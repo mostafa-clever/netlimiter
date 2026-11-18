@@ -192,7 +192,7 @@ fun StatusPill(
             WarnAmberBg,
             WarnAmber,
             Icons.Rounded.HourglassBottom,
-            "رصيد إضافي • سرعة 0.25 م.ب/ث"
+            "رصيد إضافي • سرعة 0.25 ميجابت/ث"
         )
         connectionState == ConnectionState.SLOWED -> Quad(
             WarnAmberBg,

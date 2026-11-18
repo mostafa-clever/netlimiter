@@ -220,7 +220,7 @@ fun computeEffectiveSpeed(
     }
 
     if (usedMb >= limitMb) {
-        val graceBytesPerSec = (policy.graceSpeedMbPerSec * 1024.0 * 1024.0).toLong().coerceAtLeast(32 * 1024L)
+        val graceBytesPerSec = (policy.graceSpeedMbPerSec * 125_000.0).toLong().coerceAtLeast(8_000L)
         val extraLeftMb = (hardCapMb - usedMb).coerceAtLeast(0L)
         val speedStr = formatSpeedArabic(policy.graceSpeedMbPerSec)
         return EffectiveSpeedStatus(
@@ -240,20 +240,20 @@ fun computeEffectiveSpeed(
     }
 
     val baseBytesPerSec = if (effectiveBaseMbPerSec > 0.0) {
-        (effectiveBaseMbPerSec * 1024.0 * 1024.0).toLong().coerceAtLeast(64 * 1024L)
+        (effectiveBaseMbPerSec * 125_000.0).toLong().coerceAtLeast(8_000L)
     } else {
-        10L * 1024L * 1024L
+        25L * 125_000L
     }
 
     val usedPercent = ((usedMb * 100.0) / limitMb).coerceIn(0.0, 100.0)
     val remainingPercent = 100.0 - usedPercent
-    val finalPhaseBytesPerSec = (policy.finalPhaseSpeedMbPerSec * 1024.0 * 1024.0).toLong().coerceAtLeast(64 * 1024L)
+    val finalPhaseBytesPerSec = (policy.finalPhaseSpeedMbPerSec * 125_000.0).toLong().coerceAtLeast(8_000L)
 
     if (remainingPercent <= policy.finalPhaseRemainingPercent.toDouble()) {
         val capped = if (globalSpeedCapMbPerSec > 0.0) {
-            minOf(finalPhaseBytesPerSec, (globalSpeedCapMbPerSec * 1024.0 * 1024.0).toLong())
+            minOf(finalPhaseBytesPerSec, (globalSpeedCapMbPerSec * 125_000.0).toLong())
         } else finalPhaseBytesPerSec
-        val speedStr = formatSpeedArabic(capped / (1024.0 * 1024.0))
+        val speedStr = formatSpeedArabic(capped / 125_000.0)
         return EffectiveSpeedStatus(
             state = ConnectionState.SLOWED,
             targetBytesPerSec = capped,
@@ -267,7 +267,7 @@ fun computeEffectiveSpeed(
         val stepsUsed = (usedPercent - policy.slowdownStartPercent).toInt().coerceAtLeast(0)
         val speedPct = (policy.slowdownInitialSpeedPercent - (stepsUsed * policy.slowdownStepPerPercent)).coerceIn(1, 100)
         val computedBytes = maxOf(finalPhaseBytesPerSec, (baseBytesPerSec * speedPct) / 100L)
-        val mbps = computedBytes / (1024.0 * 1024.0)
+        val mbps = computedBytes / 125_000.0
         return EffectiveSpeedStatus(
             state = ConnectionState.SLOWED,
             targetBytesPerSec = computedBytes,
@@ -289,22 +289,22 @@ fun computeEffectiveSpeed(
     if (saverActive) {
         val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
         if (policy.nightSaverEnabled && (hour in 1..6)) {
-            val nightBytes = (policy.nightSaverSpeedMbPerSec * 1024.0 * 1024.0).toLong().coerceAtLeast(64 * 1024L)
+            val nightBytes = (policy.nightSaverSpeedMbPerSec * 125_000.0).toLong().coerceAtLeast(8_000L)
             targetBytes = minOf(targetBytes, nightBytes)
             state = ConnectionState.SMART_SAVING
-            label = "توفير ليلي • ${formatSpeedArabic(targetBytes / (1024.0 * 1024.0))}"
+            label = "توفير ليلي • ${formatSpeedArabic(targetBytes / 125_000.0)}"
         } else if (policy.peakHoursSaverEnabled && (hour in 18..23)) {
-            val peakBytes = (policy.peakHoursSpeedMbPerSec * 1024.0 * 1024.0).toLong().coerceAtLeast(64 * 1024L)
+            val peakBytes = (policy.peakHoursSpeedMbPerSec * 125_000.0).toLong().coerceAtLeast(8_000L)
             targetBytes = minOf(targetBytes, peakBytes)
             state = ConnectionState.SMART_SAVING
-            label = "ساعات الذروة • ${formatSpeedArabic(targetBytes / (1024.0 * 1024.0))}"
+            label = "ساعات الذروة • ${formatSpeedArabic(targetBytes / 125_000.0)}"
         }
 
         if (policy.burstGuardEnabled && burstDetected) {
-            val burstBytes = (policy.burstCapSpeedMbPerSec * 1024.0 * 1024.0).toLong().coerceAtLeast(64 * 1024L)
+            val burstBytes = (policy.burstCapSpeedMbPerSec * 125_000.0).toLong().coerceAtLeast(8_000L)
             targetBytes = minOf(targetBytes, burstBytes)
             state = ConnectionState.SMART_SAVING
-            label = "حماية السحب المفاجئ • ${formatSpeedArabic(targetBytes / (1024.0 * 1024.0))}"
+            label = "حماية السحب المفاجئ • ${formatSpeedArabic(targetBytes / 125_000.0)}"
         }
     }
 
@@ -321,10 +321,10 @@ fun formatSpeedArabic(mbPerSec: Double): String {
     return if (mbPerSec <= 0.0) {
         "سرعة كاملة"
     } else if (mbPerSec % 1.0 == 0.0) {
-        "${mbPerSec.toInt()} م.ب/ث"
+        "${mbPerSec.toInt()} ميجابت/ث"
     } else {
-        String.format(java.util.Locale("ar"), "%.2f م.ب/ث", mbPerSec)
-            .replace("0 م.ب/ث", " م.ب/ث")
+        String.format(java.util.Locale("ar"), "%.2f ميجابت/ث", mbPerSec)
+            .replace("0 ميجابت/ث", " ميجابت/ث")
     }
 }
 

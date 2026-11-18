@@ -19,7 +19,6 @@ import com.wifiguard.limiter.admin.WifiGuardDeviceAdminReceiver
 import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.AppRole
 import com.wifiguard.limiter.model.ConnectionState
-import com.wifiguard.limiter.model.SpeedPolicyConfig
 import com.wifiguard.limiter.model.computeEffectiveSpeed
 import com.wifiguard.limiter.model.formatDataSizeArabic
 import com.wifiguard.limiter.network.LocalLanClient
@@ -42,19 +41,13 @@ class WifiGuardVpnService : VpnService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var prefs: PreferencesManager
     private lateinit var dnsHandler: DnsPacketHandler
+    private val tokenBucket = TokenBucket()
     private var tunInterface: ParcelFileDescriptor? = null
+    private var forwarder: Tun2NetForwarder? = null
     private var packetLoopJob: Job? = null
 
-    private var currentBlockAll: Boolean = false
-    private var currentUseLocalDns: Boolean = false
-    private var currentBlockDoh: Boolean = false
     private var currentWhitelist: Set<String> = emptySet()
     private var lastTrafficBytes: Long = -1L
-
-    @Volatile
-    private var activePolicy: SpeedPolicyConfig = SpeedPolicyConfig()
-    @Volatile
-    private var activeSaverFlag: Boolean = true
 
     companion object {
         const val CHANNEL_ID = "wifiguard_vpn_channel"
@@ -97,7 +90,7 @@ class WifiGuardVpnService : VpnService() {
         createNotificationChannel()
         startForeground(NOTIF_ID, buildNotification("جاري تشغيل حماية الاتصال...", "التوفير الذكي نشط"))
         _isRunning.value = true
-        establishTunnel(blockAll = false, useLocalDns = true, blockDoh = true, whitelist = emptySet())
+        establishTunnel(whitelist = emptySet())
         startMonitoringLoop()
         startHeartbeatLoop()
     }
@@ -138,6 +131,8 @@ class WifiGuardVpnService : VpnService() {
         super.onDestroy()
         _isRunning.value = false
         packetLoopJob?.cancel()
+        forwarder?.close()
+        forwarder = null
         runCatching { tunInterface?.close() }
         tunInterface = null
         serviceScope.cancel()
@@ -145,7 +140,6 @@ class WifiGuardVpnService : VpnService() {
 
     private fun startMonitoringLoop() {
         serviceScope.launch {
-            var brakeDebtBytes = 0L
             val recent60sBytes = ArrayDeque<Long>()
             var burstCooldownTicks = 0
             var screenOffSeconds = 0
@@ -176,7 +170,6 @@ class WifiGuardVpnService : VpnService() {
 
                 val cfg = prefs.getLocalLimitConfig()
                 val usedMb = prefs.getUsedMbActivePeriod()
-                activePolicy = cfg.speedPolicy
 
                 recent60sBytes.addLast(intervalBytes)
                 if (recent60sBytes.size > 60) recent60sBytes.removeFirst()
@@ -197,38 +190,24 @@ class WifiGuardVpnService : VpnService() {
                     isScreenOffIdle = isScreenOffIdle
                 )
 
-                activeSaverFlag = effective.saverActive
                 _connectionState.value = effective.state
                 _statusLabel.value = effective.statusLabelArabic
                 _blockedAdsCount.value = dnsHandler.blockedRequestsCount.get()
 
-                val shouldBlockTunnel = when {
-                    effective.state == ConnectionState.BLOCKED || effective.state == ConnectionState.IDLE_FROZEN -> true
-                    effective.targetBytesPerSec == Long.MAX_VALUE -> {
-                        brakeDebtBytes = 0L
-                        false
-                    }
-                    else -> {
-                        brakeDebtBytes = (brakeDebtBytes + intervalBytes - effective.targetBytesPerSec)
-                            .coerceIn(0L, effective.targetBytesPerSec * 3L)
-                        brakeDebtBytes > (effective.targetBytesPerSec / 4L)
-                    }
-                }
+                // Update continuous TokenBucket rate & packet policy flags WITHOUT restarting the VPN interface!
+                tokenBucket.setRateBytesPerSec(effective.targetBytesPerSec)
+                val blockAllNow = effective.state == ConnectionState.BLOCKED || effective.state == ConnectionState.IDLE_FROZEN
+                forwarder?.flags = Tun2NetForwarder.PacketPolicyFlags(
+                    blockAll = blockAllNow,
+                    sinkholeEnabled = effective.saverActive && cfg.speedPolicy.dnsSinkholeEnabled,
+                    cacheEnabled = effective.saverActive && cfg.speedPolicy.dnsCacheEnabled,
+                    blockDohDot = effective.saverActive && cfg.speedPolicy.blockDohDotEnabled,
+                    blockQuicUdp443 = effective.saverActive && cfg.speedPolicy.blockQuicUdp443Enabled
+                )
 
-                val useLocalDns = effective.saverActive && (cfg.speedPolicy.dnsSinkholeEnabled || cfg.speedPolicy.dnsCacheEnabled)
-                val blockDoh = effective.saverActive && cfg.speedPolicy.blockDohDotEnabled
-
-                if (shouldBlockTunnel != currentBlockAll ||
-                    useLocalDns != currentUseLocalDns ||
-                    blockDoh != currentBlockDoh ||
-                    cfg.whitelist != currentWhitelist
-                ) {
-                    establishTunnel(
-                        blockAll = shouldBlockTunnel,
-                        useLocalDns = useLocalDns,
-                        blockDoh = blockDoh,
-                        whitelist = cfg.whitelist
-                    )
+                // Only rebuild the TUN interface if the whitelisted apps changed
+                if (cfg.whitelist != currentWhitelist) {
+                    establishTunnel(whitelist = cfg.whitelist)
                 }
 
                 val summary = "${cfg.limitPeriod.arabicLabel}: ${formatDataSizeArabic(usedMb)} من ${formatDataSizeArabic(cfg.limitMb)}"
@@ -278,41 +257,19 @@ class WifiGuardVpnService : VpnService() {
         }
     }
 
-    private fun establishTunnel(
-        blockAll: Boolean,
-        useLocalDns: Boolean,
-        blockDoh: Boolean,
-        whitelist: Set<String>
-    ) {
+    private fun establishTunnel(whitelist: Set<String>) {
         packetLoopJob?.cancel()
+        forwarder?.close()
+        forwarder = null
         runCatching { tunInterface?.close() }
-        currentBlockAll = blockAll
-        currentUseLocalDns = useLocalDns
-        currentBlockDoh = blockDoh
         currentWhitelist = whitelist
 
         val builder = Builder()
             .setSession("حارس الواي فاي")
             .addAddress("10.0.0.2", 32)
-            .setMtu(1500)
-
-        if (blockAll) {
-            builder.addRoute("0.0.0.0", 0)
-            builder.addRoute("::", 0)
-        } else {
-            builder.addRoute("10.254.0.0", 16)
-        }
-
-        if (useLocalDns) {
-            builder.addDnsServer("10.0.0.1")
-            builder.addRoute("10.0.0.1", 32)
-            if (blockDoh) {
-                // Route known public DoH/DoT resolver IPs into TUN so encrypted DNS bypasses fall back to our sinkhole
-                listOf("1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9").forEach { ip ->
-                    runCatching { builder.addRoute(ip, 32) }
-                }
-            }
-        }
+            .addRoute("0.0.0.0", 0)
+            .addDnsServer("10.0.0.1")
+            .setMtu(1400)
 
         runCatching { builder.addDisallowedApplication(packageName) }
         whitelist.forEach { pkg ->
@@ -321,30 +278,19 @@ class WifiGuardVpnService : VpnService() {
 
         tunInterface = runCatching { builder.establish() }.getOrNull()
 
-        val pfd = tunInterface
-        if (pfd != null && (blockAll || useLocalDns)) {
-            packetLoopJob = serviceScope.launch {
-                val input = FileInputStream(pfd.fileDescriptor)
-                val output = FileOutputStream(pfd.fileDescriptor)
-                val buffer = ByteArray(32767)
-                while (isActive) {
-                    val len = runCatching { input.read(buffer) }.getOrElse { -1 }
-                    if (len < 0) break
-                    if (!blockAll && useLocalDns) {
-                        val policy = activePolicy
-                        val saverOn = activeSaverFlag
-                        val response = dnsHandler.handlePacket(
-                            packet = buffer,
-                            length = len,
-                            sinkholeEnabled = saverOn && policy.dnsSinkholeEnabled,
-                            cacheEnabled = saverOn && policy.dnsCacheEnabled,
-                            blockDohDot = saverOn && policy.blockDohDotEnabled,
-                            blockQuicUdp443 = saverOn && policy.blockQuicUdp443Enabled
-                        )
-                        if (response != null) {
-                            runCatching { output.write(response) }
-                        }
-                    }
+        val pfd = tunInterface ?: return
+        val input = FileInputStream(pfd.fileDescriptor)
+        val output = FileOutputStream(pfd.fileDescriptor)
+        val fwd = Tun2NetForwarder(this, dnsHandler, tokenBucket, output)
+        forwarder = fwd
+
+        packetLoopJob = serviceScope.launch {
+            val buffer = ByteArray(32767)
+            while (isActive) {
+                val len = runCatching { input.read(buffer) }.getOrElse { -1 }
+                if (len < 0) break
+                if (len > 0) {
+                    fwd.processTunPacket(buffer, len)
                 }
             }
         }

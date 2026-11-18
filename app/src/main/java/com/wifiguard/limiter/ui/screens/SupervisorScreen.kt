@@ -446,7 +446,7 @@ private fun DevicesTab(
             }
             Spacer(modifier = Modifier.height(8.dp))
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf(0.0 to "بدون حد", 1.0 to "1 م.ب/ث", 2.0 to "2 م.ب/ث", 3.0 to "3 م.ب/ث", 5.0 to "5 م.ب/ث").forEach { (cap, label) ->
+                listOf(0.0 to "بدون حد", 1.0 to "1 ميجابت/ث", 2.0 to "2 ميجابت/ث", 3.0 to "3 ميجابت/ث", 5.0 to "5 ميجابت/ث").forEach { (cap, label) ->
                     FilterChip(
                         selected = globalSpeedCapMbps == cap,
                         onClick = { onQuickGlobalCapChange(cap) },
@@ -788,8 +788,8 @@ private fun AdvancedSettingsTab(
     // Section 1: Speed in MB/s (All devices & Default)
     AccordionCard(
         icon = Icons.Rounded.Speed,
-        title = "1. السرعة القصوى (م.ب/ث)",
-        subtitle = "تحديد سرعة جميع الأجهزة أو هذا الجهاز بالميجابايت/ثانية",
+        title = "1. السرعة القصوى (ميجابت/ث)",
+        subtitle = "تحديد سرعة جميع الأجهزة أو هذا الجهاز بالميجابت/ثانية (Mbps)",
         expanded = expandSpeed,
         onToggle = { expandSpeed = !expandSpeed }
     ) {
@@ -799,7 +799,7 @@ private fun AdvancedSettingsTab(
                 globalCapText = txt
                 txt.toDoubleOrNull()?.let { onSaveGlobalCap(it) }
             },
-            label = { Text("الحد الأقصى للسرعة لجميع الأجهزة (م.ب/ث، 0 = بدون حد)") },
+            label = { Text("الحد الأقصى للسرعة لجميع الأجهزة (ميجابت/ث، 0 = بدون حد)") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
@@ -815,7 +815,7 @@ private fun AdvancedSettingsTab(
                     draftPolicy = draftPolicy.copy(baseSpeedLimitMbPerSec = v.coerceAtLeast(0.0))
                 }
             },
-            label = { Text("السرعة الافتراضية قبل التهدئة (م.ب/ث، 0 = سرعة كاملة)") },
+            label = { Text("السرعة الافتراضية قبل التهدئة (ميجابت/ث، 0 = سرعة كاملة)") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
@@ -826,7 +826,7 @@ private fun AdvancedSettingsTab(
     AccordionCard(
         icon = Icons.Rounded.Tune,
         title = "2. مراحل التهدئة التلقائية",
-        subtitle = "تبدأ عند ${draftPolicy.slowdownStartPercent}% • تنخفض إلى ${draftPolicy.finalPhaseSpeedMbPerSec} م.ب/ث",
+        subtitle = "تبدأ عند ${draftPolicy.slowdownStartPercent}% • تنخفض إلى ${draftPolicy.finalPhaseSpeedMbPerSec} ميجابت/ث",
         expanded = expandPhases,
         onToggle = { expandPhases = !expandPhases }
     ) {
@@ -837,7 +837,7 @@ private fun AdvancedSettingsTab(
     AccordionCard(
         icon = Icons.Rounded.HourglassBottom,
         title = "3. الرصيد الإضافي وترحيل الباقة",
-        subtitle = "+${draftPolicy.graceExtraPercent}% بسرعة ${draftPolicy.graceSpeedMbPerSec} م.ب/ث • ترحيل ${draftPolicy.rolloverPercent}%",
+        subtitle = "+${draftPolicy.graceExtraPercent}% بسرعة ${draftPolicy.graceSpeedMbPerSec} ميجابت/ث • ترحيل ${draftPolicy.rolloverPercent}%",
         expanded = expandGrace,
         onToggle = { expandGrace = !expandGrace }
     ) {
@@ -1005,7 +1005,7 @@ private fun PhasedRulesControls(
                 if (v >= 0.1) onChange(policy.copy(finalPhaseSpeedMbPerSec = v))
             }
         },
-        label = { Text("سرعة المرحلة الأخيرة (م.ب/ث)") },
+        label = { Text("سرعة المرحلة الأخيرة (ميجابت/ث)") },
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
         singleLine = true,
         modifier = Modifier.fillMaxWidth()
@@ -1039,7 +1039,7 @@ private fun GraceAndRolloverControls(
                 if (v >= 0.05) onChange(policy.copy(graceSpeedMbPerSec = v))
             }
         },
-        label = { Text("سرعة الرصيد الإضافي (م.ب/ث)") },
+        label = { Text("سرعة الرصيد الإضافي (ميجابت/ث)") },
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
         singleLine = true,
         modifier = Modifier.fillMaxWidth()
@@ -1140,7 +1140,7 @@ private fun SmartAutomationControls(
             checked = policy.burstGuardEnabled,
             onCheckedChange = { onChange(policy.copy(burstGuardEnabled = it)) }
         )
-        Text("حماية السحب المفاجئ (>${policy.burstThresholdMbPerMin} م.ب/دقيقة ← ${policy.burstCapSpeedMbPerSec} م.ب/ث)", fontSize = 12.sp)
+        Text("حماية السحب المفاجئ (>${policy.burstThresholdMbPerMin} م.ب/دقيقة ← ${policy.burstCapSpeedMbPerSec} ميجابت/ث)", fontSize = 12.sp)
     }
     if (policy.burstGuardEnabled) {
         Text("حساسية السحب المفاجئ: ${policy.burstThresholdMbPerMin} م.ب/دقيقة", fontSize = 11.sp, color = TextMuted)
@@ -1156,7 +1156,7 @@ private fun SmartAutomationControls(
             checked = policy.peakHoursSaverEnabled,
             onCheckedChange = { onChange(policy.copy(peakHoursSaverEnabled = it)) }
         )
-        Text("تخفيف ساعات الذروة (6م – 12ص ← ${policy.peakHoursSpeedMbPerSec} م.ب/ث)", fontSize = 12.sp)
+        Text("تخفيف ساعات الذروة (6م – 12ص ← ${policy.peakHoursSpeedMbPerSec} ميجابت/ث)", fontSize = 12.sp)
     }
 
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -1164,7 +1164,7 @@ private fun SmartAutomationControls(
             checked = policy.nightSaverEnabled,
             onCheckedChange = { onChange(policy.copy(nightSaverEnabled = it)) }
         )
-        Text("توفير ليلي (1ص – 7ص ← ${policy.nightSaverSpeedMbPerSec} م.ب/ث)", fontSize = 12.sp)
+        Text("توفير ليلي (1ص – 7ص ← ${policy.nightSaverSpeedMbPerSec} ميجابت/ث)", fontSize = 12.sp)
     }
 }
 
@@ -1265,7 +1265,7 @@ private fun EditDeviceDialog(
                             policy = policy.copy(baseSpeedLimitMbPerSec = v.coerceAtLeast(0.0))
                         }
                     },
-                    label = { Text("السرعة القصوى لهذا الجهاز (م.ب/ث، 0 = سرعة كاملة)") },
+                    label = { Text("السرعة القصوى لهذا الجهاز (ميجابت/ث، 0 = سرعة كاملة)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
@@ -1382,7 +1382,7 @@ private fun EditSelfLimitDialog(
                             policy = policy.copy(baseSpeedLimitMbPerSec = v.coerceAtLeast(0.0))
                         }
                     },
-                    label = { Text("السرعة القصوى (م.ب/ث، 0 = سرعة كاملة)") },
+                    label = { Text("السرعة القصوى (ميجابت/ث، 0 = سرعة كاملة)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
