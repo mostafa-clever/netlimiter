@@ -1113,6 +1113,7 @@ private fun GraceAndRolloverControls(
     )
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SmartAutomationControls(
     policy: SpeedPolicyConfig,
@@ -1217,6 +1218,35 @@ private fun SmartAutomationControls(
         )
         Text("تخفيف ساعات الذروة (6م – 12ص ← ${policy.peakHoursSpeedMbPerSec} ميجابت/ث)", fontSize = 12.sp)
     }
+
+    HorizontalDivider()
+    Text("مزود تصفية الإعلانات (DNS):", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        listOf(
+            "94.140.14.14" to "AdGuard (حجب الإعلانات)",
+            "1.1.1.1" to "Cloudflare",
+            "8.8.8.8" to "Google"
+        ).forEach { (ip, label) ->
+            FilterChip(
+                selected = policy.upstreamDnsIp == ip,
+                onClick = { onChange(policy.copy(upstreamDnsIp = ip)) },
+                label = { Text(label, fontSize = 11.sp) }
+            )
+        }
+    }
+    var customDnsText by remember(policy.upstreamDnsIp) { mutableStateOf(policy.upstreamDnsIp) }
+    OutlinedTextField(
+        value = customDnsText,
+        onValueChange = { txt ->
+            customDnsText = txt
+            if (txt.trim().count { it == '.' } == 3) {
+                onChange(policy.copy(upstreamDnsIp = txt.trim()))
+            }
+        },
+        label = { Text("عنوان DNS مخصص") },
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth()
+    )
 
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Checkbox(

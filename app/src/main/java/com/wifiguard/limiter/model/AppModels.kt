@@ -55,7 +55,8 @@ data class SpeedPolicyConfig(
     val burstThresholdMbPerMin: Int = 50,
     val burstCapSpeedMbPerSec: Double = 1.0,
     val nightSaverEnabled: Boolean = false,
-    val nightSaverSpeedMbPerSec: Double = 0.5
+    val nightSaverSpeedMbPerSec: Double = 0.5,
+    val upstreamDnsIp: String = "94.140.14.14"
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("baseSpeedLimitMbPerSec", baseSpeedLimitMbPerSec)
@@ -81,6 +82,7 @@ data class SpeedPolicyConfig(
         put("burstCapSpeedMbPerSec", burstCapSpeedMbPerSec)
         put("nightSaverEnabled", nightSaverEnabled)
         put("nightSaverSpeedMbPerSec", nightSaverSpeedMbPerSec)
+        put("upstreamDnsIp", upstreamDnsIp)
     }
 
     companion object {
@@ -109,7 +111,8 @@ data class SpeedPolicyConfig(
                 burstThresholdMbPerMin = obj.optInt("burstThresholdMbPerMin", 50).coerceIn(10, 500),
                 burstCapSpeedMbPerSec = obj.optDouble("burstCapSpeedMbPerSec", 1.0).coerceAtLeast(0.1),
                 nightSaverEnabled = obj.optBoolean("nightSaverEnabled", false),
-                nightSaverSpeedMbPerSec = obj.optDouble("nightSaverSpeedMbPerSec", 0.5).coerceAtLeast(0.1)
+                nightSaverSpeedMbPerSec = obj.optDouble("nightSaverSpeedMbPerSec", 0.5).coerceAtLeast(0.1),
+                upstreamDnsIp = obj.optString("upstreamDnsIp", "94.140.14.14").ifBlank { "94.140.14.14" }
             )
         }
 

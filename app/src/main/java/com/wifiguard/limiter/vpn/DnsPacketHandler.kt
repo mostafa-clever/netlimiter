@@ -17,6 +17,7 @@ class DnsPacketHandler(private val vpnService: VpnService) {
 
     private val dnsCache = ConcurrentHashMap<String, CachedDns>()
     val blockedRequestsCount = AtomicLong(0L)
+    @Volatile var upstreamDnsIp: String = "94.140.14.14"
 
     private val blockedDomainSuffixes = listOf(
         "doubleclick.net",
@@ -233,7 +234,7 @@ class DnsPacketHandler(private val vpnService: VpnService) {
             try {
                 vpnService.protect(socket)
                 socket.soTimeout = 3000
-                val upstream = InetAddress.getByName("8.8.8.8")
+                val upstream = InetAddress.getByName(upstreamDnsIp.ifBlank { "94.140.14.14" })
                 val outPacket = DatagramPacket(query, query.size, upstream, 53)
                 socket.send(outPacket)
 
