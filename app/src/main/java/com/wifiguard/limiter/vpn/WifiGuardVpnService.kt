@@ -221,7 +221,6 @@ class WifiGuardVpnService : VpnService() {
                         val isScreenOffIdle = screenOffSeconds >= 60
 
                         val usedMb = prefs.getUsedMbActivePeriod()
-                            val savedMb = prefs.getSavedMbToday()
                         dnsHandler.upstreamDnsIp = cfg.speedPolicy.upstreamDnsIp
 
                         recent60sBytes.addLast(intervalBytes)
@@ -235,7 +234,6 @@ class WifiGuardVpnService : VpnService() {
 
                         val effective = computeEffectiveSpeed(
                             usedMb = usedMb,
-                                savedMbToday = savedMb,
                             limitMb = cfg.limitMb,
                             policy = cfg.speedPolicy,
                             forcedBySupervisor = cfg.forceQuotaSaver,
@@ -311,7 +309,6 @@ class WifiGuardVpnService : VpnService() {
                             val name = prefs.getDeviceName()
                             val usedMb = prefs.getUsedMbActivePeriod()
                             val savedMb = prefs.getSavedMbToday()
-                        dnsHandler.upstreamDnsIp = cfg.speedPolicy.upstreamDnsIp
                             val adminActive = WifiGuardDeviceAdminReceiver.isActive(applicationContext)
                             val updated = LocalLanClient.sendHeartbeat(
                                 host = host,
