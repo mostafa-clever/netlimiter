@@ -11,19 +11,16 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import com.wifiguard.limiter.update.GitHubUpdater
-import com.wifiguard.limiter.update.ReleaseUpdateInfo
-import kotlinx.coroutines.launch
 import androidx.core.content.ContextCompat
 import com.wifiguard.limiter.admin.WifiGuardDeviceAdminReceiver
 import com.wifiguard.limiter.data.PreferencesManager
@@ -34,7 +31,10 @@ import com.wifiguard.limiter.ui.screens.ClientScreen
 import com.wifiguard.limiter.ui.screens.OnboardingScreen
 import com.wifiguard.limiter.ui.screens.SupervisorScreen
 import com.wifiguard.limiter.ui.theme.WifiGuardTheme
+import com.wifiguard.limiter.update.GitHubUpdater
+import com.wifiguard.limiter.update.ReleaseUpdateInfo
 import com.wifiguard.limiter.vpn.WifiGuardVpnService
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -55,7 +55,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = PreferencesManager(applicationContext)
-        requestNotificationPermissionIfNeeded()
+        requestPermissionsIfNeeded()
 
         setContent {
             WifiGuardTheme {
@@ -124,12 +124,12 @@ class MainActivity : ComponentActivity() {
                         onDismissRequest = { if (!isDownloadingUpdate) availableUpdate = null },
                         title = { Text("يتوفر تحديث جديد (${upd.versionTag})") },
                         text = {
-                            Text(
-                                if (isDownloadingUpdate) "جاري تحميل ملف التحديث..."
-                                else "الإصدار الحالي: 1.0.${upd.localBuildNumber}
-الإصدار الجديد: ${upd.versionTag}
-هل تريد التحديث الآن؟"
-                            )
+                            val msg = if (isDownloadingUpdate) {
+                                "جاري تحميل ملف التحديث..."
+                            } else {
+                                "الإصدار الحالي: 1.0.${upd.localBuildNumber}\nالإصدار الجديد: ${upd.versionTag}\nهل تريد التحديث الآن؟"
+                            }
+                            Text(msg)
                         },
                         confirmButton = {
                             TextButton(
@@ -185,7 +185,7 @@ class MainActivity : ComponentActivity() {
         runCatching { startActivity(intent) }
     }
 
-    private fun requestNotificationPermissionIfNeeded() {
+    private fun requestPermissionsIfNeeded() {
         val needed = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED

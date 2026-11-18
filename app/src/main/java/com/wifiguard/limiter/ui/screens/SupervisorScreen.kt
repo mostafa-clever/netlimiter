@@ -283,8 +283,6 @@ fun SupervisorScreen(
                                     whitelistedPackages = d.whitelistedPackages,
                                     globalSpeedCapMbps = cap,
                                     forceQuotaSaver = forceQuotaSaverAll || d.forceQuotaSaver,
-                                    githubRepo = githubRepo,
-                    onSaveGithubRepo = { repo -> scope.launch { prefs.setGithubRepo(repo) } },
                     targetNetworkOnly = targetNetworkOnly,
                                     targetNetworkSig = targetNetworkSig
                                 )
@@ -397,8 +395,6 @@ fun SupervisorScreen(
                             whitelistedPackages = updated.whitelistedPackages,
                             globalSpeedCapMbps = globalSpeedCapMbps,
                             forceQuotaSaver = forceQuotaSaverAll || updated.forceQuotaSaver,
-                            githubRepo = githubRepo,
-                    onSaveGithubRepo = { repo -> scope.launch { prefs.setGithubRepo(repo) } },
                     targetNetworkOnly = targetNetworkOnly,
                             targetNetworkSig = targetNetworkSig
                         )
