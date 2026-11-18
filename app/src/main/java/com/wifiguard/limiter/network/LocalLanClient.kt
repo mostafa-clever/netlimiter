@@ -31,7 +31,9 @@ data class SyncedLimitConfig(
     val speedPolicy: SpeedPolicyConfig,
     val whitelistedPackages: Set<String>,
     val globalSpeedCapMbps: Double,
-    val forceQuotaSaver: Boolean
+    val forceQuotaSaver: Boolean,
+    val targetNetworkOnly: Boolean,
+    val targetNetworkSig: String
 )
 
 object LocalLanClient {
@@ -163,7 +165,9 @@ object LocalLanClient {
             speedPolicy = SpeedPolicyConfig.fromJson(resp.optJSONObject("speedPolicy")),
             whitelistedPackages = pkgs,
             globalSpeedCapMbps = resp.optDouble("globalSpeedCapMbps", 0.0),
-            forceQuotaSaver = resp.optBoolean("forceQuotaSaver", false)
+            forceQuotaSaver = resp.optBoolean("forceQuotaSaver", false),
+            targetNetworkOnly = resp.optBoolean("targetNetworkOnly", false),
+            targetNetworkSig = resp.optString("targetNetworkSig", "")
         )
     }
 

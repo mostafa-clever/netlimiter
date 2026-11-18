@@ -50,7 +50,7 @@ class Tun2NetForwarder(
         var mySeq: Long,
         var state: TcpState = TcpState.SYN_SENT,
         var lastActivityMs: Long = System.currentTimeMillis(),
-        val writeQueue: ConcurrentLinkedQueue<ByteArray> = ConcurrentLinkedQueue()
+        val writeQueue: ConcurrentLinkedQueue<ByteBuffer> = ConcurrentLinkedQueue()
     )
 
     private class UdpSession(
@@ -124,7 +124,6 @@ class Tun2NetForwarder(
         val srcPort = ((packet[ihl].toInt() and 0xFF) shl 8) or (packet[ihl + 1].toInt() and 0xFF)
         val dstPort = ((packet[ihl + 2].toInt() and 0xFF) shl 8) or (packet[ihl + 3].toInt() and 0xFF)
 
-        // DNS (port 53) handled by local sinkhole + cache
         if (dstPort == 53) {
             if (currentFlags.blockAll) return
             val resp = dnsHandler.handlePacket(
@@ -211,7 +210,6 @@ class Tun2NetForwarder(
             return
         }
 
-        // Drop DoH/DoT TCP 443/853 to known public DNS IPs if enabled
         if (currentFlags.blockDohDot && (dstPort == 853 || (dstPort == 443 && isPublicDnsIp(dstIp)))) {
             val rstPkt = buildTcpPacket(dstIp, srcIp, dstPort, srcPort, 0L, seqNum + 1, 0x14, ByteArray(0))
             writeToTun(rstPkt)
@@ -219,7 +217,6 @@ class Tun2NetForwarder(
         }
 
         if (isSyn && !isAck) {
-            // New TCP connection
             tcpSessions.remove(key)?.let { old -> runCatching { old.channel.close() } }
             runCatching {
                 val sc = SocketChannel.open()
@@ -266,8 +263,7 @@ class Tun2NetForwarder(
             val expected = session.clientSeq
             if (seqNum == expected) {
                 session.clientSeq = (seqNum + payloadLen) and 0xFFFFFFFFL
-                session.writeQueue.add(payload)
-                // Send ACK back to phone
+                session.writeQueue.add(ByteBuffer.wrap(payload))
                 val ackPkt = buildTcpPacket(
                     session.dstIp, session.srcIp,
                     key.dstPort, key.srcPort,
@@ -285,7 +281,6 @@ class Tun2NetForwarder(
                 }
                 selector.wakeup()
             } else {
-                // Re-send ACK for expected seq
                 val ackPkt = buildTcpPacket(
                     session.dstIp, session.srcIp,
                     key.dstPort, key.srcPort,
@@ -321,7 +316,6 @@ class Tun2NetForwarder(
                 task()
             }
 
-            // Re-enable OP_READ on established TCP sessions if token bucket has budget
             val budget = tokenBucket.availableBytes()
             if (budget >= 512) {
                 for (session in tcpSessions.values) {
@@ -334,7 +328,7 @@ class Tun2NetForwarder(
                 }
             }
 
-            runCatching { selector.select(15L) }
+            runCatching { selector.select(10L) }
             val keys = selector.selectedKeys().iterator()
             while (keys.hasNext()) {
                 val key = keys.next()
@@ -375,19 +369,14 @@ class Tun2NetForwarder(
 
         if (key.isWritable) {
             while (true) {
-                val next = session.writeQueue.peek() ?: break
-                val buf = ByteBuffer.wrap(next)
+                val buf = session.writeQueue.peek() ?: break
                 val written = runCatching { session.channel.write(buf) }.getOrElse { -1 }
                 if (written < 0) {
                     closeTcpSession(session)
                     return
                 }
                 if (buf.hasRemaining()) {
-                    val rem = ByteArray(buf.remaining())
-                    buf.get(rem)
-                    session.writeQueue.poll()
-                    // Put remaining back? Simple single-thread queue: just write next loop
-                    runCatching { session.channel.write(ByteBuffer.wrap(rem)) }
+                    // Socket send buffer full, keep remaining ByteBuffer at head of queue
                     break
                 } else {
                     session.writeQueue.poll()
@@ -401,7 +390,6 @@ class Tun2NetForwarder(
         if (key.isReadable) {
             val avail = tokenBucket.availableBytes()
             if (avail < 256) {
-                // Pause reading for ~15ms so remote server slows down smoothly via TCP backpressure
                 key.interestOps(key.interestOps() and SelectionKey.OP_READ.inv())
                 return
             }
@@ -412,7 +400,6 @@ class Tun2NetForwarder(
             }
             val bytesRead = runCatching { session.channel.read(readBuf) }.getOrElse { -1 }
             if (bytesRead < 0) {
-                // Remote closed connection -> send FIN+ACK to phone
                 val finPkt = buildTcpPacket(
                     session.dstIp, session.srcIp,
                     session.key.dstPort, session.key.srcPort,
@@ -433,7 +420,7 @@ class Tun2NetForwarder(
                     session.dstIp, session.srcIp,
                     session.key.dstPort, session.key.srcPort,
                     session.mySeq, session.clientSeq,
-                    0x18, // PSH + ACK
+                    0x18,
                     data
                 )
                 session.mySeq = (session.mySeq + bytesRead) and 0xFFFFFFFFL
@@ -469,7 +456,7 @@ class Tun2NetForwarder(
             session.dstIp, session.srcIp,
             session.key.dstPort, session.key.srcPort,
             session.mySeq, session.clientSeq,
-            0x12, // SYN + ACK
+            0x12,
             ByteArray(0)
         )
         session.mySeq = (session.mySeq + 1) and 0xFFFFFFFFL
@@ -522,29 +509,27 @@ class Tun2NetForwarder(
         val pkt = ByteArray(totalLen)
         val buf = ByteBuffer.wrap(pkt)
 
-        // IPv4 Header
         buf.put(0x45.toByte())
         buf.put(0x00.toByte())
         buf.putShort(totalLen.toShort())
         buf.putShort(0)
         buf.putShort(0x4000.toShort())
         buf.put(64.toByte())
-        buf.put(6.toByte()) // TCP
+        buf.put(6.toByte())
         buf.putShort(0)
         buf.put(srcIp)
         buf.put(dstIp)
         computeIpChecksum(pkt)
 
-        // TCP Header
         buf.putShort(srcPort.toShort())
         buf.putShort(dstPort.toShort())
         buf.putInt(seqNum.toInt())
         buf.putInt(ackNum.toInt())
-        buf.put((5 shl 4).toByte()) // Data offset = 5 (20 bytes)
+        buf.put((5 shl 4).toByte())
         buf.put(flags.toByte())
-        buf.putShort(65535.toShort()) // Window size
-        buf.putShort(0) // Checksum placeholder
-        buf.putShort(0) // Urgent pointer
+        buf.putShort(65535.toShort())
+        buf.putShort(0)
+        buf.putShort(0)
         buf.put(payload)
 
         computeTransportChecksum(pkt, 20, tcpLen, 6, srcIp, dstIp)
@@ -606,7 +591,6 @@ class Tun2NetForwarder(
         dstIp: ByteArray
     ) {
         var sum = 0
-        // Pseudo-header
         sum += ((srcIp[0].toInt() and 0xFF) shl 8) or (srcIp[1].toInt() and 0xFF)
         sum += ((srcIp[2].toInt() and 0xFF) shl 8) or (srcIp[3].toInt() and 0xFF)
         sum += ((dstIp[0].toInt() and 0xFF) shl 8) or (dstIp[1].toInt() and 0xFF)

@@ -7,8 +7,6 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.net.ConnectivityManager
-import android.net.LinkProperties
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
@@ -32,7 +30,6 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
-import java.net.Inet4Address
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
@@ -45,6 +42,7 @@ class SupervisorServerService : Service() {
     private var nsdManager: NsdManager? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
     private val alertedOfflineDevices = mutableSetOf<String>()
+    private val alertedMacCheatDevices = mutableSetOf<String>()
 
     companion object {
         const val CHANNEL_ID = "wifiguard_supervisor_channel"
@@ -65,11 +63,7 @@ class SupervisorServerService : Service() {
         }
 
         fun getLocalWifiIp(context: Context): String {
-            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            val network = cm.activeNetwork ?: return "غير متصل بالواي فاي"
-            val lp: LinkProperties = cm.getLinkProperties(network) ?: return "غير متاح"
-            val ipv4 = lp.linkAddresses.firstOrNull { it.address is Inet4Address && !it.address.isLoopbackAddress }
-            return ipv4?.address?.hostAddress ?: "غير متاح"
+            return NetworkScanner.getLocalWifiIp(context).ifBlank { "غير متصل بالواي فاي" }
         }
     }
 
@@ -80,7 +74,7 @@ class SupervisorServerService : Service() {
         startForeground(NOTIF_ID, buildForegroundNotification())
         registerNsdService()
         startHttpServer()
-        startOfflineWatchdog()
+        startOfflineAndMacCheatWatchdog()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -130,6 +124,7 @@ class SupervisorServerService : Service() {
     }
 
     private suspend fun handleClient(socket: Socket) {
+        val remoteIp = socket.inetAddress?.hostAddress ?: ""
         socket.use { s ->
             runCatching {
                 s.soTimeout = 5000
@@ -158,8 +153,8 @@ class SupervisorServerService : Service() {
                 val bodyJson = if (totalRead > 0) JSONObject(String(bodyChars, 0, totalRead)) else JSONObject()
 
                 val responseJson = when (path) {
-                    "/pair" -> handlePair(bodyJson)
-                    "/heartbeat" -> handleHeartbeat(bodyJson)
+                    "/pair" -> handlePair(bodyJson, remoteIp)
+                    "/heartbeat" -> handleHeartbeat(bodyJson, remoteIp)
                     "/tamper" -> handleTamper(bodyJson)
                     else -> JSONObject().put("ok", false).put("error", "مسار غير معروف")
                 }
@@ -177,7 +172,7 @@ class SupervisorServerService : Service() {
         }
     }
 
-    private suspend fun handlePair(body: JSONObject): JSONObject {
+    private suspend fun handlePair(body: JSONObject, remoteIp: String): JSONObject {
         val code = body.optString("pairingCode", "")
         val expectedCode = prefs.getOrCreatePairingCode()
         if (code != expectedCode) {
@@ -185,22 +180,33 @@ class SupervisorServerService : Service() {
         }
         val deviceId = body.optString("deviceId", "")
         val deviceName = body.optString("deviceName", "جهاز جديد")
+        val peers = NetworkScanner.readArpAndNeighTable()
+        val mac = peers.firstOrNull { it.ip == remoteIp }?.mac ?: ""
+
         val existing = prefs.managedDevicesFlow.first().firstOrNull { it.deviceId == deviceId }
         val device = existing?.copy(
             deviceName = deviceName,
+            lastKnownIp = remoteIp.ifBlank { existing.lastKnownIp },
+            macAddress = mac.ifBlank { existing.macAddress },
             lastSeenMillis = System.currentTimeMillis(),
             isOnline = true
         ) ?: ManagedDevice(
             deviceId = deviceId,
             deviceName = deviceName,
             dailyLimitMb = 1024L,
+            lastKnownIp = remoteIp,
+            macAddress = mac,
             lastSeenMillis = System.currentTimeMillis(),
             isOnline = true
         )
         prefs.upsertManagedDevice(device)
         alertedOfflineDevices.remove(deviceId)
+        alertedMacCheatDevices.remove(deviceId)
+
         val globalCap = prefs.globalSpeedCapMbpsFlow.first()
         val forceAll = prefs.forceQuotaSaverAllFlow.first()
+        val targetOnly = prefs.targetNetworkOnlyFlow.first()
+        val targetSig = prefs.targetNetworkSigFlow.first()
 
         return JSONObject().apply {
             put("ok", true)
@@ -210,10 +216,12 @@ class SupervisorServerService : Service() {
             put("whitelistedPackages", JSONArray(device.whitelistedPackages))
             put("globalSpeedCapMbps", globalCap)
             put("forceQuotaSaver", forceAll || device.forceQuotaSaver)
+            put("targetNetworkOnly", targetOnly)
+            put("targetNetworkSig", targetSig)
         }
     }
 
-    private suspend fun handleHeartbeat(body: JSONObject): JSONObject {
+    private suspend fun handleHeartbeat(body: JSONObject, remoteIp: String): JSONObject {
         val deviceId = body.optString("deviceId", "")
         val deviceName = body.optString("deviceName", "جهاز")
         val usedMb = body.optLong("usedMb", 0L)
@@ -221,6 +229,9 @@ class SupervisorServerService : Service() {
         val uninstallProtectionActive = body.optBoolean("uninstallProtectionActive", false)
         val stateStr = body.optString("connectionState", ConnectionState.SMART_SAVING.name)
         val connState = runCatching { ConnectionState.valueOf(stateStr) }.getOrDefault(ConnectionState.SMART_SAVING)
+
+        val peers = NetworkScanner.readArpAndNeighTable()
+        val mac = peers.firstOrNull { it.ip == remoteIp }?.mac ?: ""
 
         val existing = prefs.managedDevicesFlow.first().firstOrNull { it.deviceId == deviceId }
         val wasProtected = existing?.protectionActive == true
@@ -240,14 +251,20 @@ class SupervisorServerService : Service() {
             protectionActive = protectionActive,
             uninstallProtectionActive = uninstallProtectionActive,
             connectionState = if (!protectionActive) ConnectionState.PROTECTION_OFF else connState,
+            lastKnownIp = remoteIp.ifBlank { existing?.lastKnownIp ?: "" },
+            macAddress = mac.ifBlank { existing?.macAddress ?: "" },
             lastSeenMillis = System.currentTimeMillis(),
             isOnline = true,
             tamperWarning = tamperMsg ?: if (protectionActive) null else existing?.tamperWarning
         )
         prefs.upsertManagedDevice(updated)
         alertedOfflineDevices.remove(deviceId)
+        if (protectionActive) alertedMacCheatDevices.remove(deviceId)
+
         val globalCap = prefs.globalSpeedCapMbpsFlow.first()
         val forceAll = prefs.forceQuotaSaverAllFlow.first()
+        val targetOnly = prefs.targetNetworkOnlyFlow.first()
+        val targetSig = prefs.targetNetworkSigFlow.first()
 
         return JSONObject().apply {
             put("ok", true)
@@ -257,6 +274,8 @@ class SupervisorServerService : Service() {
             put("whitelistedPackages", JSONArray(updated.whitelistedPackages))
             put("globalSpeedCapMbps", globalCap)
             put("forceQuotaSaver", forceAll || updated.forceQuotaSaver)
+            put("targetNetworkOnly", targetOnly)
+            put("targetNetworkSig", targetSig)
         }
     }
 
@@ -273,27 +292,55 @@ class SupervisorServerService : Service() {
         return JSONObject().put("ok", true)
     }
 
-    private fun startOfflineWatchdog() {
+    private fun startOfflineAndMacCheatWatchdog() {
         serviceScope.launch {
             while (isActive) {
-                delay(15_000L)
+                delay(25_000L)
                 val now = System.currentTimeMillis()
+                val activePeers = NetworkScanner.scanActiveLanPeers(applicationContext)
+                val activeMacs = activePeers.map { it.mac.lowercase() }.toSet()
+                val activeIps = activePeers.map { it.ip }.toSet()
+
                 val devices = prefs.managedDevicesFlow.first()
                 var changed = false
                 val updated = devices.map { d ->
-                    if (d.lastSeenMillis > 0L && now - d.lastSeenMillis > 50_000L) {
-                        if (d.isOnline || !alertedOfflineDevices.contains(d.deviceId)) {
-                            alertedOfflineDevices.add(d.deviceId)
-                            val msg = "انقطع اتصال جهاز ${d.deviceName} — قد يكون تم حذف التطبيق أو إيقاف الحماية"
-                            recordAndNotifyTamper(d.deviceId, d.deviceName, msg)
+                    var cur = d
+                    // Bind MAC if newly discovered by IP
+                    if (cur.macAddress.isBlank() && cur.lastKnownIp.isNotBlank()) {
+                        val foundMac = activePeers.firstOrNull { it.ip == cur.lastKnownIp }?.mac
+                        if (!foundMac.isNullOrBlank()) {
+                            cur = cur.copy(macAddress = foundMac)
                             changed = true
-                            d.copy(isOnline = false, tamperWarning = msg)
-                        } else {
-                            d
                         }
-                    } else {
-                        d
                     }
+
+                    val heartbeatTimedOut = cur.lastSeenMillis > 0L && (now - cur.lastSeenMillis > 50_000L)
+                    if (heartbeatTimedOut && cur.isOnline) {
+                        cur = cur.copy(isOnline = false)
+                        changed = true
+                    }
+
+                    // Layer 1 Anti-Cheat: Device is physically active on Wi-Fi (by MAC or IP) while offline or VPN off!
+                    val presentOnWifi = (cur.macAddress.isNotBlank() && activeMacs.contains(cur.macAddress.lowercase())) ||
+                        (cur.lastKnownIp.isNotBlank() && activeIps.contains(cur.lastKnownIp))
+
+                    if (presentOnWifi && (!cur.isOnline || !cur.protectionActive)) {
+                        if (!alertedMacCheatDevices.contains(cur.deviceId)) {
+                            alertedMacCheatDevices.add(cur.deviceId)
+                            val macTag = if (cur.macAddress.isNotBlank()) " (${cur.macAddress})" else ""
+                            val msg = "محاولة تحايل مؤكدة: جهاز ${cur.deviceName}$macTag متصل بالواي فاي حالياً بدون حماية!"
+                            recordAndNotifyTamper(cur.deviceId, cur.deviceName, msg)
+                            cur = cur.copy(tamperWarning = msg)
+                            changed = true
+                        }
+                    } else if (heartbeatTimedOut && !alertedOfflineDevices.contains(cur.deviceId)) {
+                        alertedOfflineDevices.add(cur.deviceId)
+                        val msg = "انقطع اتصال جهاز ${cur.deviceName} — قد يكون خارج الشبكة أو حذف التطبيق"
+                        recordAndNotifyTamper(cur.deviceId, cur.deviceName, msg)
+                        cur = cur.copy(tamperWarning = msg)
+                        changed = true
+                    }
+                    cur
                 }
                 if (changed) {
                     prefs.updateAllManagedDevices { updated }
@@ -343,7 +390,7 @@ class SupervisorServerService : Service() {
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("حارس الواي فاي — وضع المشرف")
-            .setContentText("يراقب الأجهزة المرتبطة على شبكة الواي فاي")
+            .setContentText("يراقب الأجهزة والشبكة المحلية للكشف عن أي تجاوز")
             .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
             .setContentIntent(pi)
             .setOngoing(true)

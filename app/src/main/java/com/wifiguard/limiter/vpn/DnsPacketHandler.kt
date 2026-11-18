@@ -96,6 +96,10 @@ class DnsPacketHandler(private val vpnService: VpnService) {
 
         // 2. Aggressive 30-min DNS Cache
         val qType = extractQueryType(dnsPayload)
+        if (qType == 28) {
+            val emptyResp = buildEmptyNoErrorResponse(dnsPayload) ?: return null
+            return wrapIpv4UdpPacket(dstIp, srcIp, dstPort, srcPort, emptyResp)
+        }
         val cacheKey = "${domain ?: ""}:$qType"
         val now = System.currentTimeMillis()
         if (cacheEnabled && domain != null) {
@@ -161,6 +165,29 @@ class DnsPacketHandler(private val vpnService: VpnService) {
                 ((dns[pos].toInt() and 0xFF) shl 8) or (dns[pos + 1].toInt() and 0xFF)
             } else 1
         }.getOrDefault(1)
+    }
+
+    private fun buildEmptyNoErrorResponse(query: ByteArray): ByteArray? {
+        if (query.size < 12) return null
+        var pos = 12
+        while (pos < query.size) {
+            val len = query[pos].toInt() and 0xFF
+            pos++
+            if (len == 0) break
+            pos += len
+        }
+        val questionEnd = pos + 4
+        if (questionEnd > query.size) return null
+        val out = ByteBuffer.allocate(questionEnd)
+        out.put(query[0])
+        out.put(query[1])
+        out.putShort(0x8180.toShort())
+        out.putShort(1)
+        out.putShort(0)
+        out.putShort(0)
+        out.putShort(0)
+        out.put(query, 12, questionEnd - 12)
+        return out.array()
     }
 
     private fun buildSinkholeResponse(query: ByteArray): ByteArray? {

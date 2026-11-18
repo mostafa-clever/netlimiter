@@ -92,6 +92,7 @@ import com.wifiguard.limiter.model.SpeedPolicyConfig
 import com.wifiguard.limiter.model.TamperAlert
 import com.wifiguard.limiter.model.formatDataSizeArabic
 import com.wifiguard.limiter.model.formatSpeedArabic
+import com.wifiguard.limiter.network.NetworkScanner
 import com.wifiguard.limiter.network.SupervisorServerService
 import com.wifiguard.limiter.ui.components.UsageRingCard
 import com.wifiguard.limiter.ui.components.WhitelistPickerDialog
@@ -128,6 +129,8 @@ fun SupervisorScreen(
     val supervisorPin by prefs.supervisorPinFlow.collectAsState(initial = "")
     val globalSpeedCapMbps by prefs.globalSpeedCapMbpsFlow.collectAsState(initial = 0.0)
     val forceQuotaSaverAll by prefs.forceQuotaSaverAllFlow.collectAsState(initial = false)
+    val targetNetworkOnly by prefs.targetNetworkOnlyFlow.collectAsState(initial = false)
+    val targetNetworkSig by prefs.targetNetworkSigFlow.collectAsState(initial = "")
     val blockedAds by WifiGuardVpnService.blockedAdsCount.collectAsState()
 
     // Self-limit & template policy states
@@ -277,6 +280,9 @@ fun SupervisorScreen(
                             prefs.applyPolicyToAllDevices(newPolicy)
                         }
                     },
+                    targetNetworkOnly = targetNetworkOnly,
+                    targetNetworkSig = targetNetworkSig,
+                    onSetTargetNetwork = { only, sig -> scope.launch { prefs.setTargetNetwork(only, sig) } },
                     onSavePin = { newPin -> scope.launch { prefs.setSupervisorPin(newPin) } },
                     onResetUsage = { scope.launch { prefs.resetUsageCounters() } },
                     onSwitchRole = {
@@ -596,6 +602,7 @@ private fun DeviceMonitorCard(device: ManagedDevice, onClick: () -> Unit) {
                         device.connectionState == ConnectionState.IDLE_FROZEN -> "تجميد الخلفية"
                         device.connectionState == ConnectionState.GRACE_EXTRA -> "رصيد إضافي"
                         device.connectionState == ConnectionState.SLOWED -> "تهدئة تدريجية"
+                        device.connectionState == ConnectionState.OUTSIDE_TARGET_WIFI -> "خارج الشبكة المحددة"
                         device.connectionState == ConnectionState.SMART_SAVING -> "توفير ذكي نشط"
                         else -> "متصل بشكل طبيعي"
                     },
@@ -606,9 +613,10 @@ private fun DeviceMonitorCard(device: ManagedDevice, onClick: () -> Unit) {
             }
 
             val capText = formatSpeedArabic(device.speedPolicy.baseSpeedLimitMbPerSec)
+            val macText = if (device.macAddress.isNotBlank()) " • MAC: ${device.macAddress}" else ""
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "السرعة الأساسية: $capText • المستثناة: ${device.whitelistedPackages.size}",
+                text = "السرعة: $capText • المستثناة: ${device.whitelistedPackages.size}$macText",
                 fontSize = 12.sp,
                 color = TextMuted
             )
@@ -731,6 +739,9 @@ private fun AdvancedSettingsTab(
     onSaveGlobalCap: (Double) -> Unit,
     onSavePolicy: (SpeedPolicyConfig) -> Unit,
     onApplyPolicyToAll: (SpeedPolicyConfig) -> Unit,
+    targetNetworkOnly: Boolean,
+    targetNetworkSig: String,
+    onSetTargetNetwork: (Boolean, String?) -> Unit,
     onSavePin: (String) -> Unit,
     onResetUsage: () -> Unit,
     onSwitchRole: () -> Unit
@@ -739,6 +750,7 @@ private fun AdvancedSettingsTab(
     var globalCapText by remember(globalSpeedCapMbps) {
         mutableStateOf(if (globalSpeedCapMbps == 0.0) "0" else globalSpeedCapMbps.toString())
     }
+    val ctx = LocalContext.current
     var pinInput by remember(currentPin) { mutableStateOf(currentPin) }
 
     // Clean collapsible sections so everything is easy to find without clutter
@@ -871,6 +883,53 @@ private fun AdvancedSettingsTab(
                 shape = RoundedCornerShape(14.dp)
             ) {
                 Text("تطبيق على الكل ($deviceCount)")
+            }
+        }
+    }
+
+    // Section 4.5: Target Wi-Fi Network Only
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("تطبيق القيود على شبكة واحدة فقط", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text(
+                        "عند الخروج لشبكة أخرى تُرفع القيود مؤقتاً ولا يُحسب الاستهلاك",
+                        fontSize = 11.sp,
+                        color = TextMuted
+                    )
+                }
+                Switch(
+                    checked = targetNetworkOnly,
+                    onCheckedChange = { enabled ->
+                        val sig = if (enabled && targetNetworkSig.isBlank()) {
+                            NetworkScanner.getCurrentWifiSignature(ctx)
+                        } else null
+                        onSetTargetNetwork(enabled, sig)
+                    }
+                )
+            }
+            OutlinedButton(
+                onClick = {
+                    val sig = NetworkScanner.getCurrentWifiSignature(ctx)
+                    if (sig.isNotBlank()) onSetTargetNetwork(true, sig)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(
+                    if (targetNetworkSig.isBlank()) "تعيين شبكة الواي فاي الحالية للمراقبة"
+                    else "تحديث الشبكة المحددة (الحالية: $targetNetworkSig)",
+                    fontSize = 12.sp
+                )
             }
         }
     }

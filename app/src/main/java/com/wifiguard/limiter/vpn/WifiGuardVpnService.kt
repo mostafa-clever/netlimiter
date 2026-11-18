@@ -22,6 +22,7 @@ import com.wifiguard.limiter.model.ConnectionState
 import com.wifiguard.limiter.model.computeEffectiveSpeed
 import com.wifiguard.limiter.model.formatDataSizeArabic
 import com.wifiguard.limiter.network.LocalLanClient
+import com.wifiguard.limiter.network.NetworkScanner
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -46,6 +47,7 @@ class WifiGuardVpnService : VpnService() {
     private var forwarder: Tun2NetForwarder? = null
     private var packetLoopJob: Job? = null
 
+    private var currentUseFullTunnel: Boolean = false
     private var currentWhitelist: Set<String> = emptySet()
     private var lastTrafficBytes: Long = -1L
 
@@ -90,7 +92,7 @@ class WifiGuardVpnService : VpnService() {
         createNotificationChannel()
         startForeground(NOTIF_ID, buildNotification("جاري تشغيل حماية الاتصال...", "التوفير الذكي نشط"))
         _isRunning.value = true
-        establishTunnel(whitelist = emptySet())
+        establishTunnel(useFullTunnel = false, whitelist = emptySet())
         startMonitoringLoop()
         startHeartbeatLoop()
     }
@@ -146,8 +148,32 @@ class WifiGuardVpnService : VpnService() {
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
 
             while (isActive) {
+                val cfg = prefs.getLocalLimitConfig()
+                val onWifi = isOnWifi()
+
+                // Check if limits are restricted to the target Wi-Fi network only
+                val currentWifiSig = if (onWifi) NetworkScanner.getCurrentWifiSignature(applicationContext) else ""
+                val outsideTargetWifi = cfg.targetNetworkOnly &&
+                    cfg.targetNetworkSig.isNotBlank() &&
+                    onWifi &&
+                    currentWifiSig.isNotBlank() &&
+                    !matchesNetworkSignature(currentWifiSig, cfg.targetNetworkSig)
+
+                if (outsideTargetWifi) {
+                    lastTrafficBytes = -1L
+                    _connectionState.value = ConnectionState.OUTSIDE_TARGET_WIFI
+                    _statusLabel.value = "خارج الشبكة المحددة — بلا قيود"
+                    tokenBucket.setRateBytesPerSec(Long.MAX_VALUE)
+                    if (currentUseFullTunnel || cfg.whitelist != currentWhitelist) {
+                        establishTunnel(useFullTunnel = false, whitelist = cfg.whitelist)
+                    }
+                    updateNotification("متصل بشبكة أخرى", "خارج الشبكة المحددة — بلا قيود")
+                    delay(2000L)
+                    continue
+                }
+
                 var intervalBytes = 0L
-                if (isOnWifi()) {
+                if (onWifi) {
                     val currentTotal = TrafficStats.getTotalRxBytes() + TrafficStats.getTotalTxBytes()
                     if (lastTrafficBytes > 0L && currentTotal > lastTrafficBytes) {
                         val delta = currentTotal - lastTrafficBytes
@@ -168,7 +194,6 @@ class WifiGuardVpnService : VpnService() {
                 }
                 val isScreenOffIdle = screenOffSeconds >= 60
 
-                val cfg = prefs.getLocalLimitConfig()
                 val usedMb = prefs.getUsedMbActivePeriod()
 
                 recent60sBytes.addLast(intervalBytes)
@@ -194,9 +219,10 @@ class WifiGuardVpnService : VpnService() {
                 _statusLabel.value = effective.statusLabelArabic
                 _blockedAdsCount.value = dnsHandler.blockedRequestsCount.get()
 
-                // Update continuous TokenBucket rate & packet policy flags WITHOUT restarting the VPN interface!
                 tokenBucket.setRateBytesPerSec(effective.targetBytesPerSec)
                 val blockAllNow = effective.state == ConnectionState.BLOCKED || effective.state == ConnectionState.IDLE_FROZEN
+                val needsFullTunnel = blockAllNow || effective.targetBytesPerSec < Long.MAX_VALUE
+
                 forwarder?.flags = Tun2NetForwarder.PacketPolicyFlags(
                     blockAll = blockAllNow,
                     sinkholeEnabled = effective.saverActive && cfg.speedPolicy.dnsSinkholeEnabled,
@@ -205,9 +231,8 @@ class WifiGuardVpnService : VpnService() {
                     blockQuicUdp443 = effective.saverActive && cfg.speedPolicy.blockQuicUdp443Enabled
                 )
 
-                // Only rebuild the TUN interface if the whitelisted apps changed
-                if (cfg.whitelist != currentWhitelist) {
-                    establishTunnel(whitelist = cfg.whitelist)
+                if (needsFullTunnel != currentUseFullTunnel || cfg.whitelist != currentWhitelist) {
+                    establishTunnel(useFullTunnel = needsFullTunnel, whitelist = cfg.whitelist)
                 }
 
                 val summary = "${cfg.limitPeriod.arabicLabel}: ${formatDataSizeArabic(usedMb)} من ${formatDataSizeArabic(cfg.limitMb)}"
@@ -216,6 +241,17 @@ class WifiGuardVpnService : VpnService() {
                 delay(1000L)
             }
         }
+    }
+
+    private fun matchesNetworkSignature(current: String, target: String): Boolean {
+        val curGw = current.substringBefore("|")
+        val curMac = current.substringAfter("|", "")
+        val tgtGw = target.substringBefore("|")
+        val tgtMac = target.substringAfter("|", "")
+        if (curMac.isNotBlank() && tgtMac.isNotBlank()) {
+            return curMac.equals(tgtMac, ignoreCase = true)
+        }
+        return curGw == tgtGw
     }
 
     private fun startHeartbeatLoop() {
@@ -247,7 +283,9 @@ class WifiGuardVpnService : VpnService() {
                                 speedPolicy = updated.speedPolicy,
                                 whitelist = updated.whitelistedPackages,
                                 globalSpeedCapMbps = updated.globalSpeedCapMbps,
-                                forceQuotaSaver = updated.forceQuotaSaver
+                                forceQuotaSaver = updated.forceQuotaSaver,
+                                targetNetworkOnly = updated.targetNetworkOnly,
+                                targetNetworkSig = updated.targetNetworkSig
                             )
                         }
                     }
@@ -257,19 +295,27 @@ class WifiGuardVpnService : VpnService() {
         }
     }
 
-    private fun establishTunnel(whitelist: Set<String>) {
+    private fun establishTunnel(useFullTunnel: Boolean, whitelist: Set<String>) {
         packetLoopJob?.cancel()
         forwarder?.close()
         forwarder = null
         runCatching { tunInterface?.close() }
+        currentUseFullTunnel = useFullTunnel
         currentWhitelist = whitelist
 
         val builder = Builder()
             .setSession("حارس الواي فاي")
             .addAddress("10.0.0.2", 32)
-            .addRoute("0.0.0.0", 0)
             .addDnsServer("10.0.0.1")
             .setMtu(1400)
+
+        if (useFullTunnel) {
+            builder.addRoute("0.0.0.0", 0)
+        } else {
+            // Unlimited / Outside target network: route only local DNS (10.0.0.1) + dummy subnet so TCP/UDP runs at 100% native Wi-Fi speed
+            builder.addRoute("10.0.0.1", 32)
+            builder.addRoute("10.254.0.0", 16)
+        }
 
         runCatching { builder.addDisallowedApplication(packageName) }
         whitelist.forEach { pkg ->

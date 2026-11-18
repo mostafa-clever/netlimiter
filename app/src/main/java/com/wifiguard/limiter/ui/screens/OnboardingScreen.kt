@@ -247,7 +247,10 @@ fun OnboardingScreen(
                                         limitPeriod = cfg.limitPeriod,
                                         speedPolicy = cfg.speedPolicy,
                                         whitelist = cfg.whitelistedPackages,
-                                        globalSpeedCapMbps = cfg.globalSpeedCapMbps
+                                        globalSpeedCapMbps = cfg.globalSpeedCapMbps,
+                                        forceQuotaSaver = cfg.forceQuotaSaver,
+                                        targetNetworkOnly = cfg.targetNetworkOnly,
+                                        targetNetworkSig = cfg.targetNetworkSig
                                     )
                                     isConnecting = false
                                     onSetupComplete(AppRole.CLIENT)

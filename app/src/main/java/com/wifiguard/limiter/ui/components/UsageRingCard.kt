@@ -200,6 +200,12 @@ fun StatusPill(
             Icons.Rounded.Speed,
             "تهدئة تدريجية للسرعة"
         )
+        connectionState == ConnectionState.OUTSIDE_TARGET_WIFI -> Quad(
+            SuccessGreenBg,
+            SuccessGreen,
+            Icons.Rounded.CheckCircle,
+            "خارج الشبكة المحددة — بلا قيود"
+        )
         connectionState == ConnectionState.SMART_SAVING -> Quad(
             SoftMint,
             PrimaryTeal,

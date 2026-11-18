@@ -22,6 +22,7 @@ enum class ConnectionState {
     SLOWED,
     GRACE_EXTRA,
     IDLE_FROZEN,
+    OUTSIDE_TARGET_WIFI,
     BLOCKED,
     PROTECTION_OFF
 }
@@ -340,6 +341,8 @@ data class ManagedDevice(
     val protectionActive: Boolean = false,
     val uninstallProtectionActive: Boolean = false,
     val connectionState: ConnectionState = ConnectionState.SMART_SAVING,
+    val lastKnownIp: String = "",
+    val macAddress: String = "",
     val lastSeenMillis: Long = 0L,
     val isOnline: Boolean = false,
     val tamperWarning: String? = null
@@ -359,6 +362,8 @@ data class ManagedDevice(
         put("protectionActive", protectionActive)
         put("uninstallProtectionActive", uninstallProtectionActive)
         put("connectionState", connectionState.name)
+        put("lastKnownIp", lastKnownIp)
+        put("macAddress", macAddress)
         put("lastSeenMillis", lastSeenMillis)
         put("isOnline", isOnline)
         put("tamperWarning", tamperWarning ?: JSONObject.NULL)
@@ -388,6 +393,8 @@ data class ManagedDevice(
                 protectionActive = obj.optBoolean("protectionActive", false),
                 uninstallProtectionActive = obj.optBoolean("uninstallProtectionActive", false),
                 connectionState = state,
+                lastKnownIp = obj.optString("lastKnownIp", ""),
+                macAddress = obj.optString("macAddress", ""),
                 lastSeenMillis = obj.optLong("lastSeenMillis", 0L),
                 isOnline = obj.optBoolean("isOnline", false),
                 tamperWarning = warning

@@ -50,6 +50,8 @@ class PreferencesManager(private val context: Context) {
         // Global supervisor settings for all devices
         val GLOBAL_SPEED_CAP_MBPS = doublePreferencesKey("global_speed_cap_mbps")
         val FORCE_QUOTA_SAVER_ALL = booleanPreferencesKey("force_quota_saver_all")
+        val TARGET_NETWORK_ONLY = booleanPreferencesKey("target_network_only")
+        val TARGET_NETWORK_SIG = stringPreferencesKey("target_network_sig")
 
         // Period usage tracking
         val USED_BYTES_DAY = longPreferencesKey("used_bytes_today")
@@ -130,6 +132,14 @@ class PreferencesManager(private val context: Context) {
         prefs[Keys.FORCE_QUOTA_SAVER_ALL] ?: false
     }
 
+    val targetNetworkOnlyFlow: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[Keys.TARGET_NETWORK_ONLY] ?: false
+    }
+
+    val targetNetworkSigFlow: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[Keys.TARGET_NETWORK_SIG] ?: ""
+    }
+
     val managedDevicesFlow: Flow<List<ManagedDevice>> = context.dataStore.data.map { prefs ->
         val raw = prefs[Keys.MANAGED_DEVICES_JSON] ?: "[]"
         parseDevicesList(raw)
@@ -199,13 +209,22 @@ class PreferencesManager(private val context: Context) {
         context.dataStore.edit { it[Keys.FORCE_QUOTA_SAVER_ALL] = forced }
     }
 
+    suspend fun setTargetNetwork(onlyTarget: Boolean, signature: String? = null) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.TARGET_NETWORK_ONLY] = onlyTarget
+            if (signature != null) prefs[Keys.TARGET_NETWORK_SIG] = signature
+        }
+    }
+
     suspend fun updateLocalLimits(
         limitMb: Long,
         limitPeriod: LimitPeriod,
         speedPolicy: SpeedPolicyConfig,
         whitelist: Set<String>,
         globalSpeedCapMbps: Double = 0.0,
-        forceQuotaSaver: Boolean? = null
+        forceQuotaSaver: Boolean? = null,
+        targetNetworkOnly: Boolean? = null,
+        targetNetworkSig: String? = null
     ) {
         context.dataStore.edit { prefs ->
             prefs[Keys.DAILY_LIMIT_MB] = limitMb.coerceAtLeast(10L)
@@ -214,6 +233,8 @@ class PreferencesManager(private val context: Context) {
             prefs[Keys.WHITELIST_PACKAGES] = whitelist
             prefs[Keys.GLOBAL_SPEED_CAP_MBPS] = globalSpeedCapMbps.coerceAtLeast(0.0)
             if (forceQuotaSaver != null) prefs[Keys.FORCE_QUOTA_SAVER_ALL] = forceQuotaSaver
+            if (targetNetworkOnly != null) prefs[Keys.TARGET_NETWORK_ONLY] = targetNetworkOnly
+            if (targetNetworkSig != null) prefs[Keys.TARGET_NETWORK_SIG] = targetNetworkSig
         }
     }
 
@@ -286,7 +307,9 @@ class PreferencesManager(private val context: Context) {
         val speedPolicy: SpeedPolicyConfig,
         val whitelist: Set<String>,
         val globalSpeedCapMbps: Double,
-        val forceQuotaSaver: Boolean
+        val forceQuotaSaver: Boolean,
+        val targetNetworkOnly: Boolean,
+        val targetNetworkSig: String
     )
 
     suspend fun getLocalLimitConfig(): LocalConfigSnapshot {
@@ -305,7 +328,9 @@ class PreferencesManager(private val context: Context) {
             speedPolicy = policy,
             whitelist = prefs[Keys.WHITELIST_PACKAGES] ?: emptySet(),
             globalSpeedCapMbps = prefs[Keys.GLOBAL_SPEED_CAP_MBPS] ?: 0.0,
-            forceQuotaSaver = prefs[Keys.FORCE_QUOTA_SAVER_ALL] ?: false
+            forceQuotaSaver = prefs[Keys.FORCE_QUOTA_SAVER_ALL] ?: false,
+            targetNetworkOnly = prefs[Keys.TARGET_NETWORK_ONLY] ?: false,
+            targetNetworkSig = prefs[Keys.TARGET_NETWORK_SIG] ?: ""
         )
     }
 
