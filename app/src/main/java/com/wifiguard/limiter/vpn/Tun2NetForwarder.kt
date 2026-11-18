@@ -71,8 +71,9 @@ class Tun2NetForwarder(
     private var running = true
 
     private val selectorThread = Thread {
-        runSelectorLoop()
+        runCatching { runSelectorLoop() }
     }.apply {
+        uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, _ -> }
         name = "WifiGuard-Selector"
         isDaemon = true
         start()
@@ -85,7 +86,6 @@ class Tun2NetForwarder(
         udpSessions.values.forEach { runCatching { it.channel.close() } }
         tcpSessions.clear()
         udpSessions.clear()
-        runCatching { selector.close() }
     }
 
     fun processTunPacket(packet: ByteArray, length: Int) {
@@ -310,26 +310,29 @@ class Tun2NetForwarder(
         val udpBuf = ByteBuffer.allocate(1450)
         var lastCleanupMs = System.currentTimeMillis()
 
-        while (running) {
-            while (true) {
-                val task = pendingRegistrations.poll() ?: break
-                task()
-            }
+        try {
+            while (running && selector.isOpen) {
+                while (true) {
+                    val task = pendingRegistrations.poll() ?: break
+                    runCatching { task() }
+                }
 
-            val budget = tokenBucket.availableBytes()
-            if (budget >= 512) {
-                for (session in tcpSessions.values) {
-                    if (session.state == TcpState.ESTABLISHED) {
-                        val k = session.channel.keyFor(selector)
-                        if (k != null && k.isValid && (k.interestOps() and SelectionKey.OP_READ) == 0) {
-                            k.interestOps(k.interestOps() or SelectionKey.OP_READ)
+                val budget = tokenBucket.availableBytes()
+                if (budget >= 512) {
+                    for (session in tcpSessions.values) {
+                        if (session.state == TcpState.ESTABLISHED) {
+                            val k = runCatching { session.channel.keyFor(selector) }.getOrNull()
+                            if (k != null && k.isValid && (k.interestOps() and SelectionKey.OP_READ) == 0) {
+                                runCatching { k.interestOps(k.interestOps() or SelectionKey.OP_READ) }
+                            }
                         }
                     }
                 }
-            }
 
-            runCatching { selector.select(10L) }
-            val keys = selector.selectedKeys().iterator()
+                if (!running || !selector.isOpen) break
+                runCatching { selector.select(10L) }
+                if (!running || !selector.isOpen) break
+                val keys = selector.selectedKeys().iterator()
             while (keys.hasNext()) {
                 val key = keys.next()
                 keys.remove()
@@ -350,6 +353,10 @@ class Tun2NetForwarder(
                     runCatching { it.channel.close() }
                 }
             }
+        }
+        } catch (_: Throwable) {
+        } finally {
+            runCatching { selector.close() }
         }
     }
 
