@@ -8,7 +8,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.TrafficStats
 import android.net.VpnService
 import android.os.Build
@@ -51,6 +53,7 @@ class WifiGuardVpnService : VpnService() {
     private var forwarder: Tun2NetForwarder? = null
     private var packetLoopJob: Job? = null
     private var clientControlSocket: java.net.ServerSocket? = null
+    private var wifiCallback: ConnectivityManager.NetworkCallback? = null
 
     private var currentUseFullTunnel: Boolean = false
     private var currentWhitelist: Set<String> = emptySet()
@@ -121,6 +124,7 @@ class WifiGuardVpnService : VpnService() {
         }
         startMonitoringLoop()
         startClientControlServer()
+        registerWifiReconnectCallback()
         startHeartbeatLoop()
     }
 
@@ -162,6 +166,7 @@ class WifiGuardVpnService : VpnService() {
         packetLoopJob?.cancel()
         runCatching { forwarder?.close() }
         forwarder = null
+        runCatching { wifiCallback?.let { (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(it) } }
         runCatching { clientControlSocket?.close() }
         runCatching { tunInterface?.close() }
         tunInterface = null
@@ -300,6 +305,74 @@ class WifiGuardVpnService : VpnService() {
             return curMac.equals(tgtMac, ignoreCase = true)
         }
         return curGw == tgtGw
+    }
+
+    private fun registerWifiReconnectCallback() {
+        runCatching {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val req = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .build()
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    serviceScope.launch {
+                        // Retry pulling latest Supervisor config immediately when Wi-Fi reconnects
+                        val backoffs = listOf(500L, 1500L, 3000L)
+                        for (waitMs in backoffs) {
+                            delay(waitMs)
+                            if (syncWithSupervisorOnce()) break
+                        }
+                    }
+                }
+            }
+            wifiCallback = cb
+            cm.registerNetworkCallback(req, cb)
+        }
+    }
+
+    private suspend fun syncWithSupervisorOnce(): Boolean {
+        val role = prefs.roleFlow.first()
+        if (role != AppRole.CLIENT) return true
+        val host = prefs.getSupervisorHost()
+        val port = prefs.getSupervisorPort()
+        if (host.isBlank()) return false
+        val id = prefs.getOrCreateDeviceId()
+        val name = prefs.getDeviceName()
+        val usedMb = prefs.getUsedMbActivePeriod()
+        val savedMb = prefs.getSavedMbToday()
+        val adminActive = WifiGuardDeviceAdminReceiver.isActive(applicationContext)
+        val updated = LocalLanClient.sendHeartbeat(
+            host = host,
+            port = port,
+            deviceId = id,
+            deviceName = name,
+            usedMb = usedMb,
+            savedMbToday = savedMb,
+            protectionActive = _isRunning.value,
+            uninstallProtectionActive = adminActive,
+            connectionState = _connectionState.value,
+            installedApps = getInstalledLaunchableApps(applicationContext)
+        )
+        if (updated != null) {
+            prefs.updateLocalLimits(
+                limitMb = updated.dailyLimitMb,
+                limitPeriod = updated.limitPeriod,
+                speedPolicy = updated.speedPolicy,
+                whitelist = updated.whitelistedPackages,
+                globalSpeedCapMbps = updated.globalSpeedCapMbps,
+                forceQuotaSaver = updated.forceQuotaSaver,
+                targetNetworkOnly = updated.targetNetworkOnly,
+                targetNetworkSig = updated.targetNetworkSig
+            )
+            return true
+        }
+        val found = withTimeoutOrNull(3000L) {
+            LocalLanClient.discoverSupervisors(applicationContext).first { it.isNotEmpty() }
+        }?.firstOrNull()
+        if (found != null) {
+            prefs.setSupervisorConnection(found.host, found.port, "")
+        }
+        return false
     }
 
     private fun startClientControlServer() {
@@ -453,6 +526,7 @@ class WifiGuardVpnService : VpnService() {
         packetLoopJob?.cancel()
         runCatching { forwarder?.close() }
         forwarder = null
+        runCatching { wifiCallback?.let { (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(it) } }
         runCatching { clientControlSocket?.close() }
         runCatching { tunInterface?.close() }
         currentUseFullTunnel = useFullTunnel

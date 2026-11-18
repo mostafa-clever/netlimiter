@@ -339,17 +339,21 @@ fun SupervisorScreen(
             onSave = { updated ->
                 scope.launch {
                     prefs.upsertManagedDevice(updated)
-                    LocalLanClient.pushConfigToClient(
-                        clientIp = updated.lastKnownIp,
-                        dailyLimitMb = updated.dailyLimitMb,
-                        limitPeriod = updated.limitPeriod,
-                        speedPolicy = updated.speedPolicy,
-                        whitelistedPackages = updated.whitelistedPackages,
-                        globalSpeedCapMbps = globalSpeedCapMbps,
-                        forceQuotaSaver = forceQuotaSaverAll || updated.forceQuotaSaver,
-                        targetNetworkOnly = targetNetworkOnly,
-                        targetNetworkSig = targetNetworkSig
-                    )
+                    for (attempt in 0..2) {
+                        val ok = LocalLanClient.pushConfigToClient(
+                            clientIp = updated.lastKnownIp,
+                            dailyLimitMb = updated.dailyLimitMb,
+                            limitPeriod = updated.limitPeriod,
+                            speedPolicy = updated.speedPolicy,
+                            whitelistedPackages = updated.whitelistedPackages,
+                            globalSpeedCapMbps = globalSpeedCapMbps,
+                            forceQuotaSaver = forceQuotaSaverAll || updated.forceQuotaSaver,
+                            targetNetworkOnly = targetNetworkOnly,
+                            targetNetworkSig = targetNetworkSig
+                        )
+                        if (ok) break
+                        kotlinx.coroutines.delay(1500L)
+                    }
                 }
                 editingDevice = null
             },

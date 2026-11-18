@@ -145,7 +145,7 @@ class SupervisorServerService : Service() {
     }
 
     private suspend fun handleClient(socket: Socket) {
-        val remoteIp = socket.inetAddress?.hostAddress ?: ""
+        val remoteIp = (socket.inetAddress?.hostAddress ?: "").removePrefix("::ffff:")
         socket.use { s ->
             runCatching {
                 s.soTimeout = 5000
@@ -351,10 +351,16 @@ class SupervisorServerService : Service() {
 
     private fun startOfflineAndMacCheatWatchdog() {
         serviceScope.launch {
+            var tickCount = 0
             while (isActive) {
-                delay(25_000L)
+                delay(30_000L)
+                tickCount++
                 val now = System.currentTimeMillis()
-                val activePeers = NetworkScanner.scanActiveLanPeers(applicationContext)
+                val activePeers = if (tickCount % 20 == 1) {
+                    NetworkScanner.scanActiveLanPeers(applicationContext)
+                } else {
+                    NetworkScanner.readArpAndNeighTable()
+                }
                 val activeMacs = activePeers.map { it.mac.lowercase() }.toSet()
                 val activeIps = activePeers.map { it.ip }.toSet()
 
@@ -371,7 +377,22 @@ class SupervisorServerService : Service() {
                         }
                     }
 
-                    val heartbeatTimedOut = cur.lastSeenMillis > 0L && (now - cur.lastSeenMillis > 120_000L)
+                    var heartbeatTimedOut = cur.lastSeenMillis > 0L && (now - cur.lastSeenMillis > 65_000L)
+                    if (heartbeatTimedOut && cur.lastKnownIp.isNotBlank()) {
+                        // Actively query Client port 8766 before declaring offline
+                        val liveStatus = LocalLanClient.fetchClientStatus(cur.lastKnownIp)
+                        if (liveStatus != null && liveStatus.optBoolean("ok", false)) {
+                            heartbeatTimedOut = false
+                            cur = cur.copy(
+                                usedMb = liveStatus.optLong("usedMb", cur.usedMb),
+                                savedMbToday = liveStatus.optLong("savedMbToday", cur.savedMbToday),
+                                protectionActive = liveStatus.optBoolean("protectionActive", cur.protectionActive),
+                                lastSeenMillis = now,
+                                isOnline = true
+                            )
+                            changed = true
+                        }
+                    }
                     if (heartbeatTimedOut && cur.isOnline) {
                         cur = cur.copy(isOnline = false)
                         changed = true
