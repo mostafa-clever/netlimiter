@@ -1017,27 +1017,35 @@ private fun AdvancedSettingsTab(
                         color = TextMuted
                     )
                 }
+                val netScope = rememberCoroutineScope()
                 Switch(
                     checked = targetNetworkOnly,
                     onCheckedChange = { enabled ->
-                        val sig = if (enabled && targetNetworkSig.isBlank()) {
-                            NetworkScanner.getCurrentWifiSignature(ctx)
-                        } else null
-                        onSetTargetNetwork(enabled, sig)
+                        if (enabled && targetNetworkSig.isBlank()) {
+                            netScope.launch {
+                                val sig = NetworkScanner.getCurrentWifiSignatureActive(ctx)
+                                onSetTargetNetwork(true, sig)
+                            }
+                        } else {
+                            onSetTargetNetwork(enabled, null)
+                        }
                     }
                 )
             }
+            val btnNetScope = rememberCoroutineScope()
             OutlinedButton(
                 onClick = {
-                    val sig = NetworkScanner.getCurrentWifiSignature(ctx)
-                    if (sig.isNotBlank()) onSetTargetNetwork(true, sig)
+                    btnNetScope.launch {
+                        val sig = NetworkScanner.getCurrentWifiSignatureActive(ctx)
+                        if (sig.isNotBlank()) onSetTargetNetwork(true, sig)
+                    }
                 },
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp)
             ) {
                 Text(
                     if (targetNetworkSig.isBlank()) "تعيين شبكة الواي فاي الحالية للمراقبة"
-                    else "تحديث الشبكة المحددة (الحالية: $targetNetworkSig)",
+                    else "تحديث الشبكة المحددة (${NetworkScanner.formatSignatureForDisplay(targetNetworkSig)})",
                     fontSize = 12.sp
                 )
             }

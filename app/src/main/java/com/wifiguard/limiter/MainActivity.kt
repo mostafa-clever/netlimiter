@@ -48,8 +48,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private val notifPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
+    private val multiPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
     ) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -186,14 +186,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestNotificationPermissionIfNeeded() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val granted = ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.POST_NOTIFICATIONS
-            ) == PackageManager.PERMISSION_GRANTED
-            if (!granted) {
-                notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            needed.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        if (needed.isNotEmpty()) {
+            multiPermissionLauncher.launch(needed.toTypedArray())
         }
     }
 }

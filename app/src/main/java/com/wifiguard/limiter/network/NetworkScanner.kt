@@ -3,6 +3,9 @@ package com.wifiguard.limiter.network
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.LinkProperties
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
+import android.os.Build
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -11,6 +14,8 @@ import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
 
@@ -37,12 +42,105 @@ object NetworkScanner {
         return gw?.hostAddress ?: ""
     }
 
+    private fun getWifiSsidAndBssid(context: Context): Pair<String, String> {
+        return runCatching {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val net = cm.activeNetwork
+            val caps = if (net != null) cm.getNetworkCapabilities(net) else null
+            val info: WifiInfo? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && caps?.transportInfo is WifiInfo) {
+                caps.transportInfo as WifiInfo
+            } else {
+                val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                @Suppress("DEPRECATION")
+                wm.connectionInfo
+            }
+            val rawSsid = info?.ssid?.trim('"') ?: ""
+            val ssid = if (rawSsid.equals("<unknown ssid>", ignoreCase = true)) "" else rawSsid
+            val rawBssid = info?.bssid?.lowercase() ?: ""
+            val bssid = if (rawBssid == "02:00:00:00:00:00" || rawBssid == "00:00:00:00:00:00") "" else rawBssid
+            ssid to bssid
+        }.getOrDefault("" to "")
+    }
+
+    /**
+     * Returns a unique hardware fingerprint for the current Wi-Fi network:
+     * format: "ssid=<SSID>|bssid=<AP_MAC>|gwmac=<ROUTER_MAC>"
+     * Never relies on common router IP (192.168.1.1) alone.
+     */
     fun getCurrentWifiSignature(context: Context): String {
+        val (ssid, bssid) = getWifiSsidAndBssid(context)
         val gwIp = getGatewayIp(context)
-        if (gwIp.isBlank()) return ""
-        val peers = readArpAndNeighTable()
-        val gwMac = peers.firstOrNull { it.ip == gwIp }?.mac ?: ""
-        return if (gwMac.isNotBlank()) "$gwIp|$gwMac" else gwIp
+        var gwMac = ""
+        if (gwIp.isNotBlank()) {
+            val peers = readArpAndNeighTable()
+            gwMac = peers.firstOrNull { it.ip == gwIp }?.mac ?: ""
+        }
+        val parts = mutableListOf<String>()
+        if (ssid.isNotBlank()) parts.add("ssid=$ssid")
+        if (bssid.isNotBlank()) parts.add("bssid=$bssid")
+        if (gwMac.isNotBlank()) parts.add("gwmac=$gwMac")
+        return parts.joinToString("|")
+    }
+
+    suspend fun getCurrentWifiSignatureActive(context: Context): String = withContext(Dispatchers.IO) {
+        val gwIp = getGatewayIp(context)
+        if (gwIp.isNotBlank()) {
+            probeIpForArp(gwIp)
+        }
+        getCurrentWifiSignature(context)
+    }
+
+    fun formatSignatureForDisplay(sig: String): String {
+        if (sig.isBlank()) return "غير محددة"
+        val map = parseSig(sig)
+        val ssid = map["ssid"] ?: ""
+        val mac = map["bssid"] ?: map["gwmac"] ?: ""
+        return when {
+            ssid.isNotBlank() && mac.isNotBlank() -> "$ssid ($mac)"
+            ssid.isNotBlank() -> ssid
+            mac.isNotBlank() -> "راوتر ($mac)"
+            else -> sig
+        }
+    }
+
+    fun matchesNetworkSignature(current: String, target: String): Boolean {
+        if (current.isBlank() || target.isBlank()) return false
+        val cur = parseSig(current)
+        val tgt = parseSig(target)
+
+        // 1. Exact Router BSSID match (strongest, globally unique)
+        val curBssid = cur["bssid"]
+        val tgtBssid = tgt["bssid"]
+        if (!curBssid.isNullOrBlank() && !tgtBssid.isNullOrBlank()) {
+            return curBssid.equals(tgtBssid, ignoreCase = true)
+        }
+
+        // 2. Exact Router Gateway MAC match (globally unique)
+        val curGwMac = cur["gwmac"]
+        val tgtGwMac = tgt["gwmac"]
+        if (!curGwMac.isNullOrBlank() && !tgtGwMac.isNullOrBlank()) {
+            return curGwMac.equals(tgtGwMac, ignoreCase = true)
+        }
+
+        // 3. Fallback to SSID match if hardware MAC unavailable
+        val curSsid = cur["ssid"]
+        val tgtSsid = tgt["ssid"]
+        if (!curSsid.isNullOrBlank() && !tgtSsid.isNullOrBlank()) {
+            return curSsid == tgtSsid
+        }
+
+        return false
+    }
+
+    private fun parseSig(sig: String): Map<String, String> {
+        val map = mutableMapOf<String, String>()
+        sig.split("|").forEach { part ->
+            val idx = part.indexOf('=')
+            if (idx > 0) {
+                map[part.substring(0, idx)] = part.substring(idx + 1)
+            }
+        }
+        return map
     }
 
     suspend fun probeIpForArp(ip: String) = withContext(Dispatchers.IO) {
@@ -50,9 +148,8 @@ object NetworkScanner {
         runCatching {
             val addr = InetAddress.getByName(ip)
             addr.isReachable(350)
-            // Also send a tiny UDP packet to trigger kernel ARP resolution even if ICMP is ignored
-            java.net.DatagramSocket().use { ds ->
-                val pkt = java.net.DatagramPacket(byteArrayOf(0), 1, addr, 5353)
+            DatagramSocket().use { ds ->
+                val pkt = DatagramPacket(byteArrayOf(0), 1, addr, 5353)
                 ds.send(pkt)
             }
         }
@@ -63,7 +160,6 @@ object NetworkScanner {
         if (myIp.isBlank() || !myIp.contains(".")) return@withContext emptyList()
         val prefix = myIp.substringBeforeLast(".")
 
-        // Fast parallel reachability sweep to populate kernel neighbor/ARP table
         coroutineScope {
             (1..254).chunked(32).forEach { chunk ->
                 chunk.map { lastOctet ->
@@ -83,12 +179,10 @@ object NetworkScanner {
     fun readArpAndNeighTable(): List<LanPeer> {
         val map = linkedMapOf<String, String>()
 
-        // 1. Try `ip neigh` (works on Android 10+ where /proc/net/arp may be restricted)
         runCatching {
             val proc = ProcessBuilder("ip", "neigh").start()
             BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
                 reader.forEachLine { line ->
-                    // Example: 192.168.1.15 dev wlan0 lladdr aa:bb:cc:dd:ee:ff REACHABLE
                     val parts = line.trim().split(Regex("\\s+"))
                     if (parts.size >= 5) {
                         val ip = parts[0]
@@ -105,7 +199,6 @@ object NetworkScanner {
             }
         }
 
-        // 2. Fallback / supplement with /proc/net/arp
         runCatching {
             val file = File("/proc/net/arp")
             if (file.exists() && file.canRead()) {

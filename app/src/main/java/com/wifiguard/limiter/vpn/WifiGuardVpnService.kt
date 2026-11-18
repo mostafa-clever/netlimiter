@@ -192,12 +192,12 @@ class WifiGuardVpnService : VpnService() {
                     dnsHandler.upstreamDnsIp = cfg.speedPolicy.upstreamDnsIp
                     val onWifi = isOnWifi()
 
-                    val currentWifiSig = if (onWifi) NetworkScanner.getCurrentWifiSignature(applicationContext) else ""
+                    val currentWifiSig = if (onWifi) NetworkScanner.getCurrentWifiSignature(applicationContext).ifBlank { NetworkScanner.getCurrentWifiSignatureActive(applicationContext) } else ""
                     val outsideTargetWifi = cfg.targetNetworkOnly &&
                         cfg.targetNetworkSig.isNotBlank() &&
                         onWifi &&
                         currentWifiSig.isNotBlank() &&
-                        !matchesNetworkSignature(currentWifiSig, cfg.targetNetworkSig)
+                        !NetworkScanner.matchesNetworkSignature(currentWifiSig, cfg.targetNetworkSig)
 
                     if (outsideTargetWifi) {
                         lastTrafficBytes = -1L
