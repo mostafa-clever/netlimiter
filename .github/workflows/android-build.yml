@@ -7,6 +7,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -29,8 +32,13 @@ jobs:
       - name: Build Debug APK
         run: gradle assembleDebug --no-daemon
 
-      - name: Upload Debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: wifiguard-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk WifiGuard.apk
+
+      - name: Publish Direct APK to GitHub Releases
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes || true
+          gh release create latest WifiGuard.apk --title "WifiGuard Latest APK" --notes "Direct APK download (not zipped)."

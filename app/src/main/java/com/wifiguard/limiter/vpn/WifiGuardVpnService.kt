@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.TrafficStats
@@ -14,6 +15,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import com.wifiguard.limiter.MainActivity
 import com.wifiguard.limiter.admin.WifiGuardDeviceAdminReceiver
 import com.wifiguard.limiter.data.PreferencesManager
@@ -69,19 +71,23 @@ class WifiGuardVpnService : VpnService() {
         val blockedAdsCount: StateFlow<Long> = _blockedAdsCount
 
         fun start(context: Context) {
-            val intent = Intent(context, WifiGuardVpnService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            runCatching {
+                val intent = Intent(context, WifiGuardVpnService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
             }
         }
 
         fun stop(context: Context) {
-            val intent = Intent(context, WifiGuardVpnService::class.java).apply {
-                action = ACTION_STOP
+            runCatching {
+                val intent = Intent(context, WifiGuardVpnService::class.java).apply {
+                    action = ACTION_STOP
+                }
+                context.startService(intent)
             }
-            context.startService(intent)
         }
     }
 
@@ -90,9 +96,23 @@ class WifiGuardVpnService : VpnService() {
         prefs = PreferencesManager(applicationContext)
         dnsHandler = DnsPacketHandler(this)
         createNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification("جاري تشغيل حماية الاتصال...", "التوفير الذكي نشط"))
+        val notif = buildNotification("جاري تشغيل حماية الاتصال...", "التوفير الذكي نشط")
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIF_ID,
+                    notif,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+        }
         _isRunning.value = true
-        establishTunnel(useFullTunnel = false, whitelist = emptySet())
+        serviceScope.launch {
+            runCatching { establishTunnel(useFullTunnel = false, whitelist = emptySet()) }
+        }
         startMonitoringLoop()
         startHeartbeatLoop()
     }
@@ -133,7 +153,7 @@ class WifiGuardVpnService : VpnService() {
         super.onDestroy()
         _isRunning.value = false
         packetLoopJob?.cancel()
-        forwarder?.close()
+        runCatching { forwarder?.close() }
         forwarder = null
         runCatching { tunInterface?.close() }
         tunInterface = null
@@ -148,95 +168,94 @@ class WifiGuardVpnService : VpnService() {
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
 
             while (isActive) {
-                val cfg = prefs.getLocalLimitConfig()
-                val onWifi = isOnWifi()
+                runCatching {
+                    val cfg = prefs.getLocalLimitConfig()
+                    val onWifi = isOnWifi()
 
-                // Check if limits are restricted to the target Wi-Fi network only
-                val currentWifiSig = if (onWifi) NetworkScanner.getCurrentWifiSignature(applicationContext) else ""
-                val outsideTargetWifi = cfg.targetNetworkOnly &&
-                    cfg.targetNetworkSig.isNotBlank() &&
-                    onWifi &&
-                    currentWifiSig.isNotBlank() &&
-                    !matchesNetworkSignature(currentWifiSig, cfg.targetNetworkSig)
+                    val currentWifiSig = if (onWifi) NetworkScanner.getCurrentWifiSignature(applicationContext) else ""
+                    val outsideTargetWifi = cfg.targetNetworkOnly &&
+                        cfg.targetNetworkSig.isNotBlank() &&
+                        onWifi &&
+                        currentWifiSig.isNotBlank() &&
+                        !matchesNetworkSignature(currentWifiSig, cfg.targetNetworkSig)
 
-                if (outsideTargetWifi) {
-                    lastTrafficBytes = -1L
-                    _connectionState.value = ConnectionState.OUTSIDE_TARGET_WIFI
-                    _statusLabel.value = "خارج الشبكة المحددة — بلا قيود"
-                    tokenBucket.setRateBytesPerSec(Long.MAX_VALUE)
-                    if (currentUseFullTunnel || cfg.whitelist != currentWhitelist) {
-                        establishTunnel(useFullTunnel = false, whitelist = cfg.whitelist)
-                    }
-                    updateNotification("متصل بشبكة أخرى", "خارج الشبكة المحددة — بلا قيود")
-                    delay(2000L)
-                    continue
-                }
-
-                var intervalBytes = 0L
-                if (onWifi) {
-                    val currentTotal = TrafficStats.getTotalRxBytes() + TrafficStats.getTotalTxBytes()
-                    if (lastTrafficBytes > 0L && currentTotal > lastTrafficBytes) {
-                        val delta = currentTotal - lastTrafficBytes
-                        if (delta < 100L * 1024L * 1024L) {
-                            intervalBytes = delta
-                            prefs.addUsedBytes(delta)
+                    if (outsideTargetWifi) {
+                        lastTrafficBytes = -1L
+                        _connectionState.value = ConnectionState.OUTSIDE_TARGET_WIFI
+                        _statusLabel.value = "خارج الشبكة المحددة — بلا قيود"
+                        tokenBucket.setRateBytesPerSec(Long.MAX_VALUE)
+                        if (currentUseFullTunnel || cfg.whitelist != currentWhitelist) {
+                            establishTunnel(useFullTunnel = false, whitelist = cfg.whitelist)
                         }
+                        updateNotification("متصل بشبكة أخرى", "خارج الشبكة المحددة — بلا قيود")
+                    } else {
+                        var intervalBytes = 0L
+                        if (onWifi) {
+                            val currentTotal = TrafficStats.getTotalRxBytes() + TrafficStats.getTotalTxBytes()
+                            if (lastTrafficBytes > 0L && currentTotal > lastTrafficBytes) {
+                                val delta = currentTotal - lastTrafficBytes
+                                if (delta < 100L * 1024L * 1024L) {
+                                    intervalBytes = delta
+                                    prefs.addUsedBytes(delta)
+                                }
+                            }
+                            lastTrafficBytes = currentTotal
+                        } else {
+                            lastTrafficBytes = -1L
+                        }
+
+                        if (!powerManager.isInteractive) {
+                            screenOffSeconds++
+                        } else {
+                            screenOffSeconds = 0
+                        }
+                        val isScreenOffIdle = screenOffSeconds >= 60
+
+                        val usedMb = prefs.getUsedMbActivePeriod()
+
+                        recent60sBytes.addLast(intervalBytes)
+                        if (recent60sBytes.size > 60) recent60sBytes.removeFirst()
+                        val burstThresholdBytes = cfg.speedPolicy.burstThresholdMbPerMin.toLong() * 1024L * 1024L
+                        if (recent60sBytes.sum() > burstThresholdBytes) {
+                            burstCooldownTicks = 120
+                        } else if (burstCooldownTicks > 0) {
+                            burstCooldownTicks--
+                        }
+
+                        val effective = computeEffectiveSpeed(
+                            usedMb = usedMb,
+                            limitMb = cfg.limitMb,
+                            policy = cfg.speedPolicy,
+                            forcedBySupervisor = cfg.forceQuotaSaver,
+                            globalSpeedCapMbPerSec = cfg.globalSpeedCapMbps,
+                            burstDetected = burstCooldownTicks > 0,
+                            isScreenOffIdle = isScreenOffIdle
+                        )
+
+                        _connectionState.value = effective.state
+                        _statusLabel.value = effective.statusLabelArabic
+                        _blockedAdsCount.value = dnsHandler.blockedRequestsCount.get()
+
+                        tokenBucket.setRateBytesPerSec(effective.targetBytesPerSec)
+                        val blockAllNow = effective.state == ConnectionState.BLOCKED || effective.state == ConnectionState.IDLE_FROZEN
+                        val needsFullTunnel = blockAllNow || effective.targetBytesPerSec < Long.MAX_VALUE
+
+                        forwarder?.flags = Tun2NetForwarder.PacketPolicyFlags(
+                            blockAll = blockAllNow,
+                            sinkholeEnabled = effective.saverActive && cfg.speedPolicy.dnsSinkholeEnabled,
+                            cacheEnabled = effective.saverActive && cfg.speedPolicy.dnsCacheEnabled,
+                            blockDohDot = effective.saverActive && cfg.speedPolicy.blockDohDotEnabled,
+                            blockQuicUdp443 = effective.saverActive && cfg.speedPolicy.blockQuicUdp443Enabled
+                        )
+
+                        if (needsFullTunnel != currentUseFullTunnel || cfg.whitelist != currentWhitelist || tunInterface == null) {
+                            establishTunnel(useFullTunnel = needsFullTunnel, whitelist = cfg.whitelist)
+                        }
+
+                        val summary = "${cfg.limitPeriod.arabicLabel}: ${formatDataSizeArabic(usedMb)} من ${formatDataSizeArabic(cfg.limitMb)}"
+                        updateNotification(summary, effective.statusLabelArabic)
                     }
-                    lastTrafficBytes = currentTotal
-                } else {
-                    lastTrafficBytes = -1L
                 }
-
-                if (!powerManager.isInteractive) {
-                    screenOffSeconds++
-                } else {
-                    screenOffSeconds = 0
-                }
-                val isScreenOffIdle = screenOffSeconds >= 60
-
-                val usedMb = prefs.getUsedMbActivePeriod()
-
-                recent60sBytes.addLast(intervalBytes)
-                if (recent60sBytes.size > 60) recent60sBytes.removeFirst()
-                val burstThresholdBytes = cfg.speedPolicy.burstThresholdMbPerMin.toLong() * 1024L * 1024L
-                if (recent60sBytes.sum() > burstThresholdBytes) {
-                    burstCooldownTicks = 120
-                } else if (burstCooldownTicks > 0) {
-                    burstCooldownTicks--
-                }
-
-                val effective = computeEffectiveSpeed(
-                    usedMb = usedMb,
-                    limitMb = cfg.limitMb,
-                    policy = cfg.speedPolicy,
-                    forcedBySupervisor = cfg.forceQuotaSaver,
-                    globalSpeedCapMbPerSec = cfg.globalSpeedCapMbps,
-                    burstDetected = burstCooldownTicks > 0,
-                    isScreenOffIdle = isScreenOffIdle
-                )
-
-                _connectionState.value = effective.state
-                _statusLabel.value = effective.statusLabelArabic
-                _blockedAdsCount.value = dnsHandler.blockedRequestsCount.get()
-
-                tokenBucket.setRateBytesPerSec(effective.targetBytesPerSec)
-                val blockAllNow = effective.state == ConnectionState.BLOCKED || effective.state == ConnectionState.IDLE_FROZEN
-                val needsFullTunnel = blockAllNow || effective.targetBytesPerSec < Long.MAX_VALUE
-
-                forwarder?.flags = Tun2NetForwarder.PacketPolicyFlags(
-                    blockAll = blockAllNow,
-                    sinkholeEnabled = effective.saverActive && cfg.speedPolicy.dnsSinkholeEnabled,
-                    cacheEnabled = effective.saverActive && cfg.speedPolicy.dnsCacheEnabled,
-                    blockDohDot = effective.saverActive && cfg.speedPolicy.blockDohDotEnabled,
-                    blockQuicUdp443 = effective.saverActive && cfg.speedPolicy.blockQuicUdp443Enabled
-                )
-
-                if (needsFullTunnel != currentUseFullTunnel || cfg.whitelist != currentWhitelist) {
-                    establishTunnel(useFullTunnel = needsFullTunnel, whitelist = cfg.whitelist)
-                }
-
-                val summary = "${cfg.limitPeriod.arabicLabel}: ${formatDataSizeArabic(usedMb)} من ${formatDataSizeArabic(cfg.limitMb)}"
-                updateNotification(summary, effective.statusLabelArabic)
 
                 delay(1000L)
             }
@@ -257,36 +276,38 @@ class WifiGuardVpnService : VpnService() {
     private fun startHeartbeatLoop() {
         serviceScope.launch {
             while (isActive) {
-                val role = prefs.roleFlow.first()
-                if (role == AppRole.CLIENT) {
-                    val host = prefs.getSupervisorHost()
-                    val port = prefs.getSupervisorPort()
-                    if (host.isNotBlank()) {
-                        val id = prefs.getOrCreateDeviceId()
-                        val name = prefs.getDeviceName()
-                        val usedMb = prefs.getUsedMbActivePeriod()
-                        val adminActive = WifiGuardDeviceAdminReceiver.isActive(applicationContext)
-                        val updated = LocalLanClient.sendHeartbeat(
-                            host = host,
-                            port = port,
-                            deviceId = id,
-                            deviceName = name,
-                            usedMb = usedMb,
-                            protectionActive = _isRunning.value,
-                            uninstallProtectionActive = adminActive,
-                            connectionState = _connectionState.value
-                        )
-                        if (updated != null) {
-                            prefs.updateLocalLimits(
-                                limitMb = updated.dailyLimitMb,
-                                limitPeriod = updated.limitPeriod,
-                                speedPolicy = updated.speedPolicy,
-                                whitelist = updated.whitelistedPackages,
-                                globalSpeedCapMbps = updated.globalSpeedCapMbps,
-                                forceQuotaSaver = updated.forceQuotaSaver,
-                                targetNetworkOnly = updated.targetNetworkOnly,
-                                targetNetworkSig = updated.targetNetworkSig
+                runCatching {
+                    val role = prefs.roleFlow.first()
+                    if (role == AppRole.CLIENT) {
+                        val host = prefs.getSupervisorHost()
+                        val port = prefs.getSupervisorPort()
+                        if (host.isNotBlank()) {
+                            val id = prefs.getOrCreateDeviceId()
+                            val name = prefs.getDeviceName()
+                            val usedMb = prefs.getUsedMbActivePeriod()
+                            val adminActive = WifiGuardDeviceAdminReceiver.isActive(applicationContext)
+                            val updated = LocalLanClient.sendHeartbeat(
+                                host = host,
+                                port = port,
+                                deviceId = id,
+                                deviceName = name,
+                                usedMb = usedMb,
+                                protectionActive = _isRunning.value,
+                                uninstallProtectionActive = adminActive,
+                                connectionState = _connectionState.value
                             )
+                            if (updated != null) {
+                                prefs.updateLocalLimits(
+                                    limitMb = updated.dailyLimitMb,
+                                    limitPeriod = updated.limitPeriod,
+                                    speedPolicy = updated.speedPolicy,
+                                    whitelist = updated.whitelistedPackages,
+                                    globalSpeedCapMbps = updated.globalSpeedCapMbps,
+                                    forceQuotaSaver = updated.forceQuotaSaver,
+                                    targetNetworkOnly = updated.targetNetworkOnly,
+                                    targetNetworkSig = updated.targetNetworkSig
+                                )
+                            }
                         }
                     }
                 }
@@ -297,7 +318,7 @@ class WifiGuardVpnService : VpnService() {
 
     private fun establishTunnel(useFullTunnel: Boolean, whitelist: Set<String>) {
         packetLoopJob?.cancel()
-        forwarder?.close()
+        runCatching { forwarder?.close() }
         forwarder = null
         runCatching { tunInterface?.close() }
         currentUseFullTunnel = useFullTunnel
@@ -312,7 +333,6 @@ class WifiGuardVpnService : VpnService() {
         if (useFullTunnel) {
             builder.addRoute("0.0.0.0", 0)
         } else {
-            // Unlimited / Outside target network: route only local DNS (10.0.0.1) + dummy subnet so TCP/UDP runs at 100% native Wi-Fi speed
             builder.addRoute("10.0.0.1", 32)
             builder.addRoute("10.254.0.0", 16)
         }
@@ -327,7 +347,7 @@ class WifiGuardVpnService : VpnService() {
         val pfd = tunInterface ?: return
         val input = FileInputStream(pfd.fileDescriptor)
         val output = FileOutputStream(pfd.fileDescriptor)
-        val fwd = Tun2NetForwarder(this, dnsHandler, tokenBucket, output)
+        val fwd = runCatching { Tun2NetForwarder(this, dnsHandler, tokenBucket, output) }.getOrNull() ?: return
         forwarder = fwd
 
         packetLoopJob = serviceScope.launch {
@@ -336,7 +356,7 @@ class WifiGuardVpnService : VpnService() {
                 val len = runCatching { input.read(buffer) }.getOrElse { -1 }
                 if (len < 0) break
                 if (len > 0) {
-                    fwd.processTunPacket(buffer, len)
+                    runCatching { fwd.processTunPacket(buffer, len) }
                 }
             }
         }
@@ -379,7 +399,9 @@ class WifiGuardVpnService : VpnService() {
     }
 
     private fun updateNotification(text: String, title: String) {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIF_ID, buildNotification(text, title))
+        runCatching {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.notify(NOTIF_ID, buildNotification(text, title))
+        }
     }
 }

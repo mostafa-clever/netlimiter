@@ -10,7 +10,9 @@ import android.content.Intent
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
+import android.content.pm.ServiceInfo
 import android.os.IBinder
+import androidx.core.app.ServiceCompat
 import androidx.core.app.NotificationCompat
 import com.wifiguard.limiter.MainActivity
 import com.wifiguard.limiter.data.PreferencesManager
@@ -71,7 +73,14 @@ class SupervisorServerService : Service() {
         super.onCreate()
         prefs = PreferencesManager(applicationContext)
         createNotificationChannels()
-        startForeground(NOTIF_ID, buildForegroundNotification())
+        runCatching {
+            val notif = buildForegroundNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                ServiceCompat.startForeground(this, NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+        }
         registerNsdService()
         startHttpServer()
         startOfflineAndMacCheatWatchdog()

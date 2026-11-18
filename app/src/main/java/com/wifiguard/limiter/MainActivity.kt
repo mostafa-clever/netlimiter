@@ -51,7 +51,7 @@ class MainActivity : ComponentActivity() {
                 val role by prefs.roleFlow.collectAsState(initial = AppRole.UNSET)
                 val selfLimit by prefs.selfLimitEnabledFlow.collectAsState(initial = false)
 
-                LaunchedEffect(role) {
+                LaunchedEffect(role, selfLimit) {
                     if (role == AppRole.SUPERVISOR) {
                         SupervisorServerService.start(this@MainActivity)
                         if (selfLimit) {
@@ -95,11 +95,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startVpnWithPermission() {
-        val intent = VpnService.prepare(this)
-        if (intent != null) {
-            vpnPermissionLauncher.launch(intent)
-        } else {
-            WifiGuardVpnService.start(this)
+        runCatching {
+            val intent = VpnService.prepare(this)
+            if (intent != null) {
+                vpnPermissionLauncher.launch(intent)
+            } else {
+                WifiGuardVpnService.start(this)
+            }
         }
     }
 
