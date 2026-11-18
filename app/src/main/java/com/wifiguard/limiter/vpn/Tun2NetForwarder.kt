@@ -1,6 +1,9 @@
 package com.wifiguard.limiter.vpn
 
+import android.content.Context
+import android.net.ConnectivityManager
 import android.net.VpnService
+import android.os.Build
 import java.io.FileOutputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -32,6 +35,49 @@ class Tun2NetForwarder(
     @Volatile
     var flags: PacketPolicyFlags = PacketPolicyFlags()
 
+    private val connManager = vpnService.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private val uidBytesWindow = ConcurrentHashMap<Int, Long>()
+    private val burstThrottledUntil = ConcurrentHashMap<Int, Long>()
+    private val burstBucket = TokenBucket()
+    @Volatile var burstThresholdBytesPerMin: Long = 50L * 1024L * 1024L
+    @Volatile var burstGuardEnabled: Boolean = true
+    @Volatile var burstCapMbps: Double = 1.0
+    @Volatile private var lastWindowResetMs: Long = System.currentTimeMillis()
+
+    private fun resolveOwnerUid(protocol: Int, srcIp: ByteArray, srcPort: Int, dstIp: ByteArray, dstPort: Int): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return -1
+        return runCatching {
+            val local = InetSocketAddress(InetAddress.getByAddress(srcIp), srcPort)
+            val remote = InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort)
+            connManager.getConnectionOwnerUid(protocol, local, remote)
+        }.getOrDefault(-1)
+    }
+
+    private fun recordUidBytesAndCheckBurst(uid: Int, bytes: Int) {
+        if (uid <= 0 || !burstGuardEnabled) return
+        val now = System.currentTimeMillis()
+        if (now - lastWindowResetMs > 60_000L) {
+            uidBytesWindow.clear()
+            lastWindowResetMs = now
+        }
+        val total = (uidBytesWindow[uid] ?: 0L) + bytes
+        uidBytesWindow[uid] = total
+        if (total > burstThresholdBytesPerMin) {
+            burstThrottledUntil[uid] = now + 120_000L
+            burstBucket.setRateMbps(burstCapMbps)
+        }
+    }
+
+    private fun isUidBurstThrottled(uid: Int): Boolean {
+        if (uid <= 0 || !burstGuardEnabled) return false
+        val until = burstThrottledUntil[uid] ?: return false
+        if (System.currentTimeMillis() > until) {
+            burstThrottledUntil.remove(uid)
+            return false
+        }
+        return true
+    }
+
     private data class FlowKey(
         val protocol: Int,
         val srcIpInt: Int,
@@ -44,6 +90,7 @@ class Tun2NetForwarder(
 
     private class TcpSession(
         val key: FlowKey,
+        val ownerUid: Int = -1,
         val srcIp: ByteArray,
         val dstIp: ByteArray,
         val channel: SocketChannel,
@@ -56,6 +103,7 @@ class Tun2NetForwarder(
 
     private class UdpSession(
         val key: FlowKey,
+        val ownerUid: Int = -1,
         val srcIp: ByteArray,
         val dstIp: ByteArray,
         val channel: DatagramChannel,
@@ -171,7 +219,8 @@ class Tun2NetForwarder(
             vpnService.protect(dc.socket())
             dc.configureBlocking(false)
             dc.connect(InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort))
-            val session = UdpSession(key, srcIp, dstIp, dc)
+            val uid = resolveOwnerUid(17, srcIp, srcPort, dstIp, dstPort)
+            val session = UdpSession(key, uid, srcIp, dstIp, dc)
             udpSessions[key] = session
             pendingRegistrations.add {
                 runCatching {
@@ -237,8 +286,10 @@ class Tun2NetForwarder(
                 sc.socket().tcpNoDelay = true
                 val connected = sc.connect(InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort))
                 val initialMySeq = Random.nextLong(1000L, 0x7FFFFFFFL)
+                val uid = resolveOwnerUid(6, srcIp, srcPort, dstIp, dstPort)
                 val session = TcpSession(
                     key = key,
+                    ownerUid = uid,
                     srcIp = srcIp,
                     dstIp = dstIp,
                     channel = sc,
@@ -408,7 +459,9 @@ class Tun2NetForwarder(
         }
 
         if (key.isReadable) {
-            val avail = tokenBucket.availableBytes()
+            val uidThrottled = isUidBurstThrottled(session.ownerUid)
+            val activeBucket = if (uidThrottled) burstBucket else tokenBucket
+            val avail = activeBucket.availableBytes()
             if (avail < 256) {
                 key.interestOps(key.interestOps() and SelectionKey.OP_READ.inv())
                 return
@@ -433,6 +486,8 @@ class Tun2NetForwarder(
             if (bytesRead > 0) {
                 session.lastActivityMs = System.currentTimeMillis()
                 tokenBucket.consume(bytesRead)
+                if (uidThrottled) burstBucket.consume(bytesRead)
+                recordUidBytesAndCheckBurst(session.ownerUid, bytesRead)
                 val data = ByteArray(bytesRead)
                 readBuf.flip()
                 readBuf.get(data)
@@ -451,7 +506,8 @@ class Tun2NetForwarder(
 
     private fun handleUdpKey(key: SelectionKey, session: UdpSession, udpBuf: ByteBuffer) {
         if (!key.isReadable) return
-        val avail = tokenBucket.availableBytes()
+        val uidThrottled = isUidBurstThrottled(session.ownerUid)
+        val avail = (if (uidThrottled) burstBucket else tokenBucket).availableBytes()
         if (avail < 256) return
 
         udpBuf.clear()
@@ -459,6 +515,8 @@ class Tun2NetForwarder(
         if (read > 0) {
             session.lastActivityMs = System.currentTimeMillis()
             tokenBucket.consume(read)
+            if (uidThrottled) burstBucket.consume(read)
+            recordUidBytesAndCheckBurst(session.ownerUid, read)
             val data = ByteArray(read)
             udpBuf.flip()
             udpBuf.get(data)

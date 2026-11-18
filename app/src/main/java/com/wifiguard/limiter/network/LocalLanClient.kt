@@ -41,6 +41,7 @@ object LocalLanClient {
 
     const val SERVICE_TYPE = "_wifiguard._tcp."
     const val DEFAULT_PORT = 8765
+    const val CLIENT_PORT = 8766
 
     fun discoverSupervisors(context: Context): Flow<List<DiscoveredSupervisor>> = callbackFlow {
         val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
@@ -166,6 +167,49 @@ object LocalLanClient {
             }
             postJson("http://$host:$port/tamper", payload)
         }
+    }
+
+    suspend fun pushConfigToClient(
+        clientIp: String,
+        dailyLimitMb: Long,
+        limitPeriod: LimitPeriod,
+        speedPolicy: SpeedPolicyConfig,
+        whitelistedPackages: List<String>,
+        globalSpeedCapMbps: Double,
+        forceQuotaSaver: Boolean,
+        targetNetworkOnly: Boolean,
+        targetNetworkSig: String
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (clientIp.isBlank()) return@withContext false
+        runCatching {
+            val payload = JSONObject().apply {
+                put("dailyLimitMb", dailyLimitMb)
+                put("limitPeriod", limitPeriod.name)
+                put("speedPolicy", speedPolicy.toJson())
+                put("whitelistedPackages", JSONArray(whitelistedPackages))
+                put("globalSpeedCapMbps", globalSpeedCapMbps)
+                put("forceQuotaSaver", forceQuotaSaver)
+                put("targetNetworkOnly", targetNetworkOnly)
+                put("targetNetworkSig", targetNetworkSig)
+            }
+            val resp = postJson("http://$clientIp:$CLIENT_PORT/config", payload)
+            resp.optBoolean("ok", false)
+        }.getOrDefault(false)
+    }
+
+    suspend fun fetchClientStatus(clientIp: String): JSONObject? = withContext(Dispatchers.IO) {
+        if (clientIp.isBlank()) return@withContext null
+        runCatching {
+            val url = URL("http://$clientIp:$CLIENT_PORT/status")
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 3000
+                readTimeout = 3000
+            }
+            val text = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
+            conn.disconnect()
+            JSONObject(text)
+        }.getOrNull()
     }
 
     private fun parseConfig(resp: JSONObject): SyncedLimitConfig {

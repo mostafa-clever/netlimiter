@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.net.nsd.NsdManager
+import android.net.wifi.WifiManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.content.pm.ServiceInfo
@@ -44,6 +45,7 @@ class SupervisorServerService : Service() {
     private var serverSocket: ServerSocket? = null
     private var nsdManager: NsdManager? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private val alertedOfflineDevices = mutableSetOf<String>()
     private val alertedMacCheatDevices = mutableSetOf<String>()
 
@@ -82,6 +84,14 @@ class SupervisorServerService : Service() {
                 startForeground(NOTIF_ID, notif)
             }
         }
+        runCatching {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "WifiGuard:SupervisorLock").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
         registerNsdService()
         startHttpServer()
         startOfflineAndMacCheatWatchdog()
@@ -95,6 +105,7 @@ class SupervisorServerService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
         runCatching { serverSocket?.close() }
         runCatching {
             registrationListener?.let { nsdManager?.unregisterService(it) }
@@ -360,7 +371,7 @@ class SupervisorServerService : Service() {
                         }
                     }
 
-                    val heartbeatTimedOut = cur.lastSeenMillis > 0L && (now - cur.lastSeenMillis > 50_000L)
+                    val heartbeatTimedOut = cur.lastSeenMillis > 0L && (now - cur.lastSeenMillis > 120_000L)
                     if (heartbeatTimedOut && cur.isOnline) {
                         cur = cur.copy(isOnline = false)
                         changed = true

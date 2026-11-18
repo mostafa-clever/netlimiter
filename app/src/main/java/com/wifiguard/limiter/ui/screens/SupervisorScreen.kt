@@ -94,6 +94,7 @@ import com.wifiguard.limiter.model.TamperAlert
 import com.wifiguard.limiter.model.formatDataSizeArabic
 import com.wifiguard.limiter.model.formatSpeedArabic
 import com.wifiguard.limiter.network.NetworkScanner
+import com.wifiguard.limiter.network.LocalLanClient
 import com.wifiguard.limiter.network.SupervisorServerService
 import com.wifiguard.limiter.ui.components.UsageRingCard
 import com.wifiguard.limiter.ui.components.WhitelistPickerDialog
@@ -227,7 +228,22 @@ fun SupervisorScreen(
                     onClearAlerts = { scope.launch { prefs.clearTamperAlerts() } },
                     onEditDevice = { editingDevice = it },
                     onQuickGlobalCapChange = { cap ->
-                        scope.launch { prefs.setGlobalSpeedCapMbps(cap) }
+                        scope.launch {
+                            prefs.setGlobalSpeedCapMbps(cap)
+                            devices.forEach { d ->
+                                LocalLanClient.pushConfigToClient(
+                                    clientIp = d.lastKnownIp,
+                                    dailyLimitMb = d.dailyLimitMb,
+                                    limitPeriod = d.limitPeriod,
+                                    speedPolicy = d.speedPolicy,
+                                    whitelistedPackages = d.whitelistedPackages,
+                                    globalSpeedCapMbps = cap,
+                                    forceQuotaSaver = forceQuotaSaverAll || d.forceQuotaSaver,
+                                    targetNetworkOnly = targetNetworkOnly,
+                                    targetNetworkSig = targetNetworkSig
+                                )
+                            }
+                        }
                     }
                 )
                 1 -> SelfLimitTab(
@@ -321,7 +337,20 @@ fun SupervisorScreen(
             device = device,
             onDismiss = { editingDevice = null },
             onSave = { updated ->
-                scope.launch { prefs.upsertManagedDevice(updated) }
+                scope.launch {
+                    prefs.upsertManagedDevice(updated)
+                    LocalLanClient.pushConfigToClient(
+                        clientIp = updated.lastKnownIp,
+                        dailyLimitMb = updated.dailyLimitMb,
+                        limitPeriod = updated.limitPeriod,
+                        speedPolicy = updated.speedPolicy,
+                        whitelistedPackages = updated.whitelistedPackages,
+                        globalSpeedCapMbps = globalSpeedCapMbps,
+                        forceQuotaSaver = forceQuotaSaverAll || updated.forceQuotaSaver,
+                        targetNetworkOnly = targetNetworkOnly,
+                        targetNetworkSig = targetNetworkSig
+                    )
+                }
                 editingDevice = null
             },
             onDelete = {
@@ -1229,6 +1258,22 @@ private fun SmartAutomationControls(
             value = policy.burstThresholdMbPerMin.toFloat(),
             onValueChange = { onChange(policy.copy(burstThresholdMbPerMin = it.toInt())) },
             valueRange = 20f..150f
+        )
+        var burstCapText by remember(policy.burstCapSpeedMbPerSec) {
+            mutableStateOf(policy.burstCapSpeedMbPerSec.toString())
+        }
+        OutlinedTextField(
+            value = burstCapText,
+            onValueChange = { txt ->
+                burstCapText = txt
+                txt.toDoubleOrNull()?.let { v ->
+                    if (v >= 0.1) onChange(policy.copy(burstCapSpeedMbPerSec = v))
+                }
+            },
+            label = { Text("السرعة للتطبيق عند السحب المفاجئ (ميجابت/ث)") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
         )
     }
 

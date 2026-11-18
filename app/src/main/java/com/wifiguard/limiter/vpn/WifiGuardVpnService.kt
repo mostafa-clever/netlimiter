@@ -35,6 +35,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.FileInputStream
@@ -49,6 +50,7 @@ class WifiGuardVpnService : VpnService() {
     private var tunInterface: ParcelFileDescriptor? = null
     private var forwarder: Tun2NetForwarder? = null
     private var packetLoopJob: Job? = null
+    private var clientControlSocket: java.net.ServerSocket? = null
 
     private var currentUseFullTunnel: Boolean = false
     private var currentWhitelist: Set<String> = emptySet()
@@ -118,6 +120,7 @@ class WifiGuardVpnService : VpnService() {
             runCatching { establishTunnel(useFullTunnel = false, whitelist = emptySet()) }
         }
         startMonitoringLoop()
+        startClientControlServer()
         startHeartbeatLoop()
     }
 
@@ -159,6 +162,7 @@ class WifiGuardVpnService : VpnService() {
         packetLoopJob?.cancel()
         runCatching { forwarder?.close() }
         forwarder = null
+        runCatching { clientControlSocket?.close() }
         runCatching { tunInterface?.close() }
         tunInterface = null
         serviceScope.cancel()
@@ -238,7 +242,7 @@ class WifiGuardVpnService : VpnService() {
                             policy = cfg.speedPolicy,
                             forcedBySupervisor = cfg.forceQuotaSaver,
                             globalSpeedCapMbPerSec = cfg.globalSpeedCapMbps,
-                            burstDetected = burstCooldownTicks > 0,
+                            burstDetected = false,
                             isScreenOffIdle = isScreenOffIdle
                         )
 
@@ -262,6 +266,9 @@ class WifiGuardVpnService : VpnService() {
                         val blockAllNow = effective.state == ConnectionState.BLOCKED || effective.state == ConnectionState.IDLE_FROZEN
                         val needsFullTunnel = blockAllNow || effective.targetBytesPerSec < Long.MAX_VALUE
 
+                        forwarder?.burstGuardEnabled = effective.saverActive && cfg.speedPolicy.burstGuardEnabled
+                        forwarder?.burstThresholdBytesPerMin = cfg.speedPolicy.burstThresholdMbPerMin.toLong() * 1024L * 1024L
+                        forwarder?.burstCapMbps = cfg.speedPolicy.burstCapSpeedMbPerSec
                         forwarder?.flags = Tun2NetForwarder.PacketPolicyFlags(
                             blockAll = blockAllNow,
                             sinkholeEnabled = effective.saverActive && cfg.speedPolicy.dnsSinkholeEnabled,
@@ -295,9 +302,96 @@ class WifiGuardVpnService : VpnService() {
         return curGw == tgtGw
     }
 
+    private fun startClientControlServer() {
+        serviceScope.launch {
+            runCatching {
+                clientControlSocket = java.net.ServerSocket(LocalLanClient.CLIENT_PORT)
+                while (isActive) {
+                    val sock = clientControlSocket?.accept() ?: break
+                    launch {
+                        sock.use { s ->
+                            runCatching {
+                                s.soTimeout = 4000
+                                val rawIn = s.getInputStream()
+                                fun readLine(): String? {
+                                    val lb = java.io.ByteArrayOutputStream()
+                                    while (true) {
+                                        val b = rawIn.read()
+                                        if (b == -1) return if (lb.size() == 0) null else lb.toString("UTF-8")
+                                        if (b == '\n'.code) break
+                                        if (b != '\r'.code) lb.write(b)
+                                    }
+                                    return lb.toString("UTF-8")
+                                }
+                                val reqLine = readLine() ?: return@runCatching
+                                val parts = reqLine.split(" ")
+                                val path = parts.getOrNull(1) ?: "/"
+                                var contentLen = 0
+                                while (true) {
+                                    val h = readLine() ?: break
+                                    if (h.isEmpty()) break
+                                    if (h.lowercase().startsWith("content-length:")) {
+                                        contentLen = h.substringAfter(":").trim().toIntOrNull() ?: 0
+                                    }
+                                }
+                                val respJson = if (path == "/config" && contentLen > 0) {
+                                    val buf = ByteArray(contentLen)
+                                    var tot = 0
+                                    while (tot < contentLen) {
+                                        val r = rawIn.read(buf, tot, contentLen - tot)
+                                        if (r == -1) break
+                                        tot += r
+                                    }
+                                    val obj = org.json.JSONObject(String(buf, 0, tot, Charsets.UTF_8))
+                                    val arr = obj.optJSONArray("whitelistedPackages") ?: org.json.JSONArray()
+                                    val pkgs = mutableSetOf<String>()
+                                    for (i in 0 until arr.length()) {
+                                        val p = arr.optString(i)
+                                        if (p.isNotBlank()) pkgs.add(p)
+                                    }
+                                    val period = runCatching {
+                                        com.wifiguard.limiter.model.LimitPeriod.valueOf(obj.optString("limitPeriod", "DAILY"))
+                                    }.getOrDefault(com.wifiguard.limiter.model.LimitPeriod.DAILY)
+                                    prefs.updateLocalLimits(
+                                        limitMb = obj.optLong("dailyLimitMb", 1024L),
+                                        limitPeriod = period,
+                                        speedPolicy = com.wifiguard.limiter.model.SpeedPolicyConfig.fromJson(obj.optJSONObject("speedPolicy")),
+                                        whitelist = pkgs,
+                                        globalSpeedCapMbps = obj.optDouble("globalSpeedCapMbps", 0.0),
+                                        forceQuotaSaver = obj.optBoolean("forceQuotaSaver", false),
+                                        targetNetworkOnly = obj.optBoolean("targetNetworkOnly", false),
+                                        targetNetworkSig = obj.optString("targetNetworkSig", "")
+                                    )
+                                    org.json.JSONObject().put("ok", true)
+                                } else {
+                                    org.json.JSONObject().apply {
+                                        put("ok", true)
+                                        put("usedMb", prefs.getUsedMbActivePeriod())
+                                        put("savedMbToday", prefs.getSavedMbToday())
+                                        put("protectionActive", _isRunning.value)
+                                        put("uninstallProtectionActive", WifiGuardDeviceAdminReceiver.isActive(applicationContext))
+                                        put("connectionState", _connectionState.value.name)
+                                    }
+                                }
+                                val respBytes = respJson.toString().toByteArray(Charsets.UTF_8)
+                                val hdr = ("HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: ${respBytes.size}\r\nConnection: close\r\n\r\n").toByteArray(Charsets.US_ASCII)
+                                s.getOutputStream().apply {
+                                    write(hdr)
+                                    write(respBytes)
+                                    flush()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private fun startHeartbeatLoop() {
         serviceScope.launch {
             var sentAppsOnce = false
+            var consecutiveFailures = 0
             while (isActive) {
                 runCatching {
                     val role = prefs.roleFlow.first()
@@ -322,8 +416,9 @@ class WifiGuardVpnService : VpnService() {
                                 connectionState = _connectionState.value,
                                 installedApps = if (!sentAppsOnce) getInstalledLaunchableApps(applicationContext) else emptyList()
                             )
-                            if (updated != null) sentAppsOnce = true
                             if (updated != null) {
+                                sentAppsOnce = true
+                                consecutiveFailures = 0
                                 prefs.updateLocalLimits(
                                     limitMb = updated.dailyLimitMb,
                                     limitPeriod = updated.limitPeriod,
@@ -334,11 +429,22 @@ class WifiGuardVpnService : VpnService() {
                                     targetNetworkOnly = updated.targetNetworkOnly,
                                     targetNetworkSig = updated.targetNetworkSig
                                 )
+                            } else {
+                                consecutiveFailures++
+                                if (consecutiveFailures >= 2) {
+                                    consecutiveFailures = 0
+                                    val found = withTimeoutOrNull(3500L) {
+                                        LocalLanClient.discoverSupervisors(applicationContext).first { it.isNotEmpty() }
+                                    }?.firstOrNull()
+                                    if (found != null) {
+                                        prefs.setSupervisorConnection(found.host, found.port, "")
+                                    }
+                                }
                             }
                         }
                     }
                 }
-                delay(15_000L)
+                delay(60_000L)
             }
         }
     }
@@ -347,6 +453,7 @@ class WifiGuardVpnService : VpnService() {
         packetLoopJob?.cancel()
         runCatching { forwarder?.close() }
         forwarder = null
+        runCatching { clientControlSocket?.close() }
         runCatching { tunInterface?.close() }
         currentUseFullTunnel = useFullTunnel
         currentWhitelist = whitelist
