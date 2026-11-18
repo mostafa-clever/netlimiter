@@ -11,6 +11,7 @@ import java.nio.channels.Selector
 import java.nio.channels.SocketChannel
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Executors
 import kotlin.random.Random
 
 class Tun2NetForwarder(
@@ -66,6 +67,7 @@ class Tun2NetForwarder(
     private val udpSessions = ConcurrentHashMap<FlowKey, UdpSession>()
     private val pendingRegistrations = ConcurrentLinkedQueue<() -> Unit>()
     private val writeLock = Any()
+    private val dnsExecutor = Executors.newFixedThreadPool(4)
 
     @Volatile
     private var running = true
@@ -81,6 +83,7 @@ class Tun2NetForwarder(
 
     fun close() {
         running = false
+        runCatching { dnsExecutor.shutdownNow() }
         runCatching { selector.wakeup() }
         tcpSessions.values.forEach { runCatching { it.channel.close() } }
         udpSessions.values.forEach { runCatching { it.channel.close() } }
@@ -126,15 +129,20 @@ class Tun2NetForwarder(
 
         if (dstPort == 53) {
             if (currentFlags.blockAll) return
-            val resp = dnsHandler.handlePacket(
-                packet = packet,
-                length = length,
-                sinkholeEnabled = currentFlags.sinkholeEnabled,
-                cacheEnabled = currentFlags.cacheEnabled,
-                blockDohDot = currentFlags.blockDohDot,
-                blockQuicUdp443 = currentFlags.blockQuicUdp443
-            )
-            if (resp != null) writeToTun(resp)
+            val pktCopy = packet.copyOf(length)
+            dnsExecutor.execute {
+                val resp = runCatching {
+                    dnsHandler.handlePacket(
+                        packet = pktCopy,
+                        length = length,
+                        sinkholeEnabled = currentFlags.sinkholeEnabled,
+                        cacheEnabled = currentFlags.cacheEnabled,
+                        blockDohDot = currentFlags.blockDohDot,
+                        blockQuicUdp443 = currentFlags.blockQuicUdp443
+                    )
+                }.getOrNull()
+                if (resp != null) writeToTun(resp)
+            }
             return
         }
 
@@ -217,6 +225,10 @@ class Tun2NetForwarder(
         }
 
         if (isSyn && !isAck) {
+            val existingSyn = tcpSessions[key]
+            if (existingSyn != null && existingSyn.state == TcpState.SYN_SENT) {
+                return
+            }
             tcpSessions.remove(key)?.let { old -> runCatching { old.channel.close() } }
             runCatching {
                 val sc = SocketChannel.open()
@@ -318,7 +330,7 @@ class Tun2NetForwarder(
                 }
 
                 val budget = tokenBucket.availableBytes()
-                if (budget >= 512) {
+                if (budget >= 256) {
                     for (session in tcpSessions.values) {
                         if (session.state == TcpState.ESTABLISHED) {
                             val k = runCatching { session.channel.keyFor(selector) }.getOrNull()
@@ -330,6 +342,7 @@ class Tun2NetForwarder(
                 }
 
                 if (!running || !selector.isOpen) break
+                if (budget < 256) Thread.sleep(5L)
                 runCatching { selector.select(10L) }
                 if (!running || !selector.isOpen) break
                 val keys = selector.selectedKeys().iterator()

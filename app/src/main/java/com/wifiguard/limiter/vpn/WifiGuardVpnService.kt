@@ -178,6 +178,7 @@ class WifiGuardVpnService : VpnService() {
                     _isAlwaysOnActive.value = runCatching { isAlwaysOn }.getOrDefault(false)
                 }
                 val cfg = prefs.getLocalLimitConfig()
+                    dnsHandler.upstreamDnsIp = cfg.speedPolicy.upstreamDnsIp
                     val onWifi = isOnWifi()
 
                     val currentWifiSig = if (onWifi) NetworkScanner.getCurrentWifiSignature(applicationContext) else ""
