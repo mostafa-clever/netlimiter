@@ -80,7 +80,9 @@ fun ClientScreen(
     val usedMb by prefs.usedMbActivePeriodFlow.collectAsState(initial = 0L)
     val dailyLimitMb by prefs.dailyLimitMbFlow.collectAsState(initial = 1024L)
     val whitelist by prefs.whitelistFlow.collectAsState(initial = emptySet())
-    val vpnRunning by WifiGuardVpnService.isRunning.collectAsState()
+    val vpnServiceRunning by WifiGuardVpnService.isRunning.collectAsState()
+    var systemVpnDetected by remember { mutableStateOf(false) }
+    val vpnRunning = vpnServiceRunning || systemVpnDetected
     val connState by WifiGuardVpnService.connectionState.collectAsState()
     val statusLabel by WifiGuardVpnService.statusLabel.collectAsState()
     val blockedAds by WifiGuardVpnService.blockedAdsCount.collectAsState()
@@ -91,6 +93,10 @@ fun ClientScreen(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 adminActive = WifiGuardDeviceAdminReceiver.isActive(context)
+                val cm = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+                systemVpnDetected = cm.allNetworks.any { net ->
+                    cm.getNetworkCapabilities(net)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)

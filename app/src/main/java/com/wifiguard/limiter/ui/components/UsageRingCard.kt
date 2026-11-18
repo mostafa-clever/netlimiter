@@ -34,6 +34,9 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.FilterChip
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -333,6 +336,94 @@ fun WhitelistPickerDialog(
             TextButton(onClick = onDismiss) {
                 Text("إلغاء")
             }
+        }
+    )
+}
+
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun AppQuotaPercentsDialog(
+    initialMap: Map<String, Int>,
+    remoteApps: List<InstalledAppItem>? = null,
+    onDismiss: () -> Unit,
+    onConfirm: (Map<String, Int>) -> Unit
+) {
+    val context = LocalContext.current
+    val installedApps = remember(remoteApps) {
+        if (remoteApps != null) {
+            remoteApps.sortedBy { it.appName }
+        } else {
+            val pm = context.packageManager
+            pm.getInstalledApplications(PackageManager.GET_META_DATA)
+                .filter { (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 || pm.getLaunchIntentForPackage(it.packageName) != null }
+                .filter { it.packageName != context.packageName }
+                .map { InstalledAppItem(it.packageName, pm.getApplicationLabel(it).toString()) }
+                .sortedBy { it.appName }
+        }
+    }
+
+    var searchQuery by remember { mutableStateOf("") }
+    var quotaMap by remember { mutableStateOf(initialMap) }
+
+    val filtered = remember(searchQuery, installedApps) {
+        if (searchQuery.isBlank()) installedApps
+        else installedApps.filter { it.appName.contains(searchQuery, ignoreCase = true) }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("نسبة الباقة لكل تطبيق (%)", fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text(
+                    "حدد أقصى نسبة من الباقة يُسمح للتطبيق باستهلاكها (مثل 20% لـ TikTok):",
+                    fontSize = 12.sp,
+                    color = TextMuted
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    placeholder = { Text("ابحث عن تطبيق...") },
+                    leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) {
+                    items(filtered, key = { it.packageName }) { app ->
+                        val curPct = quotaMap[app.packageName]
+                        Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                            Text(
+                                text = if (curPct != null) "${app.appName} ($curPct%)" else app.appName,
+                                fontSize = 14.sp,
+                                fontWeight = if (curPct != null) FontWeight.Bold else FontWeight.Normal,
+                                color = if (curPct != null) PrimaryTeal else MaterialTheme.colorScheme.onSurface
+                            )
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                listOf(10, 20, 30, 50).forEach { pct ->
+                                    FilterChip(
+                                        selected = curPct == pct,
+                                        onClick = {
+                                            quotaMap = if (curPct == pct) quotaMap - app.packageName else quotaMap + (app.packageName to pct)
+                                        },
+                                        label = { Text("$pct%", fontSize = 11.sp) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(quotaMap) }) {
+                Text("حفظ (${quotaMap.size})")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("إلغاء") }
         }
     )
 }

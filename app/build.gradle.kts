@@ -11,8 +11,9 @@ android {
         applicationId = "com.wifiguard.limiter"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        val buildNum = (project.findProperty("buildNumber") as? String)?.toIntOrNull() ?: 1
+        versionCode = buildNum
+        versionName = "1.0.$buildNum"
 
         vectorDrawables {
             useSupportLibrary = true

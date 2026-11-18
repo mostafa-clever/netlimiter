@@ -242,7 +242,7 @@ fun OnboardingScreen(
                                     installedApps = getInstalledLaunchableApps(context)
                                 )
                                 result.onSuccess { cfg ->
-                                    prefs.setRole(AppRole.CLIENT, cleanName)
+                                    // MUST save connection & limits BEFORE setRole, because setRole triggers recomposition and cancels this scope!
                                     prefs.setSupervisorConnection(targetHost, targetPort, pairingCode.trim())
                                     prefs.updateLocalLimits(
                                         limitMb = cfg.dailyLimitMb,
@@ -254,6 +254,7 @@ fun OnboardingScreen(
                                         targetNetworkOnly = cfg.targetNetworkOnly,
                                         targetNetworkSig = cfg.targetNetworkSig
                                     )
+                                    prefs.setRole(AppRole.CLIENT, cleanName)
                                     isConnecting = false
                                     onSetupComplete(AppRole.CLIENT)
                                 }.onFailure { err ->

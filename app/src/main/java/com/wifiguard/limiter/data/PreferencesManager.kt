@@ -38,6 +38,7 @@ class PreferencesManager(private val context: Context) {
         val SUPERVISOR_HOST = stringPreferencesKey("supervisor_host")
         val SUPERVISOR_PORT = intPreferencesKey("supervisor_port")
         val SUPERVISOR_PIN = stringPreferencesKey("supervisor_pin")
+        val GITHUB_REPO = stringPreferencesKey("github_repo")
 
         // Limit & period config
         val LIMIT_PERIOD = stringPreferencesKey("limit_period")
@@ -58,6 +59,8 @@ class PreferencesManager(private val context: Context) {
         val SAVED_BYTES_DAY = longPreferencesKey("saved_bytes_today")
         val DAILY_USAGE_HISTORY_JSON = stringPreferencesKey("daily_usage_history_json")
         val DAILY_SAVED_HISTORY_JSON = stringPreferencesKey("daily_saved_history_json")
+        val APP_USAGE_BYTES_JSON = stringPreferencesKey("app_usage_bytes_json")
+        val APP_USAGE_PERIOD_KEY = stringPreferencesKey("app_usage_period_key")
         val DATE_DAY = stringPreferencesKey("usage_date")
         val USED_BYTES_WEEK = longPreferencesKey("used_bytes_week")
         val DATE_WEEK = stringPreferencesKey("usage_week")
@@ -88,6 +91,10 @@ class PreferencesManager(private val context: Context) {
 
     val supervisorPinFlow: Flow<String> = context.dataStore.data.map { prefs ->
         prefs[Keys.SUPERVISOR_PIN] ?: ""
+    }
+
+    val githubRepoFlow: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[Keys.GITHUB_REPO]?.ifBlank { "mostafa-clever/netlimiter" } ?: "mostafa-clever/netlimiter"
     }
 
     val limitPeriodFlow: Flow<LimitPeriod> = context.dataStore.data.map { prefs ->
@@ -208,6 +215,10 @@ class PreferencesManager(private val context: Context) {
         context.dataStore.edit { it[Keys.SUPERVISOR_PIN] = pin.trim() }
     }
 
+    suspend fun setGithubRepo(repo: String) {
+        context.dataStore.edit { it[Keys.GITHUB_REPO] = repo.trim() }
+    }
+
     suspend fun setSelfLimitEnabled(enabled: Boolean) {
         context.dataStore.edit { it[Keys.SELF_LIMIT_ENABLED] = enabled }
     }
@@ -308,6 +319,36 @@ class PreferencesManager(private val context: Context) {
         }
     }
 
+    private fun activePeriodKey(period: LimitPeriod): String = when (period) {
+        LimitPeriod.DAILY -> dayStr()
+        LimitPeriod.WEEKLY -> weekStr()
+        LimitPeriod.MONTHLY -> monthStr()
+    }
+
+    suspend fun addAppUsedBytes(deltas: Map<String, Long>, period: LimitPeriod) {
+        if (deltas.isEmpty()) return
+        val pKey = activePeriodKey(period)
+        context.dataStore.edit { prefs ->
+            val savedKey = prefs[Keys.APP_USAGE_PERIOD_KEY] ?: ""
+            val map = if (savedKey == pKey) {
+                parseLongMap(prefs[Keys.APP_USAGE_BYTES_JSON] ?: "{}").toMutableMap()
+            } else {
+                mutableMapOf()
+            }
+            deltas.forEach { (pkg, d) ->
+                if (d > 0L) map[pkg] = (map[pkg] ?: 0L) + d
+            }
+            prefs[Keys.APP_USAGE_PERIOD_KEY] = pKey
+            prefs[Keys.APP_USAGE_BYTES_JSON] = JSONObject(map as Map<*, *>).toString()
+        }
+    }
+
+    suspend fun getAppUsedMbMap(period: LimitPeriod): Map<String, Long> {
+        val prefs = context.dataStore.data.first()
+        if (prefs[Keys.APP_USAGE_PERIOD_KEY] != activePeriodKey(period)) return emptyMap()
+        return parseLongMap(prefs[Keys.APP_USAGE_BYTES_JSON] ?: "{}").mapValues { it.value / (1024L * 1024L) }
+    }
+
     suspend fun getSavedMbToday(): Long {
         val prefs = context.dataStore.data.first()
         if (prefs[Keys.DATE_DAY] != dayStr()) return 0L
@@ -333,6 +374,7 @@ class PreferencesManager(private val context: Context) {
             prefs[Keys.USED_BYTES_WEEK] = 0L
             prefs[Keys.DATE_MONTH] = monthStr()
             prefs[Keys.USED_BYTES_MONTH] = 0L
+            prefs[Keys.APP_USAGE_BYTES_JSON] = "{}"
         }
     }
 

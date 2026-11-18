@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.VpnService
 import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.AppRole
+import com.wifiguard.limiter.network.ClientGuardService
 import com.wifiguard.limiter.network.SupervisorServerService
 import com.wifiguard.limiter.vpn.WifiGuardVpnService
 import kotlinx.coroutines.CoroutineScope
@@ -29,6 +30,7 @@ class BootReceiver : BroadcastReceiver() {
                             WifiGuardVpnService.start(context.applicationContext)
                         }
                     } else if (role == AppRole.CLIENT) {
+                        ClientGuardService.start(context.applicationContext)
                         if (VpnService.prepare(context.applicationContext) == null) {
                             WifiGuardVpnService.start(context.applicationContext)
                         }

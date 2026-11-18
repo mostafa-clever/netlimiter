@@ -7,6 +7,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.nsd.NsdManager
 import android.net.wifi.WifiManager
 import android.net.nsd.NsdServiceInfo
@@ -94,6 +98,7 @@ class SupervisorServerService : Service() {
         }
         registerNsdService()
         startHttpServer()
+        registerSupervisorWifiReconnect()
         startOfflineAndMacCheatWatchdog()
     }
 
@@ -299,6 +304,7 @@ class SupervisorServerService : Service() {
         val usageHist = (existing?.dailyUsageHistory ?: emptyMap()).toMutableMap().apply { put(todayKey, usedMb) }
         val savedHist = (existing?.dailySavedHistory ?: emptyMap()).toMutableMap().apply { put(todayKey, savedMbToday) }
         val updated = (existing ?: ManagedDevice(deviceId = deviceId, deviceName = deviceName)).copy(
+            pendingConfigPush = false,
             deviceName = deviceName,
             usedMb = usedMb,
             savedMbToday = savedMbToday,
@@ -349,12 +355,52 @@ class SupervisorServerService : Service() {
         return JSONObject().put("ok", true)
     }
 
+    private fun registerSupervisorWifiReconnect() {
+        runCatching {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val req = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
+            cm.registerNetworkCallback(req, object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    serviceScope.launch {
+                        delay(1000L)
+                        pushAllPendingConfigs()
+                    }
+                }
+            })
+        }
+    }
+
+    private suspend fun pushAllPendingConfigs() {
+        val globalCap = prefs.globalSpeedCapMbpsFlow.first()
+        val forceAll = prefs.forceQuotaSaverAllFlow.first()
+        val targetOnly = prefs.targetNetworkOnlyFlow.first()
+        val targetSig = prefs.targetNetworkSigFlow.first()
+        val devices = prefs.managedDevicesFlow.first()
+        devices.filter { it.pendingConfigPush && it.lastKnownIp.isNotBlank() }.forEach { d ->
+            val ok = LocalLanClient.pushConfigToClient(
+                clientIp = d.lastKnownIp,
+                dailyLimitMb = d.dailyLimitMb,
+                limitPeriod = d.limitPeriod,
+                speedPolicy = d.speedPolicy,
+                whitelistedPackages = d.whitelistedPackages,
+                globalSpeedCapMbps = globalCap,
+                forceQuotaSaver = forceAll || d.forceQuotaSaver,
+                targetNetworkOnly = targetOnly,
+                targetNetworkSig = targetSig
+            )
+            if (ok) {
+                prefs.upsertManagedDevice(d.copy(pendingConfigPush = false))
+            }
+        }
+    }
+
     private fun startOfflineAndMacCheatWatchdog() {
         serviceScope.launch {
             var tickCount = 0
             while (isActive) {
                 delay(30_000L)
                 tickCount++
+                pushAllPendingConfigs()
                 val now = System.currentTimeMillis()
                 val activePeers = if (tickCount % 20 == 1) {
                     NetworkScanner.scanActiveLanPeers(applicationContext)

@@ -56,7 +56,8 @@ data class SpeedPolicyConfig(
     val burstCapSpeedMbPerSec: Double = 1.0,
     val nightSaverEnabled: Boolean = false,
     val nightSaverSpeedMbPerSec: Double = 0.5,
-    val upstreamDnsIp: String = "94.140.14.14"
+    val upstreamDnsIp: String = "94.140.14.14",
+    val appQuotaPercents: Map<String, Int> = emptyMap()
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("baseSpeedLimitMbPerSec", baseSpeedLimitMbPerSec)
@@ -83,6 +84,7 @@ data class SpeedPolicyConfig(
         put("nightSaverEnabled", nightSaverEnabled)
         put("nightSaverSpeedMbPerSec", nightSaverSpeedMbPerSec)
         put("upstreamDnsIp", upstreamDnsIp)
+        put("appQuotaPercents", JSONObject(appQuotaPercents.mapValues { it.value }))
     }
 
     companion object {
@@ -112,8 +114,19 @@ data class SpeedPolicyConfig(
                 burstCapSpeedMbPerSec = obj.optDouble("burstCapSpeedMbPerSec", 1.0).coerceAtLeast(0.1),
                 nightSaverEnabled = obj.optBoolean("nightSaverEnabled", false),
                 nightSaverSpeedMbPerSec = obj.optDouble("nightSaverSpeedMbPerSec", 0.5).coerceAtLeast(0.1),
-                upstreamDnsIp = obj.optString("upstreamDnsIp", "94.140.14.14").ifBlank { "94.140.14.14" }
+                upstreamDnsIp = obj.optString("upstreamDnsIp", "94.140.14.14").ifBlank { "94.140.14.14" },
+                appQuotaPercents = parseAppQuotaMap(obj.optJSONObject("appQuotaPercents"))
             )
+        }
+
+        private fun parseAppQuotaMap(obj: JSONObject?): Map<String, Int> {
+            if (obj == null) return emptyMap()
+            val map = mutableMapOf<String, Int>()
+            obj.keys().forEach { k ->
+                val v = obj.optInt(k, 0)
+                if (v in 1..100) map[k] = v
+            }
+            return map
         }
 
         fun presetBalanced() = SpeedPolicyConfig()
@@ -237,10 +250,9 @@ fun computeEffectiveSpeed(
     }
 
     val effectiveBaseMbPerSec = when {
-        globalSpeedCapMbPerSec > 0.0 && policy.baseSpeedLimitMbPerSec > 0.0 ->
-            minOf(globalSpeedCapMbPerSec, policy.baseSpeedLimitMbPerSec)
+        policy.baseSpeedLimitMbPerSec > 0.0 -> policy.baseSpeedLimitMbPerSec
         globalSpeedCapMbPerSec > 0.0 -> globalSpeedCapMbPerSec
-        else -> policy.baseSpeedLimitMbPerSec
+        else -> 0.0
     }
 
     val baseBytesPerSec = if (effectiveBaseMbPerSec > 0.0) {
@@ -352,6 +364,7 @@ data class ManagedDevice(
     val macAddress: String = "",
     val lastSeenMillis: Long = 0L,
     val isOnline: Boolean = false,
+    val pendingConfigPush: Boolean = false,
     val tamperWarning: String? = null
 ) {
     val usagePercent: Int
@@ -384,6 +397,7 @@ data class ManagedDevice(
         put("macAddress", macAddress)
         put("lastSeenMillis", lastSeenMillis)
         put("isOnline", isOnline)
+        put("pendingConfigPush", pendingConfigPush)
         put("tamperWarning", tamperWarning ?: JSONObject.NULL)
     }
 
@@ -434,6 +448,7 @@ data class ManagedDevice(
                 macAddress = obj.optString("macAddress", ""),
                 lastSeenMillis = obj.optLong("lastSeenMillis", 0L),
                 isOnline = obj.optBoolean("isOnline", false),
+                pendingConfigPush = obj.optBoolean("pendingConfigPush", false),
                 tamperWarning = warning
             )
         }

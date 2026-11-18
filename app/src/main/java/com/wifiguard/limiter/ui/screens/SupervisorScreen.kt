@@ -35,6 +35,8 @@ import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.HourglassBottom
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Person
+import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Tune
@@ -96,7 +98,9 @@ import com.wifiguard.limiter.model.formatSpeedArabic
 import com.wifiguard.limiter.network.NetworkScanner
 import com.wifiguard.limiter.network.LocalLanClient
 import com.wifiguard.limiter.network.SupervisorServerService
+import com.wifiguard.limiter.update.GitHubUpdater
 import com.wifiguard.limiter.ui.components.UsageRingCard
+import com.wifiguard.limiter.ui.components.AppQuotaPercentsDialog
 import com.wifiguard.limiter.ui.components.WhitelistPickerDialog
 import com.wifiguard.limiter.ui.theme.AlertRed
 import com.wifiguard.limiter.ui.theme.AlertRedBg
@@ -129,6 +133,7 @@ fun SupervisorScreen(
     val devices by prefs.managedDevicesFlow.collectAsState(initial = emptyList())
     val alerts by prefs.tamperAlertsFlow.collectAsState(initial = emptyList())
     val supervisorPin by prefs.supervisorPinFlow.collectAsState(initial = "")
+    val githubRepo by prefs.githubRepoFlow.collectAsState(initial = "")
     val globalSpeedCapMbps by prefs.globalSpeedCapMbpsFlow.collectAsState(initial = 0.0)
     val forceQuotaSaverAll by prefs.forceQuotaSaverAllFlow.collectAsState(initial = false)
     val targetNetworkOnly by prefs.targetNetworkOnlyFlow.collectAsState(initial = false)
@@ -172,6 +177,45 @@ fun SupervisorScreen(
                         fontWeight = FontWeight.Bold,
                         fontSize = 19.sp
                     )
+                },
+                actions = {
+                    if (selectedTab == 0 && devices.isNotEmpty()) {
+                        IconButton(onClick = {
+                            scope.launch {
+                                val now = System.currentTimeMillis()
+                                val todayKey = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+                                devices.forEach { d ->
+                                    if (d.lastKnownIp.isNotBlank()) {
+                                        val live = LocalLanClient.fetchClientStatus(d.lastKnownIp)
+                                        if (live != null && live.optBoolean("ok", false)) {
+                                            val newUsed = live.optLong("usedMb", d.usedMb)
+                                            val newSaved = live.optLong("savedMbToday", d.savedMbToday)
+                                            val prot = live.optBoolean("protectionActive", d.protectionActive)
+                                            val st = runCatching {
+                                                ConnectionState.valueOf(live.optString("connectionState", d.connectionState.name))
+                                            }.getOrDefault(d.connectionState)
+                                            val uHist = d.dailyUsageHistory.toMutableMap().apply { put(todayKey, newUsed) }
+                                            val sHist = d.dailySavedHistory.toMutableMap().apply { put(todayKey, newSaved) }
+                                            prefs.upsertManagedDevice(
+                                                d.copy(
+                                                    usedMb = newUsed,
+                                                    savedMbToday = newSaved,
+                                                    protectionActive = prot,
+                                                    connectionState = if (prot) st else ConnectionState.PROTECTION_OFF,
+                                                    dailyUsageHistory = uHist,
+                                                    dailySavedHistory = sHist,
+                                                    lastSeenMillis = now,
+                                                    isOnline = true
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }) {
+                            Icon(Icons.Rounded.Refresh, contentDescription = "تحديث الآن", tint = Color.White)
+                        }
+                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = PrimaryTeal,
@@ -239,7 +283,9 @@ fun SupervisorScreen(
                                     whitelistedPackages = d.whitelistedPackages,
                                     globalSpeedCapMbps = cap,
                                     forceQuotaSaver = forceQuotaSaverAll || d.forceQuotaSaver,
-                                    targetNetworkOnly = targetNetworkOnly,
+                                    githubRepo = githubRepo,
+                    onSaveGithubRepo = { repo -> scope.launch { prefs.setGithubRepo(repo) } },
+                    targetNetworkOnly = targetNetworkOnly,
                                     targetNetworkSig = targetNetworkSig
                                 )
                             }
@@ -314,6 +360,8 @@ fun SupervisorScreen(
                             prefs.applyPolicyToAllDevices(newPolicy)
                         }
                     },
+                    githubRepo = githubRepo,
+                    onSaveGithubRepo = { repo -> scope.launch { prefs.setGithubRepo(repo) } },
                     targetNetworkOnly = targetNetworkOnly,
                     targetNetworkSig = targetNetworkSig,
                     onSetTargetNetwork = { only, sig -> scope.launch { prefs.setTargetNetwork(only, sig) } },
@@ -339,8 +387,9 @@ fun SupervisorScreen(
             onSave = { updated ->
                 scope.launch {
                     prefs.upsertManagedDevice(updated)
+                    var pushed = false
                     for (attempt in 0..2) {
-                        val ok = LocalLanClient.pushConfigToClient(
+                        pushed = LocalLanClient.pushConfigToClient(
                             clientIp = updated.lastKnownIp,
                             dailyLimitMb = updated.dailyLimitMb,
                             limitPeriod = updated.limitPeriod,
@@ -348,11 +397,16 @@ fun SupervisorScreen(
                             whitelistedPackages = updated.whitelistedPackages,
                             globalSpeedCapMbps = globalSpeedCapMbps,
                             forceQuotaSaver = forceQuotaSaverAll || updated.forceQuotaSaver,
-                            targetNetworkOnly = targetNetworkOnly,
+                            githubRepo = githubRepo,
+                    onSaveGithubRepo = { repo -> scope.launch { prefs.setGithubRepo(repo) } },
+                    targetNetworkOnly = targetNetworkOnly,
                             targetNetworkSig = targetNetworkSig
                         )
-                        if (ok) break
+                        if (pushed) break
                         kotlinx.coroutines.delay(1500L)
+                    }
+                    if (!pushed) {
+                        prefs.upsertManagedDevice(updated.copy(pendingConfigPush = true))
                     }
                 }
                 editingDevice = null
@@ -793,6 +847,8 @@ private fun AdvancedSettingsTab(
     onSaveGlobalCap: (Double) -> Unit,
     onSavePolicy: (SpeedPolicyConfig) -> Unit,
     onApplyPolicyToAll: (SpeedPolicyConfig) -> Unit,
+    githubRepo: String,
+    onSaveGithubRepo: (String) -> Unit,
     targetNetworkOnly: Boolean,
     targetNetworkSig: String,
     onSetTargetNetwork: (Boolean, String?) -> Unit,
@@ -984,6 +1040,67 @@ private fun AdvancedSettingsTab(
                     else "تحديث الشبكة المحددة (الحالية: $targetNetworkSig)",
                     fontSize = 12.sp
                 )
+            }
+        }
+    }
+
+    // Section 4.8: Auto-Update from GitHub Releases
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        val updateScope = rememberCoroutineScope()
+        var repoInput by remember(githubRepo) { mutableStateOf(githubRepo) }
+        var updateMsg by remember { mutableStateOf<String?>(null) }
+        var isChecking by remember { mutableStateOf(false) }
+
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Rounded.SystemUpdate, contentDescription = null, tint = PrimaryTeal)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("التحديث التلقائي من GitHub", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            }
+            OutlinedTextField(
+                value = repoInput,
+                onValueChange = { repoInput = it },
+                label = { Text("مستودع GitHub (مثال: user/netlimiter)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (updateMsg != null) {
+                Text(updateMsg!!, fontSize = 12.sp, color = PrimaryTeal, fontWeight = FontWeight.Medium)
+            }
+            Button(
+                onClick = {
+                    onSaveGithubRepo(repoInput)
+                    isChecking = true
+                    updateMsg = "جاري التحقق من آخر إصدار..."
+                    updateScope.launch {
+                        val res = GitHubUpdater.checkLatestRelease(ctx, repoInput)
+                        res.onSuccess { info ->
+                            if (!info.hasUpdate) {
+                                updateMsg = "لديك أحدث إصدار بالفعل (1.0.${info.localBuildNumber})"
+                            } else {
+                                updateMsg = "يتوفر إصدار جديد (${info.versionTag}) — جاري التحميل..."
+                                val dl = GitHubUpdater.downloadAndInstallApk(ctx, info.downloadUrl)
+                                dl.onSuccess {
+                                    updateMsg = "تم تحميل التحديث — أكمل التثبيت من الشاشة."
+                                }.onFailure { e ->
+                                    updateMsg = "فشل التحميل: ${e.message}"
+                                }
+                            }
+                        }.onFailure { e ->
+                            updateMsg = e.message ?: "تعذر التحقق من التحديث"
+                        }
+                        isChecking = false
+                    }
+                },
+                enabled = !isChecking && repoInput.contains("/"),
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(if (isChecking) "جاري التحقق..." else "تحقق وحمّل آخر تحديث APK")
             }
         }
     }
@@ -1363,6 +1480,7 @@ private fun EditDeviceDialog(
     var baseSpeedText by remember { mutableStateOf(device.speedPolicy.baseSpeedLimitMbPerSec.toString()) }
     var whitelist by remember { mutableStateOf(device.whitelistedPackages.toSet()) }
     var showWhitelist by remember { mutableStateOf(false) }
+    var showAppQuotas by remember { mutableStateOf(false) }
     var showAdvancedInDialog by remember { mutableStateOf(false) }
 
     AlertDialog(
@@ -1439,6 +1557,13 @@ private fun EditDeviceDialog(
                     Text("التطبيقات المسموحة دائماً (${whitelist.size})")
                 }
 
+                OutlinedButton(
+                    onClick = { showAppQuotas = true },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("حد نسبة الباقة لتطبيقات معينة (${policy.appQuotaPercents.size})")
+                }
+
                 TextButton(
                     onClick = { showAdvancedInDialog = !showAdvancedInDialog },
                     modifier = Modifier.fillMaxWidth()
@@ -1489,6 +1614,18 @@ private fun EditDeviceDialog(
             }
         )
     }
+
+    if (showAppQuotas) {
+        AppQuotaPercentsDialog(
+            initialMap = policy.appQuotaPercents,
+            remoteApps = device.installedApps,
+            onDismiss = { showAppQuotas = false },
+            onConfirm = {
+                policy = policy.copy(appQuotaPercents = it)
+                showAppQuotas = false
+            }
+        )
+    }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -1504,6 +1641,7 @@ private fun EditSelfLimitDialog(
     var period by remember { mutableStateOf(currentPeriod) }
     var policy by remember { mutableStateOf(currentPolicy) }
     var baseSpeedText by remember { mutableStateOf(currentPolicy.baseSpeedLimitMbPerSec.toString()) }
+    var showSelfAppQuotas by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1547,6 +1685,12 @@ private fun EditSelfLimitDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+                OutlinedButton(
+                    onClick = { showSelfAppQuotas = true },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("حد نسبة الباقة لتطبيقات معينة (${policy.appQuotaPercents.size})")
+                }
                 PhasedRulesControls(policy = policy, onChange = { policy = it })
                 GraceAndRolloverControls(policy = policy, onChange = { policy = it })
                 SmartAutomationControls(policy = policy, onChange = { policy = it })
@@ -1562,6 +1706,18 @@ private fun EditSelfLimitDialog(
             TextButton(onClick = onDismiss) { Text("إلغاء") }
         }
     )
+
+    if (showSelfAppQuotas) {
+        AppQuotaPercentsDialog(
+            initialMap = policy.appQuotaPercents,
+            remoteApps = null,
+            onDismiss = { showSelfAppQuotas = false },
+            onConfirm = {
+                policy = policy.copy(appQuotaPercents = it)
+                showSelfAppQuotas = false
+            }
+        )
+    }
 }
 
 @Composable
