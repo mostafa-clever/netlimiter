@@ -3,7 +3,6 @@ package com.wifiguard.limiter.ui.screens
 import android.os.Build
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -65,7 +64,7 @@ fun OnboardingScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var step by remember { mutableStateOf(0) } // 0 = choose role, 1 = client pairing
+    var step by remember { mutableStateOf(0) }
     var deviceName by remember { mutableStateOf(Build.MODEL) }
     var pairingCode by remember { mutableStateOf("") }
     var manualHost by remember { mutableStateOf("") }
@@ -105,7 +104,7 @@ fun OnboardingScreen(
         )
         Spacer(modifier = Modifier.height(6.dp))
         Text(
-            text = "تنظيم ذكي لاستهلاك الواي فاي اليومي بدون تعقيد",
+            text = "تنظيم ذكي لاستهلاك الواي فاي اليومي والأسبوعي والشهري",
             fontSize = 14.sp,
             color = TextMuted
         )
@@ -115,7 +114,7 @@ fun OnboardingScreen(
             RoleOptionCard(
                 icon = Icons.Rounded.AdminPanelSettings,
                 title = "جهاز المشرف",
-                description = "لمتابعة الأجهزة المرتبطة، تحديد الحدود اليومية، واستلام التنبيهات — ويمكنك أيضاً تحديد حد لجهازك الشخصي.",
+                description = "لمتابعة الأجهزة المرتبطة، تحديد الحدود (يومي/أسبوعي/شهري)، وفرض توفير الباقة — ويمكنك أيضاً تحديد حد لجهازك الشخصي.",
                 onClick = {
                     scope.launch {
                         prefs.setRole(AppRole.SUPERVISOR)
@@ -127,7 +126,7 @@ fun OnboardingScreen(
             RoleOptionCard(
                 icon = Icons.Rounded.PhoneAndroid,
                 title = "جهاز عضو (مُدار)",
-                description = "يرتبط بجهاز المشرف على نفس شبكة الواي فاي لتطبيق الحد اليومي وتهدئة السرعة قبل الانتهاء.",
+                description = "يرتبط بجهاز المشرف على نفس شبكة الواي فاي لتطبيق الحد وتهدئة السرعة تدريجياً.",
                 onClick = { step = 1 }
             )
         } else {
@@ -244,9 +243,11 @@ fun OnboardingScreen(
                                     prefs.setRole(AppRole.CLIENT, cleanName)
                                     prefs.setSupervisorConnection(targetHost, targetPort, pairingCode.trim())
                                     prefs.updateLocalLimits(
-                                        cfg.dailyLimitMb,
-                                        cfg.slowdownThresholdPercent,
-                                        cfg.whitelistedPackages
+                                        limitMb = cfg.dailyLimitMb,
+                                        limitPeriod = cfg.limitPeriod,
+                                        speedPolicy = cfg.speedPolicy,
+                                        whitelist = cfg.whitelistedPackages,
+                                        globalSpeedCapMbps = cfg.globalSpeedCapMbps
                                     )
                                     isConnecting = false
                                     onSetupComplete(AppRole.CLIENT)

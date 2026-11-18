@@ -4,6 +4,8 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import com.wifiguard.limiter.model.ConnectionState
+import com.wifiguard.limiter.model.LimitPeriod
+import com.wifiguard.limiter.model.SpeedPolicyConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -25,8 +27,11 @@ data class DiscoveredSupervisor(
 
 data class SyncedLimitConfig(
     val dailyLimitMb: Long,
-    val slowdownThresholdPercent: Int,
-    val whitelistedPackages: Set<String>
+    val limitPeriod: LimitPeriod,
+    val speedPolicy: SpeedPolicyConfig,
+    val whitelistedPackages: Set<String>,
+    val globalSpeedCapMbps: Double,
+    val forceQuotaSaver: Boolean
 )
 
 object LocalLanClient {
@@ -149,10 +154,16 @@ object LocalLanClient {
             val p = arr.optString(i)
             if (p.isNotBlank()) pkgs.add(p)
         }
+        val period = runCatching {
+            LimitPeriod.valueOf(resp.optString("limitPeriod", LimitPeriod.DAILY.name))
+        }.getOrDefault(LimitPeriod.DAILY)
         return SyncedLimitConfig(
             dailyLimitMb = resp.optLong("dailyLimitMb", 1024L),
-            slowdownThresholdPercent = resp.optInt("slowdownThresholdPercent", 80),
-            whitelistedPackages = pkgs
+            limitPeriod = period,
+            speedPolicy = SpeedPolicyConfig.fromJson(resp.optJSONObject("speedPolicy")),
+            whitelistedPackages = pkgs,
+            globalSpeedCapMbps = resp.optDouble("globalSpeedCapMbps", 0.0),
+            forceQuotaSaver = resp.optBoolean("forceQuotaSaver", false)
         )
     }
 

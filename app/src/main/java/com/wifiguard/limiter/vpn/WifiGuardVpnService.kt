@@ -12,12 +12,15 @@ import android.net.TrafficStats
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.wifiguard.limiter.MainActivity
 import com.wifiguard.limiter.admin.WifiGuardDeviceAdminReceiver
 import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.AppRole
 import com.wifiguard.limiter.model.ConnectionState
+import com.wifiguard.limiter.model.SpeedPolicyConfig
+import com.wifiguard.limiter.model.computeEffectiveSpeed
 import com.wifiguard.limiter.model.formatDataSizeArabic
 import com.wifiguard.limiter.network.LocalLanClient
 import kotlinx.coroutines.CoroutineScope
@@ -32,18 +35,26 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.FileInputStream
-import java.nio.ByteBuffer
+import java.io.FileOutputStream
 
 class WifiGuardVpnService : VpnService() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var prefs: PreferencesManager
+    private lateinit var dnsHandler: DnsPacketHandler
     private var tunInterface: ParcelFileDescriptor? = null
-    private var drainJob: Job? = null
+    private var packetLoopJob: Job? = null
 
     private var currentBlockAll: Boolean = false
+    private var currentUseLocalDns: Boolean = false
+    private var currentBlockDoh: Boolean = false
     private var currentWhitelist: Set<String> = emptySet()
     private var lastTrafficBytes: Long = -1L
+
+    @Volatile
+    private var activePolicy: SpeedPolicyConfig = SpeedPolicyConfig()
+    @Volatile
+    private var activeSaverFlag: Boolean = true
 
     companion object {
         const val CHANNEL_ID = "wifiguard_vpn_channel"
@@ -53,8 +64,14 @@ class WifiGuardVpnService : VpnService() {
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning
 
-        private val _connectionState = MutableStateFlow(ConnectionState.NORMAL)
+        private val _connectionState = MutableStateFlow(ConnectionState.SMART_SAVING)
         val connectionState: StateFlow<ConnectionState> = _connectionState
+
+        private val _statusLabel = MutableStateFlow("التوفير الذكي نشط")
+        val statusLabel: StateFlow<String> = _statusLabel
+
+        private val _blockedAdsCount = MutableStateFlow(0L)
+        val blockedAdsCount: StateFlow<Long> = _blockedAdsCount
 
         fun start(context: Context) {
             val intent = Intent(context, WifiGuardVpnService::class.java)
@@ -76,10 +93,11 @@ class WifiGuardVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         prefs = PreferencesManager(applicationContext)
+        dnsHandler = DnsPacketHandler(this)
         createNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification("جاري تشغيل حماية الاتصال...", ConnectionState.NORMAL))
+        startForeground(NOTIF_ID, buildNotification("جاري تشغيل حماية الاتصال...", "التوفير الذكي نشط"))
         _isRunning.value = true
-        establishTunnel(blockAll = false, whitelist = emptySet())
+        establishTunnel(blockAll = false, useLocalDns = true, blockDoh = true, whitelist = emptySet())
         startMonitoringLoop()
         startHeartbeatLoop()
     }
@@ -96,6 +114,7 @@ class WifiGuardVpnService : VpnService() {
         super.onRevoke()
         _isRunning.value = false
         _connectionState.value = ConnectionState.PROTECTION_OFF
+        _statusLabel.value = "الحماية متوقفة حالياً"
         serviceScope.launch {
             val role = prefs.roleFlow.first()
             if (role == AppRole.CLIENT) {
@@ -118,7 +137,7 @@ class WifiGuardVpnService : VpnService() {
     override fun onDestroy() {
         super.onDestroy()
         _isRunning.value = false
-        drainJob?.cancel()
+        packetLoopJob?.cancel()
         runCatching { tunInterface?.close() }
         tunInterface = null
         serviceScope.cancel()
@@ -126,15 +145,21 @@ class WifiGuardVpnService : VpnService() {
 
     private fun startMonitoringLoop() {
         serviceScope.launch {
-            var slowdownPulseCounter = 0
+            var brakeDebtBytes = 0L
+            val recent60sBytes = ArrayDeque<Long>()
+            var burstCooldownTicks = 0
+            var screenOffSeconds = 0
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+
             while (isActive) {
+                var intervalBytes = 0L
                 if (isOnWifi()) {
                     val currentTotal = TrafficStats.getTotalRxBytes() + TrafficStats.getTotalTxBytes()
                     if (lastTrafficBytes > 0L && currentTotal > lastTrafficBytes) {
                         val delta = currentTotal - lastTrafficBytes
-                        // Sanity cap to avoid counter reset spikes
                         if (delta < 100L * 1024L * 1024L) {
-                            prefs.addUsedBytesToday(delta)
+                            intervalBytes = delta
+                            prefs.addUsedBytes(delta)
                         }
                     }
                     lastTrafficBytes = currentTotal
@@ -142,35 +167,74 @@ class WifiGuardVpnService : VpnService() {
                     lastTrafficBytes = -1L
                 }
 
-                val (limitMb, slowdownThreshold, whitelist) = prefs.getLocalLimitConfig()
-                val usedMb = prefs.getUsedMbToday()
-                val percent = if (limitMb <= 0L) 100 else ((usedMb * 100) / limitMb).toInt()
-
-                val targetState = when {
-                    percent >= 100 -> ConnectionState.BLOCKED
-                    percent >= slowdownThreshold -> ConnectionState.SLOWED
-                    else -> ConnectionState.NORMAL
+                if (!powerManager.isInteractive) {
+                    screenOffSeconds++
+                } else {
+                    screenOffSeconds = 0
                 }
-                _connectionState.value = targetState
+                val isScreenOffIdle = screenOffSeconds >= 60
 
-                val shouldBlockTunnel = when (targetState) {
-                    ConnectionState.BLOCKED -> true
-                    ConnectionState.SLOWED -> {
-                        // Gentle throttling duty-cycle near limit: pause general traffic 2s out of every 4s
-                        slowdownPulseCounter = (slowdownPulseCounter + 1) % 2
-                        slowdownPulseCounter == 1
+                val cfg = prefs.getLocalLimitConfig()
+                val usedMb = prefs.getUsedMbActivePeriod()
+                activePolicy = cfg.speedPolicy
+
+                recent60sBytes.addLast(intervalBytes)
+                if (recent60sBytes.size > 60) recent60sBytes.removeFirst()
+                val burstThresholdBytes = cfg.speedPolicy.burstThresholdMbPerMin.toLong() * 1024L * 1024L
+                if (recent60sBytes.sum() > burstThresholdBytes) {
+                    burstCooldownTicks = 120
+                } else if (burstCooldownTicks > 0) {
+                    burstCooldownTicks--
+                }
+
+                val effective = computeEffectiveSpeed(
+                    usedMb = usedMb,
+                    limitMb = cfg.limitMb,
+                    policy = cfg.speedPolicy,
+                    forcedBySupervisor = cfg.forceQuotaSaver,
+                    globalSpeedCapMbPerSec = cfg.globalSpeedCapMbps,
+                    burstDetected = burstCooldownTicks > 0,
+                    isScreenOffIdle = isScreenOffIdle
+                )
+
+                activeSaverFlag = effective.saverActive
+                _connectionState.value = effective.state
+                _statusLabel.value = effective.statusLabelArabic
+                _blockedAdsCount.value = dnsHandler.blockedRequestsCount.get()
+
+                val shouldBlockTunnel = when {
+                    effective.state == ConnectionState.BLOCKED || effective.state == ConnectionState.IDLE_FROZEN -> true
+                    effective.targetBytesPerSec == Long.MAX_VALUE -> {
+                        brakeDebtBytes = 0L
+                        false
                     }
-                    else -> false
+                    else -> {
+                        brakeDebtBytes = (brakeDebtBytes + intervalBytes - effective.targetBytesPerSec)
+                            .coerceIn(0L, effective.targetBytesPerSec * 3L)
+                        brakeDebtBytes > (effective.targetBytesPerSec / 4L)
+                    }
                 }
 
-                if (shouldBlockTunnel != currentBlockAll || whitelist != currentWhitelist) {
-                    establishTunnel(blockAll = shouldBlockTunnel, whitelist = whitelist)
+                val useLocalDns = effective.saverActive && (cfg.speedPolicy.dnsSinkholeEnabled || cfg.speedPolicy.dnsCacheEnabled)
+                val blockDoh = effective.saverActive && cfg.speedPolicy.blockDohDotEnabled
+
+                if (shouldBlockTunnel != currentBlockAll ||
+                    useLocalDns != currentUseLocalDns ||
+                    blockDoh != currentBlockDoh ||
+                    cfg.whitelist != currentWhitelist
+                ) {
+                    establishTunnel(
+                        blockAll = shouldBlockTunnel,
+                        useLocalDns = useLocalDns,
+                        blockDoh = blockDoh,
+                        whitelist = cfg.whitelist
+                    )
                 }
 
-                val summary = "${formatDataSizeArabic(usedMb)} من ${formatDataSizeArabic(limitMb)}"
-                updateNotification(summary, targetState)
+                val summary = "${cfg.limitPeriod.arabicLabel}: ${formatDataSizeArabic(usedMb)} من ${formatDataSizeArabic(cfg.limitMb)}"
+                updateNotification(summary, effective.statusLabelArabic)
 
-                delay(2000L)
+                delay(1000L)
             }
         }
     }
@@ -185,7 +249,7 @@ class WifiGuardVpnService : VpnService() {
                     if (host.isNotBlank()) {
                         val id = prefs.getOrCreateDeviceId()
                         val name = prefs.getDeviceName()
-                        val usedMb = prefs.getUsedMbToday()
+                        val usedMb = prefs.getUsedMbActivePeriod()
                         val adminActive = WifiGuardDeviceAdminReceiver.isActive(applicationContext)
                         val updated = LocalLanClient.sendHeartbeat(
                             host = host,
@@ -199,9 +263,12 @@ class WifiGuardVpnService : VpnService() {
                         )
                         if (updated != null) {
                             prefs.updateLocalLimits(
-                                dailyLimitMb = updated.dailyLimitMb,
-                                slowdownThresholdPercent = updated.slowdownThresholdPercent,
-                                whitelist = updated.whitelistedPackages
+                                limitMb = updated.dailyLimitMb,
+                                limitPeriod = updated.limitPeriod,
+                                speedPolicy = updated.speedPolicy,
+                                whitelist = updated.whitelistedPackages,
+                                globalSpeedCapMbps = updated.globalSpeedCapMbps,
+                                forceQuotaSaver = updated.forceQuotaSaver
                             )
                         }
                     }
@@ -211,10 +278,17 @@ class WifiGuardVpnService : VpnService() {
         }
     }
 
-    private fun establishTunnel(blockAll: Boolean, whitelist: Set<String>) {
-        drainJob?.cancel()
+    private fun establishTunnel(
+        blockAll: Boolean,
+        useLocalDns: Boolean,
+        blockDoh: Boolean,
+        whitelist: Set<String>
+    ) {
+        packetLoopJob?.cancel()
         runCatching { tunInterface?.close() }
         currentBlockAll = blockAll
+        currentUseLocalDns = useLocalDns
+        currentBlockDoh = blockDoh
         currentWhitelist = whitelist
 
         val builder = Builder()
@@ -226,14 +300,21 @@ class WifiGuardVpnService : VpnService() {
             builder.addRoute("0.0.0.0", 0)
             builder.addRoute("::", 0)
         } else {
-            // Keep Always-On VPN connected with zero speed impact when under limit
             builder.addRoute("10.254.0.0", 16)
         }
 
-        // Always exclude our own app so local Supervisor sync never drops
-        runCatching { builder.addDisallowedApplication(packageName) }
+        if (useLocalDns) {
+            builder.addDnsServer("10.0.0.1")
+            builder.addRoute("10.0.0.1", 32)
+            if (blockDoh) {
+                // Route known public DoH/DoT resolver IPs into TUN so encrypted DNS bypasses fall back to our sinkhole
+                listOf("1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9").forEach { ip ->
+                    runCatching { builder.addRoute(ip, 32) }
+                }
+            }
+        }
 
-        // Exclude whitelisted apps so they always keep Wi-Fi access
+        runCatching { builder.addDisallowedApplication(packageName) }
         whitelist.forEach { pkg ->
             runCatching { builder.addDisallowedApplication(pkg) }
         }
@@ -241,14 +322,29 @@ class WifiGuardVpnService : VpnService() {
         tunInterface = runCatching { builder.establish() }.getOrNull()
 
         val pfd = tunInterface
-        if (pfd != null && blockAll) {
-            drainJob = serviceScope.launch {
+        if (pfd != null && (blockAll || useLocalDns)) {
+            packetLoopJob = serviceScope.launch {
                 val input = FileInputStream(pfd.fileDescriptor)
-                val buffer = ByteBuffer.allocate(32767)
+                val output = FileOutputStream(pfd.fileDescriptor)
+                val buffer = ByteArray(32767)
                 while (isActive) {
-                    val len = runCatching { input.read(buffer.array()) }.getOrElse { -1 }
+                    val len = runCatching { input.read(buffer) }.getOrElse { -1 }
                     if (len < 0) break
-                    buffer.clear()
+                    if (!blockAll && useLocalDns) {
+                        val policy = activePolicy
+                        val saverOn = activeSaverFlag
+                        val response = dnsHandler.handlePacket(
+                            packet = buffer,
+                            length = len,
+                            sinkholeEnabled = saverOn && policy.dnsSinkholeEnabled,
+                            cacheEnabled = saverOn && policy.dnsCacheEnabled,
+                            blockDohDot = saverOn && policy.blockDohDotEnabled,
+                            blockQuicUdp443 = saverOn && policy.blockQuicUdp443Enabled
+                        )
+                        if (response != null) {
+                            runCatching { output.write(response) }
+                        }
+                    }
                 }
             }
         }
@@ -267,20 +363,14 @@ class WifiGuardVpnService : VpnService() {
             nm.createNotificationChannel(
                 NotificationChannel(
                     CHANNEL_ID,
-                    "حماية الاتصال اليومية",
+                    "حماية الاتصال",
                     NotificationManager.IMPORTANCE_LOW
                 )
             )
         }
     }
 
-    private fun buildNotification(text: String, state: ConnectionState): Notification {
-        val title = when (state) {
-            ConnectionState.NORMAL -> "حارس الواي فاي — يعمل بشكل طبيعي"
-            ConnectionState.SLOWED -> "تم تهدئة السرعة — اقتربت من الحد اليومي"
-            ConnectionState.BLOCKED -> "انتهى الرصيد اليومي — التطبيقات المستثناة فقط تعمل"
-            ConnectionState.PROTECTION_OFF -> "الحماية متوقفة"
-        }
+    private fun buildNotification(text: String, title: String): Notification {
         val pi = PendingIntent.getActivity(
             this,
             0,
@@ -296,8 +386,8 @@ class WifiGuardVpnService : VpnService() {
             .build()
     }
 
-    private fun updateNotification(text: String, state: ConnectionState) {
+    private fun updateNotification(text: String, title: String) {
         val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIF_ID, buildNotification(text, state))
+        nm.notify(NOTIF_ID, buildNotification(text, title))
     }
 }

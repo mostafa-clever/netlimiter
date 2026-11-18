@@ -2,6 +2,7 @@ package com.wifiguard.limiter.model
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Calendar
 
 enum class AppRole {
     UNSET,
@@ -9,23 +10,336 @@ enum class AppRole {
     CLIENT
 }
 
+enum class LimitPeriod(val arabicLabel: String) {
+    DAILY("يومي"),
+    WEEKLY("أسبوعي"),
+    MONTHLY("شهري")
+}
+
 enum class ConnectionState {
     NORMAL,
+    SMART_SAVING,
     SLOWED,
+    GRACE_EXTRA,
+    IDLE_FROZEN,
     BLOCKED,
     PROTECTION_OFF
+}
+
+data class SpeedPolicyConfig(
+    // Base speed cap in MB/s (0.0 = unlimited / full speed)
+    val baseSpeedLimitMbPerSec: Double = 3.0,
+    // Phased slowdown rules
+    val slowdownStartPercent: Int = 50,
+    val slowdownInitialSpeedPercent: Int = 40,
+    val slowdownStepPerPercent: Int = 1,
+    val finalPhaseRemainingPercent: Int = 20,
+    val finalPhaseSpeedMbPerSec: Double = 1.0,
+    // Extra mile / grace buffer after 100% (counted in weekly/monthly limits)
+    val graceExtraPercent: Int = 10,
+    val graceSpeedMbPerSec: Double = 0.25,
+    // Automatic daily unused quota rollover (%)
+    val rolloverPercent: Int = 0,
+    // Customizable Quota Saver Mode & Auto-Trigger
+    val quotaSaverModeEnabled: Boolean = true,
+    val autoEnableSaverAtPercent: Int = 0, // 0 = from start, 1..99 = auto-enable at X%, 100 = manual/forced only
+    val dnsSinkholeEnabled: Boolean = true,
+    val dnsCacheEnabled: Boolean = true,
+    val blockDohDotEnabled: Boolean = true,
+    val blockQuicUdp443Enabled: Boolean = true,
+    val idleScreenFreezeEnabled: Boolean = true,
+    val peakHoursSaverEnabled: Boolean = true,
+    val peakHoursSpeedMbPerSec: Double = 1.5,
+    val burstGuardEnabled: Boolean = true,
+    val burstThresholdMbPerMin: Int = 50,
+    val burstCapSpeedMbPerSec: Double = 1.0,
+    val nightSaverEnabled: Boolean = false,
+    val nightSaverSpeedMbPerSec: Double = 0.5
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("baseSpeedLimitMbPerSec", baseSpeedLimitMbPerSec)
+        put("slowdownStartPercent", slowdownStartPercent)
+        put("slowdownInitialSpeedPercent", slowdownInitialSpeedPercent)
+        put("slowdownStepPerPercent", slowdownStepPerPercent)
+        put("finalPhaseRemainingPercent", finalPhaseRemainingPercent)
+        put("finalPhaseSpeedMbPerSec", finalPhaseSpeedMbPerSec)
+        put("graceExtraPercent", graceExtraPercent)
+        put("graceSpeedMbPerSec", graceSpeedMbPerSec)
+        put("rolloverPercent", rolloverPercent)
+        put("quotaSaverModeEnabled", quotaSaverModeEnabled)
+        put("autoEnableSaverAtPercent", autoEnableSaverAtPercent)
+        put("dnsSinkholeEnabled", dnsSinkholeEnabled)
+        put("dnsCacheEnabled", dnsCacheEnabled)
+        put("blockDohDotEnabled", blockDohDotEnabled)
+        put("blockQuicUdp443Enabled", blockQuicUdp443Enabled)
+        put("idleScreenFreezeEnabled", idleScreenFreezeEnabled)
+        put("peakHoursSaverEnabled", peakHoursSaverEnabled)
+        put("peakHoursSpeedMbPerSec", peakHoursSpeedMbPerSec)
+        put("burstGuardEnabled", burstGuardEnabled)
+        put("burstThresholdMbPerMin", burstThresholdMbPerMin)
+        put("burstCapSpeedMbPerSec", burstCapSpeedMbPerSec)
+        put("nightSaverEnabled", nightSaverEnabled)
+        put("nightSaverSpeedMbPerSec", nightSaverSpeedMbPerSec)
+    }
+
+    companion object {
+        fun fromJson(obj: JSONObject?): SpeedPolicyConfig {
+            if (obj == null) return SpeedPolicyConfig()
+            return SpeedPolicyConfig(
+                baseSpeedLimitMbPerSec = obj.optDouble("baseSpeedLimitMbPerSec", 3.0).coerceAtLeast(0.0),
+                slowdownStartPercent = obj.optInt("slowdownStartPercent", 50).coerceIn(10, 95),
+                slowdownInitialSpeedPercent = obj.optInt("slowdownInitialSpeedPercent", 40).coerceIn(5, 100),
+                slowdownStepPerPercent = obj.optInt("slowdownStepPerPercent", 1).coerceIn(1, 5),
+                finalPhaseRemainingPercent = obj.optInt("finalPhaseRemainingPercent", 20).coerceIn(1, 50),
+                finalPhaseSpeedMbPerSec = obj.optDouble("finalPhaseSpeedMbPerSec", 1.0).coerceAtLeast(0.1),
+                graceExtraPercent = obj.optInt("graceExtraPercent", 10).coerceIn(0, 50),
+                graceSpeedMbPerSec = obj.optDouble("graceSpeedMbPerSec", 0.25).coerceAtLeast(0.05),
+                rolloverPercent = obj.optInt("rolloverPercent", 0).coerceIn(0, 100),
+                quotaSaverModeEnabled = obj.optBoolean("quotaSaverModeEnabled", true),
+                autoEnableSaverAtPercent = obj.optInt("autoEnableSaverAtPercent", 0).coerceIn(0, 100),
+                dnsSinkholeEnabled = obj.optBoolean("dnsSinkholeEnabled", true),
+                dnsCacheEnabled = obj.optBoolean("dnsCacheEnabled", true),
+                blockDohDotEnabled = obj.optBoolean("blockDohDotEnabled", true),
+                blockQuicUdp443Enabled = obj.optBoolean("blockQuicUdp443Enabled", true),
+                idleScreenFreezeEnabled = obj.optBoolean("idleScreenFreezeEnabled", true),
+                peakHoursSaverEnabled = obj.optBoolean("peakHoursSaverEnabled", true),
+                peakHoursSpeedMbPerSec = obj.optDouble("peakHoursSpeedMbPerSec", 1.5).coerceAtLeast(0.1),
+                burstGuardEnabled = obj.optBoolean("burstGuardEnabled", true),
+                burstThresholdMbPerMin = obj.optInt("burstThresholdMbPerMin", 50).coerceIn(10, 500),
+                burstCapSpeedMbPerSec = obj.optDouble("burstCapSpeedMbPerSec", 1.0).coerceAtLeast(0.1),
+                nightSaverEnabled = obj.optBoolean("nightSaverEnabled", false),
+                nightSaverSpeedMbPerSec = obj.optDouble("nightSaverSpeedMbPerSec", 0.5).coerceAtLeast(0.1)
+            )
+        }
+
+        fun presetBalanced() = SpeedPolicyConfig()
+
+        fun presetMaxSaver() = SpeedPolicyConfig(
+            baseSpeedLimitMbPerSec = 2.0,
+            slowdownStartPercent = 40,
+            slowdownInitialSpeedPercent = 35,
+            slowdownStepPerPercent = 1,
+            finalPhaseRemainingPercent = 25,
+            finalPhaseSpeedMbPerSec = 0.5,
+            graceExtraPercent = 10,
+            graceSpeedMbPerSec = 0.25,
+            rolloverPercent = 50,
+            quotaSaverModeEnabled = true,
+            autoEnableSaverAtPercent = 0,
+            dnsSinkholeEnabled = true,
+            dnsCacheEnabled = true,
+            blockDohDotEnabled = true,
+            blockQuicUdp443Enabled = true,
+            idleScreenFreezeEnabled = true,
+            peakHoursSaverEnabled = true,
+            peakHoursSpeedMbPerSec = 1.0,
+            burstGuardEnabled = true,
+            burstThresholdMbPerMin = 30,
+            burstCapSpeedMbPerSec = 0.75,
+            nightSaverEnabled = true,
+            nightSaverSpeedMbPerSec = 0.3
+        )
+
+        fun presetRelaxed() = SpeedPolicyConfig(
+            baseSpeedLimitMbPerSec = 0.0,
+            slowdownStartPercent = 75,
+            slowdownInitialSpeedPercent = 50,
+            slowdownStepPerPercent = 1,
+            finalPhaseRemainingPercent = 10,
+            finalPhaseSpeedMbPerSec = 1.5,
+            graceExtraPercent = 15,
+            graceSpeedMbPerSec = 0.5,
+            rolloverPercent = 50,
+            quotaSaverModeEnabled = false,
+            autoEnableSaverAtPercent = 70,
+            dnsSinkholeEnabled = true,
+            dnsCacheEnabled = true,
+            blockDohDotEnabled = false,
+            blockQuicUdp443Enabled = false,
+            idleScreenFreezeEnabled = false,
+            peakHoursSaverEnabled = false,
+            burstGuardEnabled = false,
+            nightSaverEnabled = false
+        )
+    }
+}
+
+data class EffectiveSpeedStatus(
+    val state: ConnectionState,
+    val targetBytesPerSec: Long,
+    val activeSpeedPercent: Int,
+    val saverActive: Boolean,
+    val statusLabelArabic: String
+)
+
+fun isQuotaSaverActive(
+    usedMb: Long,
+    limitMb: Long,
+    policy: SpeedPolicyConfig,
+    forcedBySupervisor: Boolean
+): Boolean {
+    if (forcedBySupervisor || policy.quotaSaverModeEnabled) return true
+    if (policy.autoEnableSaverAtPercent < 100 && limitMb > 0L) {
+        val usedPercent = ((usedMb * 100.0) / limitMb).coerceIn(0.0, 100.0)
+        if (usedPercent >= policy.autoEnableSaverAtPercent.toDouble()) return true
+    }
+    return false
+}
+
+fun computeEffectiveSpeed(
+    usedMb: Long,
+    limitMb: Long,
+    policy: SpeedPolicyConfig,
+    forcedBySupervisor: Boolean = false,
+    globalSpeedCapMbPerSec: Double = 0.0,
+    burstDetected: Boolean = false,
+    isScreenOffIdle: Boolean = false
+): EffectiveSpeedStatus {
+    val graceMb = (limitMb * policy.graceExtraPercent) / 100L
+    val hardCapMb = limitMb + graceMb
+    val saverActive = isQuotaSaverActive(usedMb, limitMb, policy, forcedBySupervisor)
+
+    if (limitMb <= 0L || usedMb >= hardCapMb) {
+        return EffectiveSpeedStatus(
+            state = ConnectionState.BLOCKED,
+            targetBytesPerSec = 0L,
+            activeSpeedPercent = 0,
+            saverActive = saverActive,
+            statusLabelArabic = "انتهى الرصيد بالكامل — التطبيقات المسموحة فقط تعمل"
+        )
+    }
+
+    if (saverActive && policy.idleScreenFreezeEnabled && isScreenOffIdle) {
+        return EffectiveSpeedStatus(
+            state = ConnectionState.IDLE_FROZEN,
+            targetBytesPerSec = 0L,
+            activeSpeedPercent = 0,
+            saverActive = true,
+            statusLabelArabic = "تجميد الخلفية (الشاشة مغلقة) لتوفير الباقة"
+        )
+    }
+
+    if (usedMb >= limitMb) {
+        val graceBytesPerSec = (policy.graceSpeedMbPerSec * 1024.0 * 1024.0).toLong().coerceAtLeast(32 * 1024L)
+        val extraLeftMb = (hardCapMb - usedMb).coerceAtLeast(0L)
+        val speedStr = formatSpeedArabic(policy.graceSpeedMbPerSec)
+        return EffectiveSpeedStatus(
+            state = ConnectionState.GRACE_EXTRA,
+            targetBytesPerSec = graceBytesPerSec,
+            activeSpeedPercent = 5,
+            saverActive = saverActive,
+            statusLabelArabic = "رصيد إضافي ($speedStr) • متبقي ${formatDataSizeArabic(extraLeftMb)}"
+        )
+    }
+
+    val effectiveBaseMbPerSec = when {
+        globalSpeedCapMbPerSec > 0.0 && policy.baseSpeedLimitMbPerSec > 0.0 ->
+            minOf(globalSpeedCapMbPerSec, policy.baseSpeedLimitMbPerSec)
+        globalSpeedCapMbPerSec > 0.0 -> globalSpeedCapMbPerSec
+        else -> policy.baseSpeedLimitMbPerSec
+    }
+
+    val baseBytesPerSec = if (effectiveBaseMbPerSec > 0.0) {
+        (effectiveBaseMbPerSec * 1024.0 * 1024.0).toLong().coerceAtLeast(64 * 1024L)
+    } else {
+        10L * 1024L * 1024L
+    }
+
+    val usedPercent = ((usedMb * 100.0) / limitMb).coerceIn(0.0, 100.0)
+    val remainingPercent = 100.0 - usedPercent
+    val finalPhaseBytesPerSec = (policy.finalPhaseSpeedMbPerSec * 1024.0 * 1024.0).toLong().coerceAtLeast(64 * 1024L)
+
+    if (remainingPercent <= policy.finalPhaseRemainingPercent.toDouble()) {
+        val capped = if (globalSpeedCapMbPerSec > 0.0) {
+            minOf(finalPhaseBytesPerSec, (globalSpeedCapMbPerSec * 1024.0 * 1024.0).toLong())
+        } else finalPhaseBytesPerSec
+        val speedStr = formatSpeedArabic(capped / (1024.0 * 1024.0))
+        return EffectiveSpeedStatus(
+            state = ConnectionState.SLOWED,
+            targetBytesPerSec = capped,
+            activeSpeedPercent = 10,
+            saverActive = saverActive,
+            statusLabelArabic = "المرحلة الأخيرة • سرعة $speedStr"
+        )
+    }
+
+    if (usedPercent >= policy.slowdownStartPercent.toDouble()) {
+        val stepsUsed = (usedPercent - policy.slowdownStartPercent).toInt().coerceAtLeast(0)
+        val speedPct = (policy.slowdownInitialSpeedPercent - (stepsUsed * policy.slowdownStepPerPercent)).coerceIn(1, 100)
+        val computedBytes = maxOf(finalPhaseBytesPerSec, (baseBytesPerSec * speedPct) / 100L)
+        val mbps = computedBytes / (1024.0 * 1024.0)
+        return EffectiveSpeedStatus(
+            state = ConnectionState.SLOWED,
+            targetBytesPerSec = computedBytes,
+            activeSpeedPercent = speedPct,
+            saverActive = saverActive,
+            statusLabelArabic = "تهدئة تدريجية • $speedPct% (${formatSpeedArabic(mbps)})"
+        )
+    }
+
+    var targetBytes = if (effectiveBaseMbPerSec > 0.0) baseBytesPerSec else Long.MAX_VALUE
+    var state = if (saverActive || effectiveBaseMbPerSec > 0.0) ConnectionState.SMART_SAVING else ConnectionState.NORMAL
+    var label = when {
+        saverActive && effectiveBaseMbPerSec > 0.0 -> "توفير ذكي • ${formatSpeedArabic(effectiveBaseMbPerSec)}"
+        saverActive -> "توفير ذكي نشط (حجب الإعلانات)"
+        effectiveBaseMbPerSec > 0.0 -> "سرعة محددة • ${formatSpeedArabic(effectiveBaseMbPerSec)}"
+        else -> "متصل بسرعة كاملة"
+    }
+
+    if (saverActive) {
+        val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        if (policy.nightSaverEnabled && (hour in 1..6)) {
+            val nightBytes = (policy.nightSaverSpeedMbPerSec * 1024.0 * 1024.0).toLong().coerceAtLeast(64 * 1024L)
+            targetBytes = minOf(targetBytes, nightBytes)
+            state = ConnectionState.SMART_SAVING
+            label = "توفير ليلي • ${formatSpeedArabic(targetBytes / (1024.0 * 1024.0))}"
+        } else if (policy.peakHoursSaverEnabled && (hour in 18..23)) {
+            val peakBytes = (policy.peakHoursSpeedMbPerSec * 1024.0 * 1024.0).toLong().coerceAtLeast(64 * 1024L)
+            targetBytes = minOf(targetBytes, peakBytes)
+            state = ConnectionState.SMART_SAVING
+            label = "ساعات الذروة • ${formatSpeedArabic(targetBytes / (1024.0 * 1024.0))}"
+        }
+
+        if (policy.burstGuardEnabled && burstDetected) {
+            val burstBytes = (policy.burstCapSpeedMbPerSec * 1024.0 * 1024.0).toLong().coerceAtLeast(64 * 1024L)
+            targetBytes = minOf(targetBytes, burstBytes)
+            state = ConnectionState.SMART_SAVING
+            label = "حماية السحب المفاجئ • ${formatSpeedArabic(targetBytes / (1024.0 * 1024.0))}"
+        }
+    }
+
+    return EffectiveSpeedStatus(
+        state = state,
+        targetBytesPerSec = targetBytes,
+        activeSpeedPercent = 100,
+        saverActive = saverActive,
+        statusLabelArabic = label
+    )
+}
+
+fun formatSpeedArabic(mbPerSec: Double): String {
+    return if (mbPerSec <= 0.0) {
+        "سرعة كاملة"
+    } else if (mbPerSec % 1.0 == 0.0) {
+        "${mbPerSec.toInt()} م.ب/ث"
+    } else {
+        String.format(java.util.Locale("ar"), "%.2f م.ب/ث", mbPerSec)
+            .replace("0 م.ب/ث", " م.ب/ث")
+    }
 }
 
 data class ManagedDevice(
     val deviceId: String,
     val deviceName: String,
+    val limitPeriod: LimitPeriod = LimitPeriod.DAILY,
     val dailyLimitMb: Long = 1024L,
     val usedMb: Long = 0L,
-    val slowdownThresholdPercent: Int = 80,
+    val forceQuotaSaver: Boolean = false,
+    val speedPolicy: SpeedPolicyConfig = SpeedPolicyConfig(),
     val whitelistedPackages: List<String> = emptyList(),
     val protectionActive: Boolean = false,
     val uninstallProtectionActive: Boolean = false,
-    val connectionState: ConnectionState = ConnectionState.NORMAL,
+    val connectionState: ConnectionState = ConnectionState.SMART_SAVING,
     val lastSeenMillis: Long = 0L,
     val isOnline: Boolean = false,
     val tamperWarning: String? = null
@@ -36,9 +350,11 @@ data class ManagedDevice(
     fun toJson(): JSONObject = JSONObject().apply {
         put("deviceId", deviceId)
         put("deviceName", deviceName)
+        put("limitPeriod", limitPeriod.name)
         put("dailyLimitMb", dailyLimitMb)
         put("usedMb", usedMb)
-        put("slowdownThresholdPercent", slowdownThresholdPercent)
+        put("forceQuotaSaver", forceQuotaSaver)
+        put("speedPolicy", speedPolicy.toJson())
         put("whitelistedPackages", JSONArray(whitelistedPackages))
         put("protectionActive", protectionActive)
         put("uninstallProtectionActive", uninstallProtectionActive)
@@ -55,15 +371,19 @@ data class ManagedDevice(
             for (i in 0 until pkgArray.length()) {
                 pkgs.add(pkgArray.optString(i))
             }
-            val stateStr = obj.optString("connectionState", ConnectionState.NORMAL.name)
-            val state = runCatching { ConnectionState.valueOf(stateStr) }.getOrDefault(ConnectionState.NORMAL)
+            val periodStr = obj.optString("limitPeriod", LimitPeriod.DAILY.name)
+            val period = runCatching { LimitPeriod.valueOf(periodStr) }.getOrDefault(LimitPeriod.DAILY)
+            val stateStr = obj.optString("connectionState", ConnectionState.SMART_SAVING.name)
+            val state = runCatching { ConnectionState.valueOf(stateStr) }.getOrDefault(ConnectionState.SMART_SAVING)
             val warning = if (obj.isNull("tamperWarning")) null else obj.optString("tamperWarning", null)
             return ManagedDevice(
                 deviceId = obj.optString("deviceId", ""),
                 deviceName = obj.optString("deviceName", "جهاز غير معروف"),
+                limitPeriod = period,
                 dailyLimitMb = obj.optLong("dailyLimitMb", 1024L),
                 usedMb = obj.optLong("usedMb", 0L),
-                slowdownThresholdPercent = obj.optInt("slowdownThresholdPercent", 80),
+                forceQuotaSaver = obj.optBoolean("forceQuotaSaver", false),
+                speedPolicy = SpeedPolicyConfig.fromJson(obj.optJSONObject("speedPolicy")),
                 whitelistedPackages = pkgs,
                 protectionActive = obj.optBoolean("protectionActive", false),
                 uninstallProtectionActive = obj.optBoolean("uninstallProtectionActive", false),

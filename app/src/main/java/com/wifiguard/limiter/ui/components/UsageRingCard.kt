@@ -22,7 +22,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Eco
+import androidx.compose.material.icons.rounded.HourglassBottom
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Warning
@@ -57,6 +60,7 @@ import com.wifiguard.limiter.model.formatDataSizeArabic
 import com.wifiguard.limiter.ui.theme.AlertRed
 import com.wifiguard.limiter.ui.theme.AlertRedBg
 import com.wifiguard.limiter.ui.theme.PrimaryTeal
+import com.wifiguard.limiter.ui.theme.SoftMint
 import com.wifiguard.limiter.ui.theme.SuccessGreen
 import com.wifiguard.limiter.ui.theme.SuccessGreenBg
 import com.wifiguard.limiter.ui.theme.TextMuted
@@ -69,7 +73,8 @@ fun UsageRingCard(
     usedMb: Long,
     dailyLimitMb: Long,
     connectionState: ConnectionState,
-    protectionActive: Boolean
+    protectionActive: Boolean,
+    statusLabelOverride: String? = null
 ) {
     val ratio = if (dailyLimitMb <= 0L) 1f else (usedMb.toFloat() / dailyLimitMb.toFloat()).coerceIn(0f, 1f)
     val animatedProgress by animateFloatAsState(
@@ -82,7 +87,7 @@ fun UsageRingCard(
     val ringColor = when {
         !protectionActive -> TextMuted
         connectionState == ConnectionState.BLOCKED -> AlertRed
-        connectionState == ConnectionState.SLOWED -> WarnAmber
+        connectionState == ConnectionState.SLOWED || connectionState == ConnectionState.GRACE_EXTRA -> WarnAmber
         else -> PrimaryTeal
     }
 
@@ -144,7 +149,11 @@ fun UsageRingCard(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            StatusPill(connectionState = connectionState, protectionActive = protectionActive)
+            StatusPill(
+                connectionState = connectionState,
+                protectionActive = protectionActive,
+                labelOverride = statusLabelOverride
+            )
 
             Spacer(modifier = Modifier.height(12.dp))
 
@@ -152,28 +161,50 @@ fun UsageRingCard(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
-                StatChip(label = "المتبقي اليوم", value = formatDataSizeArabic(remainingMb))
-                StatChip(label = "نسبة الاستهلاك", value = "${(ratio * 100).toInt()}%")
+                StatChip(label = "المتبقي", value = formatDataSizeArabic(remainingMb))
+                StatChip(label = "نسبة الاستهلاك", value = "${if (dailyLimitMb <= 0L) 100 else ((usedMb * 100) / dailyLimitMb)}%")
             }
         }
     }
 }
 
 @Composable
-fun StatusPill(connectionState: ConnectionState, protectionActive: Boolean) {
-    val (bg, fg, icon, text) = when {
+fun StatusPill(
+    connectionState: ConnectionState,
+    protectionActive: Boolean,
+    labelOverride: String? = null
+) {
+    val (bg, fg, icon, defaultText) = when {
         !protectionActive -> Quad(AlertRedBg, AlertRed, Icons.Rounded.Warning, "الحماية متوقفة حالياً")
         connectionState == ConnectionState.BLOCKED -> Quad(
             AlertRedBg,
             AlertRed,
             Icons.Rounded.WifiOff,
-            "انتهى الرصيد اليومي — التطبيقات المسموحة فقط تعمل"
+            "انتهى الرصيد بالكامل — التطبيقات المسموحة فقط تعمل"
+        )
+        connectionState == ConnectionState.IDLE_FROZEN -> Quad(
+            SoftMint,
+            PrimaryTeal,
+            Icons.Rounded.Bedtime,
+            "تجميد الخلفية لتوفير الباقة"
+        )
+        connectionState == ConnectionState.GRACE_EXTRA -> Quad(
+            WarnAmberBg,
+            WarnAmber,
+            Icons.Rounded.HourglassBottom,
+            "رصيد إضافي • سرعة 0.25 م.ب/ث"
         )
         connectionState == ConnectionState.SLOWED -> Quad(
             WarnAmberBg,
             WarnAmber,
             Icons.Rounded.Speed,
-            "تم تهدئة السرعة لأنك اقتربت من الحد اليومي"
+            "تهدئة تدريجية للسرعة"
+        )
+        connectionState == ConnectionState.SMART_SAVING -> Quad(
+            SoftMint,
+            PrimaryTeal,
+            Icons.Rounded.Eco,
+            "التوفير الذكي نشط"
         )
         else -> Quad(
             SuccessGreenBg,
@@ -182,6 +213,8 @@ fun StatusPill(connectionState: ConnectionState, protectionActive: Boolean) {
             "متصل بسرعة كاملة"
         )
     }
+
+    val text = if (!protectionActive) defaultText else (labelOverride ?: defaultText)
 
     Row(
         modifier = Modifier
@@ -241,7 +274,7 @@ fun WhitelistPickerDialog(
         text = {
             Column {
                 Text(
-                    "هذه التطبيقات ستستمر بالعمل حتى بعد انتهاء الرصيد اليومي:",
+                    "هذه التطبيقات ستستمر بالعمل حتى بعد انتهاء الرصيد:",
                     fontSize = 13.sp,
                     color = TextMuted
                 )

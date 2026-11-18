@@ -194,18 +194,22 @@ class SupervisorServerService : Service() {
             deviceId = deviceId,
             deviceName = deviceName,
             dailyLimitMb = 1024L,
-            slowdownThresholdPercent = 80,
             lastSeenMillis = System.currentTimeMillis(),
             isOnline = true
         )
         prefs.upsertManagedDevice(device)
         alertedOfflineDevices.remove(deviceId)
+        val globalCap = prefs.globalSpeedCapMbpsFlow.first()
+        val forceAll = prefs.forceQuotaSaverAllFlow.first()
 
         return JSONObject().apply {
             put("ok", true)
             put("dailyLimitMb", device.dailyLimitMb)
-            put("slowdownThresholdPercent", device.slowdownThresholdPercent)
+            put("limitPeriod", device.limitPeriod.name)
+            put("speedPolicy", device.speedPolicy.toJson())
             put("whitelistedPackages", JSONArray(device.whitelistedPackages))
+            put("globalSpeedCapMbps", globalCap)
+            put("forceQuotaSaver", forceAll || device.forceQuotaSaver)
         }
     }
 
@@ -215,8 +219,8 @@ class SupervisorServerService : Service() {
         val usedMb = body.optLong("usedMb", 0L)
         val protectionActive = body.optBoolean("protectionActive", false)
         val uninstallProtectionActive = body.optBoolean("uninstallProtectionActive", false)
-        val stateStr = body.optString("connectionState", ConnectionState.NORMAL.name)
-        val connState = runCatching { ConnectionState.valueOf(stateStr) }.getOrDefault(ConnectionState.NORMAL)
+        val stateStr = body.optString("connectionState", ConnectionState.SMART_SAVING.name)
+        val connState = runCatching { ConnectionState.valueOf(stateStr) }.getOrDefault(ConnectionState.SMART_SAVING)
 
         val existing = prefs.managedDevicesFlow.first().firstOrNull { it.deviceId == deviceId }
         val wasProtected = existing?.protectionActive == true
@@ -242,12 +246,17 @@ class SupervisorServerService : Service() {
         )
         prefs.upsertManagedDevice(updated)
         alertedOfflineDevices.remove(deviceId)
+        val globalCap = prefs.globalSpeedCapMbpsFlow.first()
+        val forceAll = prefs.forceQuotaSaverAllFlow.first()
 
         return JSONObject().apply {
             put("ok", true)
             put("dailyLimitMb", updated.dailyLimitMb)
-            put("slowdownThresholdPercent", updated.slowdownThresholdPercent)
+            put("limitPeriod", updated.limitPeriod.name)
+            put("speedPolicy", updated.speedPolicy.toJson())
             put("whitelistedPackages", JSONArray(updated.whitelistedPackages))
+            put("globalSpeedCapMbps", globalCap)
+            put("forceQuotaSaver", forceAll || updated.forceQuotaSaver)
         }
     }
 

@@ -1,6 +1,5 @@
 package com.wifiguard.limiter.ui.screens
 
-import android.content.pm.PackageManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,7 +24,6 @@ import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material3.AssistChip
-import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -51,6 +49,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wifiguard.limiter.admin.WifiGuardDeviceAdminReceiver
 import com.wifiguard.limiter.data.PreferencesManager
+import com.wifiguard.limiter.model.LimitPeriod
 import com.wifiguard.limiter.ui.components.UsageRingCard
 import com.wifiguard.limiter.ui.theme.PrimaryTeal
 import com.wifiguard.limiter.ui.theme.SoftMint
@@ -71,11 +70,14 @@ fun ClientScreen(
 ) {
     val context = LocalContext.current
     val deviceName by prefs.deviceNameFlow.collectAsState(initial = "جهازي")
-    val usedMb by prefs.usedMbTodayFlow.collectAsState(initial = 0L)
+    val limitPeriod by prefs.limitPeriodFlow.collectAsState(initial = LimitPeriod.DAILY)
+    val usedMb by prefs.usedMbActivePeriodFlow.collectAsState(initial = 0L)
     val dailyLimitMb by prefs.dailyLimitMbFlow.collectAsState(initial = 1024L)
     val whitelist by prefs.whitelistFlow.collectAsState(initial = emptySet())
     val vpnRunning by WifiGuardVpnService.isRunning.collectAsState()
     val connState by WifiGuardVpnService.connectionState.collectAsState()
+    val statusLabel by WifiGuardVpnService.statusLabel.collectAsState()
+    val blockedAds by WifiGuardVpnService.blockedAdsCount.collectAsState()
     val adminActive = WifiGuardDeviceAdminReceiver.isActive(context)
 
     val allowedAppNames = remember(whitelist) {
@@ -113,14 +115,30 @@ fun ClientScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             UsageRingCard(
-                title = "استهلاك الواي فاي اليوم",
+                title = "استهلاك الواي فاي (${limitPeriod.arabicLabel})",
                 usedMb = usedMb,
                 dailyLimitMb = dailyLimitMb,
                 connectionState = connState,
-                protectionActive = vpnRunning
+                protectionActive = vpnRunning,
+                statusLabelOverride = statusLabel
             )
 
-            // Protection status & easy setup cards
+            if (blockedAds > 0L) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = SoftMint)
+                ) {
+                    Text(
+                        text = "تم حجب $blockedAds طلب إعلاني وتتبّع اليوم لتوفير الباقة",
+                        modifier = Modifier.padding(14.dp),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = PrimaryTeal
+                    )
+                }
+            }
+
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp),
@@ -135,7 +153,7 @@ fun ClientScreen(
 
                     ProtectionStepRow(
                         icon = Icons.Rounded.Shield,
-                        title = "حماية الاتصال اليومية",
+                        title = "حماية الاتصال",
                         subtitle = if (vpnRunning) "مفعّلة وتعمل في الخلفية" else "غير مفعّلة — اضغط للتفعيل",
                         isActive = vpnRunning,
                         actionLabel = if (vpnRunning) "مفعّل" else "تفعيل",
@@ -163,7 +181,6 @@ fun ClientScreen(
                 }
             }
 
-            // Whitelisted apps card
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp),
@@ -181,7 +198,7 @@ fun ClientScreen(
                     }
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "تستمر هذه التطبيقات في العمل حتى بعد انتهاء رصيد الواي فاي اليومي:",
+                        text = "تستمر هذه التطبيقات في العمل حتى بعد انتهاء الرصيد:",
                         fontSize = 13.sp,
                         color = TextMuted
                     )

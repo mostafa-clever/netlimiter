@@ -3,6 +3,7 @@ package com.wifiguard.limiter.data
 import android.content.Context
 import android.os.Build
 import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.doublePreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
@@ -10,12 +11,15 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.wifiguard.limiter.model.AppRole
+import com.wifiguard.limiter.model.LimitPeriod
 import com.wifiguard.limiter.model.ManagedDevice
+import com.wifiguard.limiter.model.SpeedPolicyConfig
 import com.wifiguard.limiter.model.TamperAlert
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import org.json.JSONArray
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -35,22 +39,34 @@ class PreferencesManager(private val context: Context) {
         val SUPERVISOR_PORT = intPreferencesKey("supervisor_port")
         val SUPERVISOR_PIN = stringPreferencesKey("supervisor_pin")
 
-        // Local device (Client or Supervisor self-limit) daily usage & limits
+        // Limit & period config
+        val LIMIT_PERIOD = stringPreferencesKey("limit_period")
         val DAILY_LIMIT_MB = longPreferencesKey("daily_limit_mb")
-        val USED_BYTES_TODAY = longPreferencesKey("used_bytes_today")
-        val USAGE_DATE = stringPreferencesKey("usage_date")
-        val SLOWDOWN_THRESHOLD = intPreferencesKey("slowdown_threshold")
+        val DAILY_BONUS_MB = longPreferencesKey("daily_bonus_mb")
+        val SPEED_POLICY_JSON = stringPreferencesKey("speed_policy_json")
         val WHITELIST_PACKAGES = stringSetPreferencesKey("whitelist_packages")
         val SELF_LIMIT_ENABLED = booleanPreferencesKey("self_limit_enabled")
+
+        // Global supervisor settings for all devices
+        val GLOBAL_SPEED_CAP_MBPS = doublePreferencesKey("global_speed_cap_mbps")
+        val FORCE_QUOTA_SAVER_ALL = booleanPreferencesKey("force_quota_saver_all")
+
+        // Period usage tracking
+        val USED_BYTES_DAY = longPreferencesKey("used_bytes_today")
+        val DATE_DAY = stringPreferencesKey("usage_date")
+        val USED_BYTES_WEEK = longPreferencesKey("used_bytes_week")
+        val DATE_WEEK = stringPreferencesKey("usage_week")
+        val USED_BYTES_MONTH = longPreferencesKey("used_bytes_month")
+        val DATE_MONTH = stringPreferencesKey("usage_month")
 
         // Supervisor stored devices & alerts
         val MANAGED_DEVICES_JSON = stringPreferencesKey("managed_devices_json")
         val TAMPER_ALERTS_JSON = stringPreferencesKey("tamper_alerts_json")
     }
 
-    private fun todayDateStr(): String {
-        return SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-    }
+    private fun dayStr(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+    private fun weekStr(): String = SimpleDateFormat("yyyy-'W'ww", Locale.US).format(Date())
+    private fun monthStr(): String = SimpleDateFormat("yyyy-MM", Locale.US).format(Date())
 
     val roleFlow: Flow<AppRole> = context.dataStore.data.map { prefs ->
         val raw = prefs[Keys.ROLE] ?: AppRole.UNSET.name
@@ -65,26 +81,37 @@ class PreferencesManager(private val context: Context) {
         prefs[Keys.DEVICE_NAME] ?: Build.MODEL
     }
 
-    val supervisorHostFlow: Flow<String> = context.dataStore.data.map { prefs ->
-        prefs[Keys.SUPERVISOR_HOST] ?: ""
-    }
-
     val supervisorPinFlow: Flow<String> = context.dataStore.data.map { prefs ->
         prefs[Keys.SUPERVISOR_PIN] ?: ""
     }
 
+    val limitPeriodFlow: Flow<LimitPeriod> = context.dataStore.data.map { prefs ->
+        val raw = prefs[Keys.LIMIT_PERIOD] ?: LimitPeriod.DAILY.name
+        runCatching { LimitPeriod.valueOf(raw) }.getOrDefault(LimitPeriod.DAILY)
+    }
+
     val dailyLimitMbFlow: Flow<Long> = context.dataStore.data.map { prefs ->
-        prefs[Keys.DAILY_LIMIT_MB] ?: 1024L
+        val base = prefs[Keys.DAILY_LIMIT_MB] ?: 1024L
+        val bonus = if (prefs[Keys.DATE_DAY] == dayStr()) prefs[Keys.DAILY_BONUS_MB] ?: 0L else 0L
+        base + bonus
     }
 
-    val usedMbTodayFlow: Flow<Long> = context.dataStore.data.map { prefs ->
-        val savedDate = prefs[Keys.USAGE_DATE] ?: ""
-        if (savedDate != todayDateStr()) 0L
-        else (prefs[Keys.USED_BYTES_TODAY] ?: 0L) / (1024L * 1024L)
+    val usedMbActivePeriodFlow: Flow<Long> = context.dataStore.data.map { prefs ->
+        val period = runCatching {
+            LimitPeriod.valueOf(prefs[Keys.LIMIT_PERIOD] ?: LimitPeriod.DAILY.name)
+        }.getOrDefault(LimitPeriod.DAILY)
+        val bytes = when (period) {
+            LimitPeriod.DAILY -> if (prefs[Keys.DATE_DAY] == dayStr()) prefs[Keys.USED_BYTES_DAY] ?: 0L else 0L
+            LimitPeriod.WEEKLY -> if (prefs[Keys.DATE_WEEK] == weekStr()) prefs[Keys.USED_BYTES_WEEK] ?: 0L else 0L
+            LimitPeriod.MONTHLY -> if (prefs[Keys.DATE_MONTH] == monthStr()) prefs[Keys.USED_BYTES_MONTH] ?: 0L else 0L
+        }
+        bytes / (1024L * 1024L)
     }
 
-    val slowdownThresholdFlow: Flow<Int> = context.dataStore.data.map { prefs ->
-        prefs[Keys.SLOWDOWN_THRESHOLD] ?: 80
+    val speedPolicyFlow: Flow<SpeedPolicyConfig> = context.dataStore.data.map { prefs ->
+        val raw = prefs[Keys.SPEED_POLICY_JSON]
+        if (raw.isNullOrBlank()) SpeedPolicyConfig()
+        else runCatching { SpeedPolicyConfig.fromJson(JSONObject(raw)) }.getOrDefault(SpeedPolicyConfig())
     }
 
     val whitelistFlow: Flow<Set<String>> = context.dataStore.data.map { prefs ->
@@ -93,6 +120,14 @@ class PreferencesManager(private val context: Context) {
 
     val selfLimitEnabledFlow: Flow<Boolean> = context.dataStore.data.map { prefs ->
         prefs[Keys.SELF_LIMIT_ENABLED] ?: false
+    }
+
+    val globalSpeedCapMbpsFlow: Flow<Double> = context.dataStore.data.map { prefs ->
+        prefs[Keys.GLOBAL_SPEED_CAP_MBPS] ?: 0.0
+    }
+
+    val forceQuotaSaverAllFlow: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[Keys.FORCE_QUOTA_SAVER_ALL] ?: false
     }
 
     val managedDevicesFlow: Flow<List<ManagedDevice>> = context.dataStore.data.map { prefs ->
@@ -156,62 +191,142 @@ class PreferencesManager(private val context: Context) {
         context.dataStore.edit { it[Keys.SELF_LIMIT_ENABLED] = enabled }
     }
 
+    suspend fun setGlobalSpeedCapMbps(mbps: Double) {
+        context.dataStore.edit { it[Keys.GLOBAL_SPEED_CAP_MBPS] = mbps.coerceAtLeast(0.0) }
+    }
+
+    suspend fun setForceQuotaSaverAll(forced: Boolean) {
+        context.dataStore.edit { it[Keys.FORCE_QUOTA_SAVER_ALL] = forced }
+    }
+
     suspend fun updateLocalLimits(
-        dailyLimitMb: Long,
-        slowdownThresholdPercent: Int,
-        whitelist: Set<String>
+        limitMb: Long,
+        limitPeriod: LimitPeriod,
+        speedPolicy: SpeedPolicyConfig,
+        whitelist: Set<String>,
+        globalSpeedCapMbps: Double = 0.0,
+        forceQuotaSaver: Boolean? = null
     ) {
         context.dataStore.edit { prefs ->
-            prefs[Keys.DAILY_LIMIT_MB] = dailyLimitMb.coerceAtLeast(10L)
-            prefs[Keys.SLOWDOWN_THRESHOLD] = slowdownThresholdPercent.coerceIn(50, 99)
+            prefs[Keys.DAILY_LIMIT_MB] = limitMb.coerceAtLeast(10L)
+            prefs[Keys.LIMIT_PERIOD] = limitPeriod.name
+            prefs[Keys.SPEED_POLICY_JSON] = speedPolicy.toJson().toString()
             prefs[Keys.WHITELIST_PACKAGES] = whitelist
+            prefs[Keys.GLOBAL_SPEED_CAP_MBPS] = globalSpeedCapMbps.coerceAtLeast(0.0)
+            if (forceQuotaSaver != null) prefs[Keys.FORCE_QUOTA_SAVER_ALL] = forceQuotaSaver
         }
     }
 
-    suspend fun addUsedBytesToday(deltaBytes: Long) {
+    suspend fun applyPolicyToAllDevices(policy: SpeedPolicyConfig) {
+        updateAllManagedDevices { list ->
+            list.map { it.copy(speedPolicy = policy) }
+        }
+    }
+
+    suspend fun addUsedBytes(deltaBytes: Long) {
         if (deltaBytes <= 0L) return
-        val today = todayDateStr()
+        val d = dayStr()
+        val w = weekStr()
+        val m = monthStr()
         context.dataStore.edit { prefs ->
-            val savedDate = prefs[Keys.USAGE_DATE] ?: ""
-            val current = if (savedDate == today) prefs[Keys.USED_BYTES_TODAY] ?: 0L else 0L
-            prefs[Keys.USAGE_DATE] = today
-            prefs[Keys.USED_BYTES_TODAY] = current + deltaBytes
+            val savedDay = prefs[Keys.DATE_DAY] ?: ""
+            if (savedDay != d) {
+                // New day started: compute unused daily rollover bonus if configured
+                val prevUsedMb = (prefs[Keys.USED_BYTES_DAY] ?: 0L) / (1024L * 1024L)
+                val baseLimitMb = prefs[Keys.DAILY_LIMIT_MB] ?: 1024L
+                val rawPolicy = prefs[Keys.SPEED_POLICY_JSON]
+                val rolloverPct = if (!rawPolicy.isNullOrBlank()) {
+                    runCatching { SpeedPolicyConfig.fromJson(JSONObject(rawPolicy)).rolloverPercent }.getOrDefault(0)
+                } else 0
+                val unusedMb = (baseLimitMb - prevUsedMb).coerceAtLeast(0L)
+                val bonusMb = if (savedDay.isNotBlank() && rolloverPct > 0) (unusedMb * rolloverPct) / 100L else 0L
+                prefs[Keys.DAILY_BONUS_MB] = bonusMb
+                prefs[Keys.DATE_DAY] = d
+                prefs[Keys.USED_BYTES_DAY] = deltaBytes
+            } else {
+                val curDay = prefs[Keys.USED_BYTES_DAY] ?: 0L
+                prefs[Keys.USED_BYTES_DAY] = curDay + deltaBytes
+            }
+
+            val curWeek = if (prefs[Keys.DATE_WEEK] == w) prefs[Keys.USED_BYTES_WEEK] ?: 0L else 0L
+            prefs[Keys.DATE_WEEK] = w
+            prefs[Keys.USED_BYTES_WEEK] = curWeek + deltaBytes
+
+            val curMonth = if (prefs[Keys.DATE_MONTH] == m) prefs[Keys.USED_BYTES_MONTH] ?: 0L else 0L
+            prefs[Keys.DATE_MONTH] = m
+            prefs[Keys.USED_BYTES_MONTH] = curMonth + deltaBytes
         }
     }
 
-    suspend fun resetTodayUsage() {
-        val today = todayDateStr()
+    suspend fun addBonusQuotaMb(extraMb: Long) {
+        if (extraMb <= 0L) return
+        val d = dayStr()
         context.dataStore.edit { prefs ->
-            prefs[Keys.USAGE_DATE] = today
-            prefs[Keys.USED_BYTES_TODAY] = 0L
+            val currentBonus = if (prefs[Keys.DATE_DAY] == d) prefs[Keys.DAILY_BONUS_MB] ?: 0L else 0L
+            prefs[Keys.DATE_DAY] = d
+            prefs[Keys.DAILY_BONUS_MB] = currentBonus + extraMb
         }
     }
 
-    suspend fun getLocalLimitConfig(): Triple<Long, Int, Set<String>> {
+    suspend fun resetUsageCounters() {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.DATE_DAY] = dayStr()
+            prefs[Keys.USED_BYTES_DAY] = 0L
+            prefs[Keys.DAILY_BONUS_MB] = 0L
+            prefs[Keys.DATE_WEEK] = weekStr()
+            prefs[Keys.USED_BYTES_WEEK] = 0L
+            prefs[Keys.DATE_MONTH] = monthStr()
+            prefs[Keys.USED_BYTES_MONTH] = 0L
+        }
+    }
+
+    data class LocalConfigSnapshot(
+        val limitMb: Long,
+        val limitPeriod: LimitPeriod,
+        val speedPolicy: SpeedPolicyConfig,
+        val whitelist: Set<String>,
+        val globalSpeedCapMbps: Double,
+        val forceQuotaSaver: Boolean
+    )
+
+    suspend fun getLocalLimitConfig(): LocalConfigSnapshot {
         val prefs = context.dataStore.data.first()
-        return Triple(
-            prefs[Keys.DAILY_LIMIT_MB] ?: 1024L,
-            prefs[Keys.SLOWDOWN_THRESHOLD] ?: 80,
-            prefs[Keys.WHITELIST_PACKAGES] ?: emptySet()
+        val rawPolicy = prefs[Keys.SPEED_POLICY_JSON]
+        val policy = if (rawPolicy.isNullOrBlank()) SpeedPolicyConfig()
+        else runCatching { SpeedPolicyConfig.fromJson(JSONObject(rawPolicy)) }.getOrDefault(SpeedPolicyConfig())
+        val period = runCatching {
+            LimitPeriod.valueOf(prefs[Keys.LIMIT_PERIOD] ?: LimitPeriod.DAILY.name)
+        }.getOrDefault(LimitPeriod.DAILY)
+        val base = prefs[Keys.DAILY_LIMIT_MB] ?: 1024L
+        val bonus = if (prefs[Keys.DATE_DAY] == dayStr()) prefs[Keys.DAILY_BONUS_MB] ?: 0L else 0L
+        return LocalConfigSnapshot(
+            limitMb = base + bonus,
+            limitPeriod = period,
+            speedPolicy = policy,
+            whitelist = prefs[Keys.WHITELIST_PACKAGES] ?: emptySet(),
+            globalSpeedCapMbps = prefs[Keys.GLOBAL_SPEED_CAP_MBPS] ?: 0.0,
+            forceQuotaSaver = prefs[Keys.FORCE_QUOTA_SAVER_ALL] ?: false
         )
     }
 
-    suspend fun getUsedMbToday(): Long {
+    suspend fun getUsedMbActivePeriod(): Long {
         val prefs = context.dataStore.data.first()
-        val savedDate = prefs[Keys.USAGE_DATE] ?: ""
-        if (savedDate != todayDateStr()) return 0L
-        return (prefs[Keys.USED_BYTES_TODAY] ?: 0L) / (1024L * 1024L)
+        val period = runCatching {
+            LimitPeriod.valueOf(prefs[Keys.LIMIT_PERIOD] ?: LimitPeriod.DAILY.name)
+        }.getOrDefault(LimitPeriod.DAILY)
+        val bytes = when (period) {
+            LimitPeriod.DAILY -> if (prefs[Keys.DATE_DAY] == dayStr()) prefs[Keys.USED_BYTES_DAY] ?: 0L else 0L
+            LimitPeriod.WEEKLY -> if (prefs[Keys.DATE_WEEK] == weekStr()) prefs[Keys.USED_BYTES_WEEK] ?: 0L else 0L
+            LimitPeriod.MONTHLY -> if (prefs[Keys.DATE_MONTH] == monthStr()) prefs[Keys.USED_BYTES_MONTH] ?: 0L else 0L
+        }
+        return bytes / (1024L * 1024L)
     }
 
     suspend fun upsertManagedDevice(device: ManagedDevice) {
         context.dataStore.edit { prefs ->
             val list = parseDevicesList(prefs[Keys.MANAGED_DEVICES_JSON] ?: "[]").toMutableList()
             val idx = list.indexOfFirst { it.deviceId == device.deviceId }
-            if (idx >= 0) {
-                list[idx] = device
-            } else {
-                list.add(device)
-            }
+            if (idx >= 0) list[idx] = device else list.add(device)
             prefs[Keys.MANAGED_DEVICES_JSON] = serializeDevicesList(list)
         }
     }
@@ -235,17 +350,13 @@ class PreferencesManager(private val context: Context) {
         context.dataStore.edit { prefs ->
             val list = parseAlertsList(prefs[Keys.TAMPER_ALERTS_JSON] ?: "[]").toMutableList()
             list.add(0, alert)
-            if (list.size > 30) {
-                list.subList(30, list.size).clear()
-            }
+            if (list.size > 30) list.subList(30, list.size).clear()
             prefs[Keys.TAMPER_ALERTS_JSON] = serializeAlertsList(list)
         }
     }
 
     suspend fun clearTamperAlerts() {
-        context.dataStore.edit { prefs ->
-            prefs[Keys.TAMPER_ALERTS_JSON] = "[]"
-        }
+        context.dataStore.edit { prefs -> prefs[Keys.TAMPER_ALERTS_JSON] = "[]" }
     }
 
     private fun parseDevicesList(jsonStr: String): List<ManagedDevice> {
