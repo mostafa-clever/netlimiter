@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import com.wifiguard.limiter.model.ConnectionState
+import com.wifiguard.limiter.model.InstalledAppItem
 import com.wifiguard.limiter.model.LimitPeriod
 import com.wifiguard.limiter.model.SpeedPolicyConfig
 import kotlinx.coroutines.Dispatchers
@@ -90,13 +91,21 @@ object LocalLanClient {
         port: Int,
         pairingCode: String,
         deviceId: String,
-        deviceName: String
+        deviceName: String,
+        installedApps: List<InstalledAppItem> = emptyList()
     ): Result<SyncedLimitConfig> = withContext(Dispatchers.IO) {
         runCatching {
             val payload = JSONObject().apply {
                 put("pairingCode", pairingCode)
                 put("deviceId", deviceId)
                 put("deviceName", deviceName)
+                if (installedApps.isNotEmpty()) {
+                    val arr = JSONArray()
+                    installedApps.forEach { a ->
+                        arr.put(JSONObject().put("packageName", a.packageName).put("appName", a.appName))
+                    }
+                    put("installedApps", arr)
+                }
             }
             val resp = postJson("http://$host:$port/pair", payload)
             if (!resp.optBoolean("ok", false)) {
@@ -112,9 +121,11 @@ object LocalLanClient {
         deviceId: String,
         deviceName: String,
         usedMb: Long,
+        savedMbToday: Long = 0L,
         protectionActive: Boolean,
         uninstallProtectionActive: Boolean,
-        connectionState: ConnectionState
+        connectionState: ConnectionState,
+        installedApps: List<InstalledAppItem> = emptyList()
     ): SyncedLimitConfig? = withContext(Dispatchers.IO) {
         if (host.isBlank()) return@withContext null
         runCatching {
@@ -122,9 +133,17 @@ object LocalLanClient {
                 put("deviceId", deviceId)
                 put("deviceName", deviceName)
                 put("usedMb", usedMb)
+                put("savedMbToday", savedMbToday)
                 put("protectionActive", protectionActive)
                 put("uninstallProtectionActive", uninstallProtectionActive)
                 put("connectionState", connectionState.name)
+                if (installedApps.isNotEmpty()) {
+                    val arr = JSONArray()
+                    installedApps.forEach { a ->
+                        arr.put(JSONObject().put("packageName", a.packageName).put("appName", a.appName))
+                    }
+                    put("installedApps", arr)
+                }
             }
             val resp = postJson("http://$host:$port/heartbeat", payload)
             if (resp.optBoolean("ok", false)) parseConfig(resp) else null
@@ -172,17 +191,19 @@ object LocalLanClient {
     }
 
     private fun postJson(urlStr: String, body: JSONObject): JSONObject {
+        val bodyBytes = body.toString().toByteArray(Charsets.UTF_8)
         val url = URL(urlStr)
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
-            connectTimeout = 4000
-            readTimeout = 4000
+            connectTimeout = 8000
+            readTimeout = 8000
             doOutput = true
+            setFixedLengthStreamingMode(bodyBytes.size)
             setRequestProperty("Content-Type", "application/json; charset=UTF-8")
         }
-        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
-            writer.write(body.toString())
-            writer.flush()
+        conn.outputStream.use { os ->
+            os.write(bodyBytes)
+            os.flush()
         }
         val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
         val text = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }

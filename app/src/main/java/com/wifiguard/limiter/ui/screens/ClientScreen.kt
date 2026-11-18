@@ -35,7 +35,13 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -78,7 +84,18 @@ fun ClientScreen(
     val connState by WifiGuardVpnService.connectionState.collectAsState()
     val statusLabel by WifiGuardVpnService.statusLabel.collectAsState()
     val blockedAds by WifiGuardVpnService.blockedAdsCount.collectAsState()
-    val adminActive = WifiGuardDeviceAdminReceiver.isActive(context)
+    val alwaysOnActive by WifiGuardVpnService.isAlwaysOnActive.collectAsState()
+    var adminActive by remember { mutableStateOf(WifiGuardDeviceAdminReceiver.isActive(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                adminActive = WifiGuardDeviceAdminReceiver.isActive(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     val allowedAppNames = remember(whitelist) {
         val pm = context.packageManager
@@ -139,45 +156,53 @@ fun ClientScreen(
                 }
             }
 
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-            ) {
-                Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text(
-                        text = "حالة الحماية والأمان",
-                        fontSize = 17.sp,
-                        fontWeight = FontWeight.Bold
-                    )
+            if (!vpnRunning || !alwaysOnActive || !adminActive) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                ) {
+                    Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(
+                            text = "إكمال تفعيل الحماية",
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold
+                        )
 
-                    ProtectionStepRow(
-                        icon = Icons.Rounded.Shield,
-                        title = "حماية الاتصال",
-                        subtitle = if (vpnRunning) "مفعّلة وتعمل في الخلفية" else "غير مفعّلة — اضغط للتفعيل",
-                        isActive = vpnRunning,
-                        actionLabel = if (vpnRunning) "مفعّل" else "تفعيل",
-                        onAction = onRequestStartVpn
-                    )
+                        if (!vpnRunning) {
+                            ProtectionStepRow(
+                                icon = Icons.Rounded.Shield,
+                                title = "حماية الاتصال",
+                                subtitle = "غير مفعّلة — اضغط للتفعيل",
+                                isActive = false,
+                                actionLabel = "تفعيل",
+                                onAction = onRequestStartVpn
+                            )
+                        }
 
-                    ProtectionStepRow(
-                        icon = Icons.Rounded.Lock,
-                        title = "تثبيت الحماية الدائمة",
-                        subtitle = "اختر (حارس الواي فاي) من الإعدادات وفعّل التشغيل الدائم ومنع الاتصال بدونه",
-                        isActive = false,
-                        actionLabel = "فتح الإعدادات",
-                        showCheck = false,
-                        onAction = onOpenAlwaysOnSettings
-                    )
+                        if (!alwaysOnActive) {
+                            ProtectionStepRow(
+                                icon = Icons.Rounded.Lock,
+                                title = "تثبيت الحماية الدائمة",
+                                subtitle = "اختر (حارس الواي فاي) من الإعدادات وفعّل التشغيل الدائم",
+                                isActive = false,
+                                actionLabel = "فتح الإعدادات",
+                                showCheck = false,
+                                onAction = onOpenAlwaysOnSettings
+                            )
+                        }
 
-                    ProtectionStepRow(
-                        icon = Icons.Rounded.Security,
-                        title = "حماية ضد الحذف",
-                        subtitle = if (adminActive) "مفعّلة — لا يمكن حذف التطبيق بسهولة" else "غير مفعّلة — يُنصح بتفعيلها",
-                        isActive = adminActive,
-                        actionLabel = if (adminActive) "مفعّل" else "تفعيل",
-                        onAction = onRequestDeviceAdmin
-                    )
+                        if (!adminActive) {
+                            ProtectionStepRow(
+                                icon = Icons.Rounded.Security,
+                                title = "حماية ضد الحذف",
+                                subtitle = "غير مفعّلة — يُنصح بتفعيلها",
+                                isActive = false,
+                                actionLabel = "تفعيل",
+                                onAction = onRequestDeviceAdmin
+                            )
+                        }
+                    }
                 }
             }
 

@@ -55,6 +55,9 @@ class PreferencesManager(private val context: Context) {
 
         // Period usage tracking
         val USED_BYTES_DAY = longPreferencesKey("used_bytes_today")
+        val SAVED_BYTES_DAY = longPreferencesKey("saved_bytes_today")
+        val DAILY_USAGE_HISTORY_JSON = stringPreferencesKey("daily_usage_history_json")
+        val DAILY_SAVED_HISTORY_JSON = stringPreferencesKey("daily_saved_history_json")
         val DATE_DAY = stringPreferencesKey("usage_date")
         val USED_BYTES_WEEK = longPreferencesKey("used_bytes_week")
         val DATE_WEEK = stringPreferencesKey("usage_week")
@@ -143,6 +146,14 @@ class PreferencesManager(private val context: Context) {
     val managedDevicesFlow: Flow<List<ManagedDevice>> = context.dataStore.data.map { prefs ->
         val raw = prefs[Keys.MANAGED_DEVICES_JSON] ?: "[]"
         parseDevicesList(raw)
+    }
+
+    val localUsageHistoryFlow: Flow<Map<String, Long>> = context.dataStore.data.map { prefs ->
+        parseLongMap(prefs[Keys.DAILY_USAGE_HISTORY_JSON] ?: "{}")
+    }
+
+    val localSavedHistoryFlow: Flow<Map<String, Long>> = context.dataStore.data.map { prefs ->
+        parseLongMap(prefs[Keys.DAILY_SAVED_HISTORY_JSON] ?: "{}")
     }
 
     val tamperAlertsFlow: Flow<List<TamperAlert>> = context.dataStore.data.map { prefs ->
@@ -276,7 +287,31 @@ class PreferencesManager(private val context: Context) {
             val curMonth = if (prefs[Keys.DATE_MONTH] == m) prefs[Keys.USED_BYTES_MONTH] ?: 0L else 0L
             prefs[Keys.DATE_MONTH] = m
             prefs[Keys.USED_BYTES_MONTH] = curMonth + deltaBytes
+
+            val newDayBytes = prefs[Keys.USED_BYTES_DAY] ?: 0L
+            val hist = parseLongMap(prefs[Keys.DAILY_USAGE_HISTORY_JSON] ?: "{}").toMutableMap()
+            hist[d] = newDayBytes / (1024L * 1024L)
+            prefs[Keys.DAILY_USAGE_HISTORY_JSON] = JSONObject(hist as Map<*, *>).toString()
         }
+    }
+
+    suspend fun addSavedBytes(deltaBytes: Long) {
+        if (deltaBytes <= 0L) return
+        val d = dayStr()
+        context.dataStore.edit { prefs ->
+            val curSaved = if (prefs[Keys.DATE_DAY] == d) prefs[Keys.SAVED_BYTES_DAY] ?: 0L else 0L
+            val newSaved = curSaved + deltaBytes
+            prefs[Keys.SAVED_BYTES_DAY] = newSaved
+            val hist = parseLongMap(prefs[Keys.DAILY_SAVED_HISTORY_JSON] ?: "{}").toMutableMap()
+            hist[d] = newSaved / (1024L * 1024L)
+            prefs[Keys.DAILY_SAVED_HISTORY_JSON] = JSONObject(hist as Map<*, *>).toString()
+        }
+    }
+
+    suspend fun getSavedMbToday(): Long {
+        val prefs = context.dataStore.data.first()
+        if (prefs[Keys.DATE_DAY] != dayStr()) return 0L
+        return (prefs[Keys.SAVED_BYTES_DAY] ?: 0L) / (1024L * 1024L)
     }
 
     suspend fun addBonusQuotaMb(extraMb: Long) {
@@ -382,6 +417,15 @@ class PreferencesManager(private val context: Context) {
 
     suspend fun clearTamperAlerts() {
         context.dataStore.edit { prefs -> prefs[Keys.TAMPER_ALERTS_JSON] = "[]" }
+    }
+
+    private fun parseLongMap(jsonStr: String): Map<String, Long> {
+        return runCatching {
+            val obj = JSONObject(jsonStr)
+            val map = mutableMapOf<String, Long>()
+            obj.keys().forEach { k -> map[k] = obj.optLong(k, 0L) }
+            map
+        }.getOrDefault(emptyMap())
     }
 
     private fun parseDevicesList(jsonStr: String): List<ManagedDevice> {

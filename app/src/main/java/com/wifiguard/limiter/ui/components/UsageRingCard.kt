@@ -248,22 +248,27 @@ private fun StatChip(label: String, value: String) {
 @Composable
 fun WhitelistPickerDialog(
     initialSelected: Set<String>,
+    remoteApps: List<InstalledAppItem>? = null,
     onDismiss: () -> Unit,
     onConfirm: (Set<String>) -> Unit
 ) {
     val context = LocalContext.current
-    val installedApps = remember {
-        val pm = context.packageManager
-        pm.getInstalledApplications(PackageManager.GET_META_DATA)
-            .filter { (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 || pm.getLaunchIntentForPackage(it.packageName) != null }
-            .filter { it.packageName != context.packageName }
-            .map {
-                InstalledAppItem(
-                    packageName = it.packageName,
-                    appName = pm.getApplicationLabel(it).toString()
-                )
-            }
-            .sortedBy { it.appName }
+    val installedApps = remember(remoteApps) {
+        if (remoteApps != null) {
+            remoteApps.sortedBy { it.appName }
+        } else {
+            val pm = context.packageManager
+            pm.getInstalledApplications(PackageManager.GET_META_DATA)
+                .filter { (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 || pm.getLaunchIntentForPackage(it.packageName) != null }
+                .filter { it.packageName != context.packageName }
+                .map {
+                    InstalledAppItem(
+                        packageName = it.packageName,
+                        appName = pm.getApplicationLabel(it).toString()
+                    )
+                }
+                .sortedBy { it.appName }
+        }
     }
 
     var searchQuery by remember { mutableStateOf("") }

@@ -50,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.AppRole
+import com.wifiguard.limiter.model.getInstalledLaunchableApps
 import com.wifiguard.limiter.network.LocalLanClient
 import com.wifiguard.limiter.ui.theme.AlertRed
 import com.wifiguard.limiter.ui.theme.PrimaryTeal
@@ -237,7 +238,8 @@ fun OnboardingScreen(
                                     port = targetPort,
                                     pairingCode = pairingCode.trim(),
                                     deviceId = devId,
-                                    deviceName = cleanName
+                                    deviceName = cleanName,
+                                    installedApps = getInstalledLaunchableApps(context)
                                 )
                                 result.onSuccess { cfg ->
                                     prefs.setRole(AppRole.CLIENT, cleanName)

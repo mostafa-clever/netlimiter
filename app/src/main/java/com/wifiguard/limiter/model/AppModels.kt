@@ -338,9 +338,13 @@ data class ManagedDevice(
     val limitPeriod: LimitPeriod = LimitPeriod.DAILY,
     val dailyLimitMb: Long = 1024L,
     val usedMb: Long = 0L,
+    val savedMbToday: Long = 0L,
+    val dailyUsageHistory: Map<String, Long> = emptyMap(),
+    val dailySavedHistory: Map<String, Long> = emptyMap(),
     val forceQuotaSaver: Boolean = false,
     val speedPolicy: SpeedPolicyConfig = SpeedPolicyConfig(),
     val whitelistedPackages: List<String> = emptyList(),
+    val installedApps: List<InstalledAppItem> = emptyList(),
     val protectionActive: Boolean = false,
     val uninstallProtectionActive: Boolean = false,
     val connectionState: ConnectionState = ConnectionState.SMART_SAVING,
@@ -359,9 +363,20 @@ data class ManagedDevice(
         put("limitPeriod", limitPeriod.name)
         put("dailyLimitMb", dailyLimitMb)
         put("usedMb", usedMb)
+        put("savedMbToday", savedMbToday)
+        put("dailyUsageHistory", JSONObject(dailyUsageHistory.mapValues { it.value }))
+        put("dailySavedHistory", JSONObject(dailySavedHistory.mapValues { it.value }))
         put("forceQuotaSaver", forceQuotaSaver)
         put("speedPolicy", speedPolicy.toJson())
         put("whitelistedPackages", JSONArray(whitelistedPackages))
+        val appsArr = JSONArray()
+        installedApps.forEach { app ->
+            appsArr.put(JSONObject().apply {
+                put("packageName", app.packageName)
+                put("appName", app.appName)
+            })
+        }
+        put("installedApps", appsArr)
         put("protectionActive", protectionActive)
         put("uninstallProtectionActive", uninstallProtectionActive)
         put("connectionState", connectionState.name)
@@ -373,11 +388,26 @@ data class ManagedDevice(
     }
 
     companion object {
+        private fun parseHistoryMap(json: JSONObject?): Map<String, Long> {
+            if (json == null) return emptyMap()
+            val map = mutableMapOf<String, Long>()
+            json.keys().forEach { k -> map[k] = json.optLong(k, 0L) }
+            return map
+        }
+
         fun fromJson(obj: JSONObject): ManagedDevice {
             val pkgArray = obj.optJSONArray("whitelistedPackages") ?: JSONArray()
             val pkgs = mutableListOf<String>()
             for (i in 0 until pkgArray.length()) {
                 pkgs.add(pkgArray.optString(i))
+            }
+            val appsJson = obj.optJSONArray("installedApps") ?: JSONArray()
+            val appsList = mutableListOf<InstalledAppItem>()
+            for (i in 0 until appsJson.length()) {
+                val item = appsJson.optJSONObject(i) ?: continue
+                val pkg = item.optString("packageName", "")
+                val name = item.optString("appName", pkg)
+                if (pkg.isNotBlank()) appsList.add(InstalledAppItem(pkg, name))
             }
             val periodStr = obj.optString("limitPeriod", LimitPeriod.DAILY.name)
             val period = runCatching { LimitPeriod.valueOf(periodStr) }.getOrDefault(LimitPeriod.DAILY)
@@ -390,9 +420,13 @@ data class ManagedDevice(
                 limitPeriod = period,
                 dailyLimitMb = obj.optLong("dailyLimitMb", 1024L),
                 usedMb = obj.optLong("usedMb", 0L),
+                savedMbToday = obj.optLong("savedMbToday", 0L),
+                dailyUsageHistory = parseHistoryMap(obj.optJSONObject("dailyUsageHistory")),
+                dailySavedHistory = parseHistoryMap(obj.optJSONObject("dailySavedHistory")),
                 forceQuotaSaver = obj.optBoolean("forceQuotaSaver", false),
                 speedPolicy = SpeedPolicyConfig.fromJson(obj.optJSONObject("speedPolicy")),
                 whitelistedPackages = pkgs,
+                installedApps = appsList,
                 protectionActive = obj.optBoolean("protectionActive", false),
                 uninstallProtectionActive = obj.optBoolean("uninstallProtectionActive", false),
                 connectionState = state,
@@ -447,4 +481,24 @@ fun formatDataSizeArabic(mb: Long): String {
     } else {
         "$mb م.ب"
     }
+}
+
+
+fun getInstalledLaunchableApps(context: android.content.Context): List<InstalledAppItem> {
+    val pm = context.packageManager
+    return runCatching {
+        pm.getInstalledApplications(android.content.pm.PackageManager.GET_META_DATA)
+            .filter {
+                (it.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) == 0 ||
+                    pm.getLaunchIntentForPackage(it.packageName) != null
+            }
+            .filter { it.packageName != context.packageName }
+            .map {
+                InstalledAppItem(
+                    packageName = it.packageName,
+                    appName = pm.getApplicationLabel(it).toString()
+                )
+            }
+            .sortedBy { it.appName }
+    }.getOrDefault(emptyList())
 }

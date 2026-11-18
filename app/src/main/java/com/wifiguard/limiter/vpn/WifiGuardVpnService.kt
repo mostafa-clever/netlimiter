@@ -22,6 +22,7 @@ import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.AppRole
 import com.wifiguard.limiter.model.ConnectionState
 import com.wifiguard.limiter.model.computeEffectiveSpeed
+import com.wifiguard.limiter.model.getInstalledLaunchableApps
 import com.wifiguard.limiter.model.formatDataSizeArabic
 import com.wifiguard.limiter.network.LocalLanClient
 import com.wifiguard.limiter.network.NetworkScanner
@@ -69,6 +70,9 @@ class WifiGuardVpnService : VpnService() {
 
         private val _blockedAdsCount = MutableStateFlow(0L)
         val blockedAdsCount: StateFlow<Long> = _blockedAdsCount
+
+        private val _isAlwaysOnActive = MutableStateFlow(false)
+        val isAlwaysOnActive: StateFlow<Boolean> = _isAlwaysOnActive
 
         fun start(context: Context) {
             runCatching {
@@ -165,11 +169,15 @@ class WifiGuardVpnService : VpnService() {
             val recent60sBytes = ArrayDeque<Long>()
             var burstCooldownTicks = 0
             var screenOffSeconds = 0
+            var lastAdsCount = 0L
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
 
             while (isActive) {
                 runCatching {
-                    val cfg = prefs.getLocalLimitConfig()
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    _isAlwaysOnActive.value = runCatching { isAlwaysOn }.getOrDefault(false)
+                }
+                val cfg = prefs.getLocalLimitConfig()
                     val onWifi = isOnWifi()
 
                     val currentWifiSig = if (onWifi) NetworkScanner.getCurrentWifiSignature(applicationContext) else ""
@@ -212,6 +220,7 @@ class WifiGuardVpnService : VpnService() {
                         val isScreenOffIdle = screenOffSeconds >= 60
 
                         val usedMb = prefs.getUsedMbActivePeriod()
+                            val savedMb = prefs.getSavedMbToday()
                         dnsHandler.upstreamDnsIp = cfg.speedPolicy.upstreamDnsIp
 
                         recent60sBytes.addLast(intervalBytes)
@@ -225,6 +234,7 @@ class WifiGuardVpnService : VpnService() {
 
                         val effective = computeEffectiveSpeed(
                             usedMb = usedMb,
+                                savedMbToday = savedMb,
                             limitMb = cfg.limitMb,
                             policy = cfg.speedPolicy,
                             forcedBySupervisor = cfg.forceQuotaSaver,
@@ -235,7 +245,19 @@ class WifiGuardVpnService : VpnService() {
 
                         _connectionState.value = effective.state
                         _statusLabel.value = effective.statusLabelArabic
-                        _blockedAdsCount.value = dnsHandler.blockedRequestsCount.get()
+                        val curAds = dnsHandler.blockedRequestsCount.get()
+                        val deltaAds = (curAds - lastAdsCount).coerceAtLeast(0L)
+                        lastAdsCount = curAds
+                        _blockedAdsCount.value = curAds
+
+                        // Real-signal savings estimator (ads blocked + idle-screen freeze + ABR shaping)
+                        var savedDelta = deltaAds * 120L * 1024L
+                        if (effective.state == ConnectionState.IDLE_FROZEN) {
+                            savedDelta += 15L * 1024L
+                        } else if (effective.saverActive && effective.targetBytesPerSec < Long.MAX_VALUE && intervalBytes >= (effective.targetBytesPerSec * 5L) / 10L) {
+                            savedDelta += (intervalBytes * 35L) / 100L
+                        }
+                        if (savedDelta > 0L) prefs.addSavedBytes(savedDelta)
 
                         tokenBucket.setRateBytesPerSec(effective.targetBytesPerSec)
                         val blockAllNow = effective.state == ConnectionState.BLOCKED || effective.state == ConnectionState.IDLE_FROZEN
@@ -276,6 +298,7 @@ class WifiGuardVpnService : VpnService() {
 
     private fun startHeartbeatLoop() {
         serviceScope.launch {
+            var sentAppsOnce = false
             while (isActive) {
                 runCatching {
                     val role = prefs.roleFlow.first()
@@ -286,6 +309,7 @@ class WifiGuardVpnService : VpnService() {
                             val id = prefs.getOrCreateDeviceId()
                             val name = prefs.getDeviceName()
                             val usedMb = prefs.getUsedMbActivePeriod()
+                            val savedMb = prefs.getSavedMbToday()
                         dnsHandler.upstreamDnsIp = cfg.speedPolicy.upstreamDnsIp
                             val adminActive = WifiGuardDeviceAdminReceiver.isActive(applicationContext)
                             val updated = LocalLanClient.sendHeartbeat(
@@ -294,10 +318,13 @@ class WifiGuardVpnService : VpnService() {
                                 deviceId = id,
                                 deviceName = name,
                                 usedMb = usedMb,
+                                savedMbToday = savedMb,
                                 protectionActive = _isRunning.value,
                                 uninstallProtectionActive = adminActive,
-                                connectionState = _connectionState.value
+                                connectionState = _connectionState.value,
+                                installedApps = if (!sentAppsOnce) getInstalledLaunchableApps(applicationContext) else emptyList()
                             )
+                            if (updated != null) sentAppsOnce = true
                             if (updated != null) {
                                 prefs.updateLocalLimits(
                                     limitMb = updated.dailyLimitMb,

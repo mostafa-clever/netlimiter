@@ -45,6 +45,19 @@ object NetworkScanner {
         return if (gwMac.isNotBlank()) "$gwIp|$gwMac" else gwIp
     }
 
+    suspend fun probeIpForArp(ip: String) = withContext(Dispatchers.IO) {
+        if (ip.isBlank()) return@withContext
+        runCatching {
+            val addr = InetAddress.getByName(ip)
+            addr.isReachable(350)
+            // Also send a tiny UDP packet to trigger kernel ARP resolution even if ICMP is ignored
+            java.net.DatagramSocket().use { ds ->
+                val pkt = java.net.DatagramPacket(byteArrayOf(0), 1, addr, 5353)
+                ds.send(pkt)
+            }
+        }
+    }
+
     suspend fun scanActiveLanPeers(context: Context): List<LanPeer> = withContext(Dispatchers.IO) {
         val myIp = getLocalWifiIp(context)
         if (myIp.isBlank() || !myIp.contains(".")) return@withContext emptyList()

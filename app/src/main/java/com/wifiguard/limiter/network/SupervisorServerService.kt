@@ -17,6 +17,7 @@ import androidx.core.app.NotificationCompat
 import com.wifiguard.limiter.MainActivity
 import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.ConnectionState
+import com.wifiguard.limiter.model.InstalledAppItem
 import com.wifiguard.limiter.model.ManagedDevice
 import com.wifiguard.limiter.model.TamperAlert
 import kotlinx.coroutines.CoroutineScope
@@ -137,29 +138,40 @@ class SupervisorServerService : Service() {
         socket.use { s ->
             runCatching {
                 s.soTimeout = 5000
-                val reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
-                val requestLine = reader.readLine() ?: return
+                val rawIn = s.getInputStream()
+                fun readHttpLine(): String? {
+                    val lineBytes = java.io.ByteArrayOutputStream()
+                    while (true) {
+                        val b = rawIn.read()
+                        if (b == -1) return if (lineBytes.size() == 0) null else lineBytes.toString("UTF-8")
+                        if (b == '\n'.code) break
+                        if (b != '\r'.code) lineBytes.write(b)
+                    }
+                    return lineBytes.toString("UTF-8")
+                }
+
+                val requestLine = readHttpLine() ?: return
                 val parts = requestLine.split(" ")
                 if (parts.size < 2) return
                 val path = parts[1]
 
                 var contentLength = 0
                 while (true) {
-                    val header = reader.readLine() ?: break
+                    val header = readHttpLine() ?: break
                     if (header.isEmpty()) break
                     if (header.lowercase().startsWith("content-length:")) {
                         contentLength = header.substringAfter(":").trim().toIntOrNull() ?: 0
                     }
                 }
 
-                val bodyChars = CharArray(contentLength)
+                val bodyBytes = ByteArray(contentLength)
                 var totalRead = 0
                 while (totalRead < contentLength) {
-                    val read = reader.read(bodyChars, totalRead, contentLength - totalRead)
+                    val read = rawIn.read(bodyBytes, totalRead, contentLength - totalRead)
                     if (read == -1) break
                     totalRead += read
                 }
-                val bodyJson = if (totalRead > 0) JSONObject(String(bodyChars, 0, totalRead)) else JSONObject()
+                val bodyJson = if (totalRead > 0) JSONObject(String(bodyBytes, 0, totalRead, Charsets.UTF_8)) else JSONObject()
 
                 val responseJson = when (path) {
                     "/pair" -> handlePair(bodyJson, remoteIp)
@@ -170,15 +182,30 @@ class SupervisorServerService : Service() {
 
                 val respStr = responseJson.toString()
                 val respBytes = respStr.toByteArray(Charsets.UTF_8)
-                val out = OutputStreamWriter(s.getOutputStream(), Charsets.UTF_8)
-                out.write("HTTP/1.1 200 OK\r\n")
-                out.write("Content-Type: application/json; charset=UTF-8\r\n")
-                out.write("Content-Length: ${respBytes.size}\r\n")
-                out.write("Connection: close\r\n\r\n")
-                out.write(respStr)
-                out.flush()
+                val headerBytes = (
+                    "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: application/json; charset=UTF-8\r\n" +
+                    "Content-Length: ${respBytes.size}\r\n" +
+                    "Connection: close\r\n\r\n"
+                ).toByteArray(Charsets.US_ASCII)
+                val rawOut = s.getOutputStream()
+                rawOut.write(headerBytes)
+                rawOut.write(respBytes)
+                rawOut.flush()
             }
         }
+    }
+
+    private fun parseInstalledApps(body: JSONObject): List<InstalledAppItem> {
+        val arr = body.optJSONArray("installedApps") ?: return emptyList()
+        val list = mutableListOf<InstalledAppItem>()
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val pkg = obj.optString("packageName", "")
+            val name = obj.optString("appName", pkg)
+            if (pkg.isNotBlank()) list.add(InstalledAppItem(pkg, name))
+        }
+        return list
     }
 
     private suspend fun handlePair(body: JSONObject, remoteIp: String): JSONObject {
@@ -189,12 +216,13 @@ class SupervisorServerService : Service() {
         }
         val deviceId = body.optString("deviceId", "")
         val deviceName = body.optString("deviceName", "جهاز جديد")
-        val peers = NetworkScanner.readArpAndNeighTable()
-        val mac = peers.firstOrNull { it.ip == remoteIp }?.mac ?: ""
+        val mac = ""
 
+        val parsedApps = parseInstalledApps(body)
         val existing = prefs.managedDevicesFlow.first().firstOrNull { it.deviceId == deviceId }
         val device = existing?.copy(
             deviceName = deviceName,
+            installedApps = if (parsedApps.isNotEmpty()) parsedApps else existing.installedApps,
             lastKnownIp = remoteIp.ifBlank { existing.lastKnownIp },
             macAddress = mac.ifBlank { existing.macAddress },
             lastSeenMillis = System.currentTimeMillis(),
@@ -203,6 +231,7 @@ class SupervisorServerService : Service() {
             deviceId = deviceId,
             deviceName = deviceName,
             dailyLimitMb = 1024L,
+            installedApps = parsedApps,
             lastKnownIp = remoteIp,
             macAddress = mac,
             lastSeenMillis = System.currentTimeMillis(),
@@ -234,14 +263,15 @@ class SupervisorServerService : Service() {
         val deviceId = body.optString("deviceId", "")
         val deviceName = body.optString("deviceName", "جهاز")
         val usedMb = body.optLong("usedMb", 0L)
+        val savedMbToday = body.optLong("savedMbToday", 0L)
         val protectionActive = body.optBoolean("protectionActive", false)
         val uninstallProtectionActive = body.optBoolean("uninstallProtectionActive", false)
         val stateStr = body.optString("connectionState", ConnectionState.SMART_SAVING.name)
         val connState = runCatching { ConnectionState.valueOf(stateStr) }.getOrDefault(ConnectionState.SMART_SAVING)
 
-        val peers = NetworkScanner.readArpAndNeighTable()
-        val mac = peers.firstOrNull { it.ip == remoteIp }?.mac ?: ""
+        val mac = ""
 
+        val parsedApps = parseInstalledApps(body)
         val existing = prefs.managedDevicesFlow.first().firstOrNull { it.deviceId == deviceId }
         val wasProtected = existing?.protectionActive == true
 
@@ -254,9 +284,16 @@ class SupervisorServerService : Service() {
             recordAndNotifyTamper(deviceId, deviceName, tamperMsg)
         }
 
+        val todayKey = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
+        val usageHist = (existing?.dailyUsageHistory ?: emptyMap()).toMutableMap().apply { put(todayKey, usedMb) }
+        val savedHist = (existing?.dailySavedHistory ?: emptyMap()).toMutableMap().apply { put(todayKey, savedMbToday) }
         val updated = (existing ?: ManagedDevice(deviceId = deviceId, deviceName = deviceName)).copy(
             deviceName = deviceName,
             usedMb = usedMb,
+            savedMbToday = savedMbToday,
+            dailyUsageHistory = usageHist,
+            dailySavedHistory = savedHist,
+            installedApps = if (parsedApps.isNotEmpty()) parsedApps else (existing?.installedApps ?: emptyList()),
             protectionActive = protectionActive,
             uninstallProtectionActive = uninstallProtectionActive,
             connectionState = if (!protectionActive) ConnectionState.PROTECTION_OFF else connState,
@@ -329,22 +366,39 @@ class SupervisorServerService : Service() {
                         changed = true
                     }
 
-                    // Layer 1 Anti-Cheat: Device is physically active on Wi-Fi (by MAC or IP) while offline or VPN off!
-                    val presentOnWifi = (cur.macAddress.isNotBlank() && activeMacs.contains(cur.macAddress.lowercase())) ||
-                        (cur.lastKnownIp.isNotBlank() && activeIps.contains(cur.lastKnownIp))
+                    var refreshedMacs = activeMacs
+                    var refreshedIps = activeIps
+                    if ((heartbeatTimedOut || !cur.protectionActive) && cur.lastKnownIp.isNotBlank()) {
+                        NetworkScanner.probeIpForArp(cur.lastKnownIp)
+                        val freshPeers = NetworkScanner.readArpAndNeighTable()
+                        refreshedMacs = freshPeers.map { it.mac.lowercase() }.toSet()
+                        refreshedIps = freshPeers.map { it.ip }.toSet()
+                        if (cur.macAddress.isBlank()) {
+                            val foundMac = freshPeers.firstOrNull { it.ip == cur.lastKnownIp }?.mac
+                            if (!foundMac.isNullOrBlank()) {
+                                cur = cur.copy(macAddress = foundMac)
+                                changed = true
+                            }
+                        }
+                    }
+
+                    // Layer 1 Anti-Cheat: Device is physically active on Wi-Fi (same MAC or IP) while offline or VPN off!
+                    val presentByMac = cur.macAddress.isNotBlank() && refreshedMacs.contains(cur.macAddress.lowercase())
+                    val presentByIp = cur.lastKnownIp.isNotBlank() && refreshedIps.contains(cur.lastKnownIp)
+                    val presentOnWifi = presentByMac || presentByIp
 
                     if (presentOnWifi && (!cur.isOnline || !cur.protectionActive)) {
                         if (!alertedMacCheatDevices.contains(cur.deviceId)) {
                             alertedMacCheatDevices.add(cur.deviceId)
-                            val macTag = if (cur.macAddress.isNotBlank()) " (${cur.macAddress})" else ""
-                            val msg = "محاولة تحايل مؤكدة: جهاز ${cur.deviceName}$macTag متصل بالواي فاي حالياً بدون حماية!"
+                            val idTag = if (cur.macAddress.isNotBlank()) "MAC: ${cur.macAddress}" else "IP: ${cur.lastKnownIp}"
+                            val msg = "تحايل مؤكد: جهاز ${cur.deviceName} متصل بالواي فاي حالياً ($idTag) بدون حماية أو حذف التطبيق!"
                             recordAndNotifyTamper(cur.deviceId, cur.deviceName, msg)
                             cur = cur.copy(tamperWarning = msg)
                             changed = true
                         }
-                    } else if (heartbeatTimedOut && !alertedOfflineDevices.contains(cur.deviceId)) {
+                    } else if (heartbeatTimedOut && !presentOnWifi && !alertedOfflineDevices.contains(cur.deviceId)) {
                         alertedOfflineDevices.add(cur.deviceId)
-                        val msg = "انقطع اتصال جهاز ${cur.deviceName} — قد يكون خارج الشبكة أو حذف التطبيق"
+                        val msg = "جهاز ${cur.deviceName} غادر شبكة الواي فاي حالياً (غير متصل بالشبكة)"
                         recordAndNotifyTamper(cur.deviceId, cur.deviceName, msg)
                         cur = cur.copy(tamperWarning = msg)
                         changed = true

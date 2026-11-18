@@ -26,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AddCircleOutline
 import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.BarChart
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Devices
 import androidx.compose.material.icons.rounded.Edit
@@ -132,9 +133,12 @@ fun SupervisorScreen(
     val targetNetworkOnly by prefs.targetNetworkOnlyFlow.collectAsState(initial = false)
     val targetNetworkSig by prefs.targetNetworkSigFlow.collectAsState(initial = "")
     val blockedAds by WifiGuardVpnService.blockedAdsCount.collectAsState()
+    val alwaysOnActive by WifiGuardVpnService.isAlwaysOnActive.collectAsState()
 
     // Self-limit & template policy states
     val selfLimitEnabled by prefs.selfLimitEnabledFlow.collectAsState(initial = false)
+    val localUsageHist by prefs.localUsageHistoryFlow.collectAsState(initial = emptyMap())
+    val localSavedHist by prefs.localSavedHistoryFlow.collectAsState(initial = emptyMap())
     val limitPeriod by prefs.limitPeriodFlow.collectAsState(initial = LimitPeriod.DAILY)
     val usedMb by prefs.usedMbActivePeriodFlow.collectAsState(initial = 0L)
     val dailyLimitMb by prefs.dailyLimitMbFlow.collectAsState(initial = 1024L)
@@ -161,6 +165,7 @@ fun SupervisorScreen(
                         when (selectedTab) {
                             0 -> "حارس الواي فاي — المشرف"
                             1 -> "حدي الشخصي"
+                            2 -> "التحليلات والتوفير"
                             else -> "الإعدادات المتقدمة"
                         },
                         fontWeight = FontWeight.Bold,
@@ -190,6 +195,12 @@ fun SupervisorScreen(
                 NavigationBarItem(
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 },
+                    icon = { Icon(Icons.Rounded.BarChart, contentDescription = null) },
+                    label = { Text("التحليلات") }
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 3,
+                    onClick = { selectedTab = 3 },
                     icon = { Icon(Icons.Rounded.Tune, contentDescription = null) },
                     label = { Text("المتقدمة") }
                 )
@@ -229,6 +240,7 @@ fun SupervisorScreen(
                     vpnRunning = vpnRunning,
                     connState = connState,
                     statusLabel = statusLabel,
+                    alwaysOnActive = alwaysOnActive,
                     adminActive = WifiGuardDeviceAdminReceiver.isActive(context),
                     onToggleSelfLimit = { enable ->
                         val action = {
@@ -262,6 +274,12 @@ fun SupervisorScreen(
                     },
                     onOpenAlwaysOn = onOpenAlwaysOnSettings,
                     onRequestAdmin = onRequestDeviceAdmin
+                )
+                2 -> AnalyticsSection(
+                    devices = devices,
+                    localUsageHistory = localUsageHist,
+                    localSavedHistory = localSavedHist,
+                    includeSelf = selfLimitEnabled
                 )
                 else -> AdvancedSettingsTab(
                     globalSpeedCapMbps = globalSpeedCapMbps,
@@ -645,6 +663,7 @@ private fun SelfLimitTab(
     vpnRunning: Boolean,
     connState: ConnectionState,
     statusLabel: String,
+    alwaysOnActive: Boolean,
     adminActive: Boolean,
     onToggleSelfLimit: (Boolean) -> Unit,
     onEditLimits: () -> Unit,
@@ -717,8 +736,10 @@ private fun SelfLimitTab(
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("إضافة رصيد إضافي سريع (+250 م.ب لليوم)")
             }
-            OutlinedButton(onClick = onOpenAlwaysOn, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
-                Text("تثبيت الحماية الدائمة من إعدادات الجهاز")
+            if (!alwaysOnActive) {
+                OutlinedButton(onClick = onOpenAlwaysOn, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
+                    Text("تثبيت الحماية الدائمة من إعدادات الجهاز")
+                }
             }
             if (!adminActive) {
                 OutlinedButton(onClick = onRequestAdmin, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
@@ -1411,6 +1432,7 @@ private fun EditDeviceDialog(
     if (showWhitelist) {
         WhitelistPickerDialog(
             initialSelected = whitelist,
+            remoteApps = device.installedApps,
             onDismiss = { showWhitelist = false },
             onConfirm = {
                 whitelist = it
