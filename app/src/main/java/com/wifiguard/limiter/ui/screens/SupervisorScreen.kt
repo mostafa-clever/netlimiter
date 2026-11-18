@@ -1374,15 +1374,6 @@ private fun EditSelfLimitDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("فرض وضع التوفير على هذا الجهاز", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                    Switch(checked = forceSaverForDevice, onCheckedChange = { forceSaverForDevice = it })
-                }
-
                 OutlinedTextField(
                     value = baseSpeedText,
                     onValueChange = { txt ->
