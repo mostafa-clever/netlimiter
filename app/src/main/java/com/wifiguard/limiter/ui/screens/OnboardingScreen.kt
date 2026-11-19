@@ -98,7 +98,7 @@ fun OnboardingScreen(
         }
         Spacer(modifier = Modifier.height(16.dp))
         Text(
-            text = "حارس الواي فاي",
+            text = "No Quota",
             fontSize = 26.sp,
             fontWeight = FontWeight.ExtraBold,
             color = PrimaryTeal

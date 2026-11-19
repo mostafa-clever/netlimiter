@@ -22,7 +22,17 @@ import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Security
+import androidx.compose.material.icons.rounded.BatteryChargingFull
+import androidx.compose.material.icons.rounded.HelpOutline
 import androidx.compose.material.icons.rounded.Shield
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.TextButton
+import com.wifiguard.limiter.ui.components.GuideType
+import com.wifiguard.limiter.ui.components.SetupGuideDialog
+import android.content.Intent
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -53,6 +63,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.wifiguard.limiter.BuildConfig
 import com.wifiguard.limiter.admin.WifiGuardDeviceAdminReceiver
 import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.LimitPeriod
@@ -64,6 +75,7 @@ import com.wifiguard.limiter.ui.theme.SuccessGreenBg
 import com.wifiguard.limiter.ui.theme.TextMuted
 import com.wifiguard.limiter.ui.theme.WarnAmber
 import com.wifiguard.limiter.ui.theme.WarnAmberBg
+import com.wifiguard.limiter.network.NetworkScanner
 import com.wifiguard.limiter.vpn.WifiGuardVpnService
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
@@ -80,6 +92,8 @@ fun ClientScreen(
     val usedMb by prefs.usedMbActivePeriodFlow.collectAsState(initial = 0L)
     val dailyLimitMb by prefs.dailyLimitMbFlow.collectAsState(initial = 1024L)
     val whitelist by prefs.whitelistFlow.collectAsState(initial = emptySet())
+    val targetNetworkOnly by prefs.targetNetworkOnlyFlow.collectAsState(initial = false)
+    val targetNetworkSig by prefs.targetNetworkSigFlow.collectAsState(initial = "")
     val vpnServiceRunning by WifiGuardVpnService.isRunning.collectAsState()
     var systemVpnDetected by remember { mutableStateOf(false) }
     val vpnRunning = vpnServiceRunning || systemVpnDetected
@@ -88,11 +102,15 @@ fun ClientScreen(
     val blockedAds by WifiGuardVpnService.blockedAdsCount.collectAsState()
     val alwaysOnActive by WifiGuardVpnService.isAlwaysOnActive.collectAsState()
     var adminActive by remember { mutableStateOf(WifiGuardDeviceAdminReceiver.isActive(context)) }
+    val pmPower = remember { context.getSystemService(android.content.Context.POWER_SERVICE) as PowerManager }
+    var batteryExempt by remember { mutableStateOf(pmPower.isIgnoringBatteryOptimizations(context.packageName)) }
+    var activeGuide by remember { mutableStateOf<GuideType?>(null) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 adminActive = WifiGuardDeviceAdminReceiver.isActive(context)
+                batteryExempt = pmPower.isIgnoringBatteryOptimizations(context.packageName)
                 val cm = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
                 systemVpnDetected = cm.allNetworks.any { net ->
                     cm.getNetworkCapabilities(net)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
@@ -118,8 +136,13 @@ fun ClientScreen(
             TopAppBar(
                 title = {
                     Column {
-                        Text("حارس الواي فاي", fontWeight = FontWeight.Bold, fontSize = 19.sp)
+                        Text("No Quota", fontWeight = FontWeight.Bold, fontSize = 19.sp)
                         Text("جهاز: $deviceName", fontSize = 12.sp, color = Color.White.copy(alpha = 0.85f))
+                    }
+                },
+                actions = {
+                    IconButton(onClick = { activeGuide = GuideType.CLIENT_FULL_SETUP }) {
+                        Icon(Icons.Rounded.HelpOutline, contentDescription = "دليل التفعيل", tint = Color.White)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -146,7 +169,23 @@ fun ClientScreen(
                 statusLabelOverride = statusLabel
             )
 
-            if (blockedAds > 0L) {
+            if (targetNetworkOnly && targetNetworkSig.isNotBlank()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                ) {
+                    Text(
+                        text = "الشبكة المراقَبة: ${NetworkScanner.formatSignatureForDisplay(targetNetworkSig)}",
+                        modifier = Modifier.padding(14.dp),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = PrimaryTeal
+                    )
+                }
+            }
+
+            if (BuildConfig.ENABLE_DNS_ADBLOCK && blockedAds > 0L) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp),
@@ -162,18 +201,27 @@ fun ClientScreen(
                 }
             }
 
-            if (!vpnRunning || !alwaysOnActive || !adminActive) {
+            if (!vpnRunning || !alwaysOnActive || !adminActive || !batteryExempt) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(20.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
                 ) {
                     Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text(
-                            text = "إكمال تفعيل الحماية",
-                            fontSize = 17.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "إكمال تفعيل الحماية",
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            TextButton(onClick = { activeGuide = GuideType.CLIENT_FULL_SETUP }) {
+                                Text("شرح الخطوات", fontSize = 12.sp)
+                            }
+                        }
 
                         if (!vpnRunning) {
                             ProtectionStepRow(
@@ -192,9 +240,9 @@ fun ClientScreen(
                                 title = "تثبيت الحماية الدائمة",
                                 subtitle = "اختر (حارس الواي فاي) من الإعدادات وفعّل التشغيل الدائم",
                                 isActive = false,
-                                actionLabel = "فتح الإعدادات",
+                                actionLabel = "الخطوات",
                                 showCheck = false,
-                                onAction = onOpenAlwaysOnSettings
+                                onAction = { activeGuide = GuideType.ALWAYS_ON_VPN }
                             )
                         }
 
@@ -206,6 +254,25 @@ fun ClientScreen(
                                 isActive = false,
                                 actionLabel = "تفعيل",
                                 onAction = onRequestDeviceAdmin
+                            )
+                        }
+
+                        if (!batteryExempt) {
+                            ProtectionStepRow(
+                                icon = Icons.Rounded.BatteryChargingFull,
+                                title = "استثناء من توفير البطارية",
+                                subtitle = "يمنع النظام من إغلاق الحماية في الخلفية",
+                                isActive = false,
+                                actionLabel = "تفعيل",
+                                onAction = {
+                                    runCatching {
+                                        val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                            data = Uri.parse("package:${context.packageName}")
+                                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                        }
+                                        context.startActivity(i)
+                                    }
+                                }
                             )
                         }
                     }
@@ -256,6 +323,15 @@ fun ClientScreen(
                 }
             }
         }
+    }
+
+    activeGuide?.let { guide ->
+        SetupGuideDialog(
+            guideType = guide,
+            onDismiss = { activeGuide = null },
+            onPrimaryAction = if (guide == GuideType.ALWAYS_ON_VPN) onOpenAlwaysOnSettings else null,
+            primaryActionLabel = if (guide == GuideType.ALWAYS_ON_VPN) "فتح إعدادات الحماية الآن" else null
+        )
     }
 }
 

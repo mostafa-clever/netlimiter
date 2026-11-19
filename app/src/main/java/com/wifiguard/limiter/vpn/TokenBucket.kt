@@ -40,6 +40,15 @@ class TokenBucket {
     }
 
     @Synchronized
+    fun millisUntilBytes(minBytes: Int): Long {
+        val rate = rateBytesPerSec.get()
+        if (rate == Long.MAX_VALUE) return 0L
+        if (rate <= 0L) return 50L
+        val needed = (minBytes - tokens).coerceAtLeast(0.0)
+        return ((needed * 1000.0) / rate.toDouble()).toLong().coerceIn(5L, 50L)
+    }
+
+    @Synchronized
     fun consume(bytes: Int) {
         val rate = rateBytesPerSec.get()
         if (rate == Long.MAX_VALUE) return

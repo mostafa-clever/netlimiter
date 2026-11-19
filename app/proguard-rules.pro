@@ -1,1 +1,3 @@
 -keep class com.wifiguard.limiter.** { *; }
+-dontwarn org.jetbrains.**
+-dontwarn kotlinx.coroutines.**

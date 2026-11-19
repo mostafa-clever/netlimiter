@@ -22,6 +22,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Eco
@@ -41,6 +43,9 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Slider
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -89,7 +94,7 @@ fun UsageRingCard(
 
     val ringColor = when {
         !protectionActive -> TextMuted
-        connectionState == ConnectionState.BLOCKED -> AlertRed
+        connectionState == ConnectionState.BLOCKED || connectionState == ConnectionState.PAUSED -> AlertRed
         connectionState == ConnectionState.SLOWED || connectionState == ConnectionState.GRACE_EXTRA -> WarnAmber
         else -> PrimaryTeal
     }
@@ -179,6 +184,12 @@ fun StatusPill(
 ) {
     val (bg, fg, icon, defaultText) = when {
         !protectionActive -> Quad(AlertRedBg, AlertRed, Icons.Rounded.Warning, "الحماية متوقفة حالياً")
+        connectionState == ConnectionState.PAUSED -> Quad(
+            AlertRedBg,
+            AlertRed,
+            Icons.Rounded.WifiOff,
+            "تم إيقاف الإنترنت مؤقتاً بواسطة المشرف"
+        )
         connectionState == ConnectionState.BLOCKED -> Quad(
             AlertRedBg,
             AlertRed,
@@ -341,7 +352,6 @@ fun WhitelistPickerDialog(
 }
 
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun AppQuotaPercentsDialog(
     initialMap: Map<String, Int>,
@@ -362,68 +372,136 @@ fun AppQuotaPercentsDialog(
                 .sortedBy { it.appName }
         }
     }
-
-    var searchQuery by remember { mutableStateOf("") }
-    var quotaMap by remember { mutableStateOf(initialMap) }
-
-    val filtered = remember(searchQuery, installedApps) {
-        if (searchQuery.isBlank()) installedApps
-        else installedApps.filter { it.appName.contains(searchQuery, ignoreCase = true) }
+    val appNameMap = remember(installedApps) {
+        installedApps.associate { it.packageName to it.appName }
     }
+
+    var quotaMap by remember { mutableStateOf(initialMap) }
+    var pickingApp by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("نسبة الباقة لكل تطبيق (%)", fontWeight = FontWeight.Bold) },
+        title = {
+            Text(
+                if (pickingApp) "اختر تطبيقاً لإضافته" else "حد نسبة الباقة للتطبيقات (%)",
+                fontWeight = FontWeight.Bold
+            )
+        },
         text = {
-            Column {
-                Text(
-                    "حدد أقصى نسبة من الباقة يُسمح للتطبيق باستهلاكها (مثل 20% لـ TikTok):",
-                    fontSize = 12.sp,
-                    color = TextMuted
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    placeholder = { Text("ابحث عن تطبيق...") },
-                    leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) {
-                    items(filtered, key = { it.packageName }) { app ->
-                        val curPct = quotaMap[app.packageName]
-                        Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
-                            Text(
-                                text = if (curPct != null) "${app.appName} ($curPct%)" else app.appName,
-                                fontSize = 14.sp,
-                                fontWeight = if (curPct != null) FontWeight.Bold else FontWeight.Normal,
-                                color = if (curPct != null) PrimaryTeal else MaterialTheme.colorScheme.onSurface
-                            )
-                            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                listOf(10, 20, 30, 50).forEach { pct ->
-                                    FilterChip(
-                                        selected = curPct == pct,
-                                        onClick = {
-                                            quotaMap = if (curPct == pct) quotaMap - app.packageName else quotaMap + (app.packageName to pct)
+            if (pickingApp) {
+                val available = remember(searchQuery, installedApps, quotaMap) {
+                    installedApps
+                        .filter { !quotaMap.containsKey(it.packageName) }
+                        .filter { searchQuery.isBlank() || it.appName.contains(searchQuery, ignoreCase = true) }
+                }
+                Column {
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = { searchQuery = it },
+                        placeholder = { Text("ابحث عن تطبيق...") },
+                        leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    LazyColumn(modifier = Modifier.heightIn(max = 280.dp)) {
+                        items(available, key = { it.packageName }) { app ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        quotaMap = quotaMap + (app.packageName to 20)
+                                        searchQuery = ""
+                                        pickingApp = false
+                                    }
+                                    .padding(vertical = 10.dp, horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(text = app.appName, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                                Icon(Icons.Rounded.Add, contentDescription = null, tint = PrimaryTeal)
+                            }
+                        }
+                    }
+                }
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (quotaMap.isEmpty()) {
+                        Text(
+                            "لم تقم بإضافة تطبيقات بعد. اضغط على (إضافة تطبيق) لتحديد نسبة من الباقة له.",
+                            fontSize = 13.sp,
+                            color = TextMuted
+                        )
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier.heightIn(max = 280.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(quotaMap.entries.toList(), key = { it.key }) { (pkg, pct) ->
+                                val label = appNameMap[pkg] ?: pkg
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(SoftMint.copy(alpha = 0.5f))
+                                        .padding(10.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = "$label — $pct%",
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 14.sp,
+                                            color = PrimaryTeal,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        IconButton(
+                                            onClick = { quotaMap = quotaMap - pkg },
+                                            modifier = Modifier.size(28.dp)
+                                        ) {
+                                            Icon(Icons.Rounded.Delete, contentDescription = "حذف", tint = AlertRed, modifier = Modifier.size(18.dp))
+                                        }
+                                    }
+                                    Slider(
+                                        value = pct.toFloat(),
+                                        onValueChange = { newVal ->
+                                            quotaMap = quotaMap + (pkg to newVal.toInt().coerceIn(5, 100))
                                         },
-                                        label = { Text("$pct%", fontSize = 11.sp) }
+                                        valueRange = 5f..100f
                                     )
                                 }
                             }
                         }
                     }
+
+                    OutlinedButton(
+                        onClick = { pickingApp = true },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("إضافة تطبيق")
+                    }
                 }
             }
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm(quotaMap) }) {
-                Text("حفظ (${quotaMap.size})")
+            if (pickingApp) {
+                TextButton(onClick = { pickingApp = false }) { Text("رجوع") }
+            } else {
+                TextButton(onClick = { onConfirm(quotaMap) }) {
+                    Text("حفظ (${quotaMap.size})")
+                }
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("إلغاء") }
+            if (!pickingApp) {
+                TextButton(onClick = onDismiss) { Text("إلغاء") }
+            }
         }
     )
 }

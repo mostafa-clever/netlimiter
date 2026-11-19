@@ -15,8 +15,10 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import com.wifiguard.limiter.BuildConfig
 import com.wifiguard.limiter.MainActivity
 import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.AppRole
@@ -51,10 +53,17 @@ class WifiGuardVpnService : VpnService() {
 
     private var currentBlockAll: Boolean = false
     private var currentProxyActive: Boolean = false
+    private var currentUseLocalDns: Boolean = false
     private var currentWhitelist: Set<String> = emptySet()
     private var currentBlockedApps: Set<String> = emptySet()
     private var lastTrafficBytes: Long = -1L
     private val lastAppUidBytes = mutableMapOf<String, Long>()
+    @Volatile private var cachedPolicy = com.wifiguard.limiter.model.SpeedPolicyConfig()
+    private var pendingUsedBytes: Long = 0L
+    private var pendingSavedBytes: Long = 0L
+    private var lastFlushMs: Long = 0L
+    private var lastNotifTitle: String = ""
+    private var lastNotifText: String = "" 
 
     companion object {
         const val CHANNEL_ID = "wifiguard_vpn_channel"
@@ -172,6 +181,16 @@ class WifiGuardVpnService : VpnService() {
         proxyServer = null
         runCatching { tunInterface?.close() }
         tunInterface = null
+        val remUsed = pendingUsedBytes
+        val remSaved = pendingSavedBytes
+        pendingUsedBytes = 0L
+        pendingSavedBytes = 0L
+        if (remUsed > 0L || remSaved > 0L) {
+            kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+                if (remUsed > 0L) prefs.addUsedBytes(remUsed)
+                if (remSaved > 0L) prefs.addSavedBytes(remSaved)
+            }
+        }
         serviceScope.cancel()
     }
 
@@ -191,6 +210,7 @@ class WifiGuardVpnService : VpnService() {
                     }
 
                     val cfg = prefs.getLocalLimitConfig()
+                    cachedPolicy = cfg.speedPolicy
                     dnsHandler.upstreamDnsIp = cfg.speedPolicy.upstreamDnsIp
                     val onWifi = isOnWifi()
 
@@ -205,7 +225,15 @@ class WifiGuardVpnService : VpnService() {
                         currentWifiSig.isNotBlank() &&
                         !NetworkScanner.matchesNetworkSignature(currentWifiSig, cfg.targetNetworkSig)
 
-                    if (outsideTargetWifi) {
+                    if (cfg.isPaused) {
+                        _connectionState.value = ConnectionState.PAUSED
+                        _statusLabel.value = "تم إيقاف الإنترنت مؤقتاً بواسطة المشرف"
+                        tokenBucket.setRateBytesPerSec(0L)
+                        if (!currentBlockAll || cfg.whitelist != currentWhitelist || tunInterface == null) {
+                            establishTunnel(blockAll = true, blockedApps = emptySet(), enableProxy = false, whitelist = cfg.whitelist)
+                        }
+                        updateNotification("إيقاف مؤقت", "تم إيقاف الإنترنت مؤقتاً بواسطة المشرف")
+                    } else if (outsideTargetWifi) {
                         lastTrafficBytes = -1L
                         _connectionState.value = ConnectionState.OUTSIDE_TARGET_WIFI
                         _statusLabel.value = "خارج الشبكة المحددة — بلا قيود"
@@ -227,7 +255,7 @@ class WifiGuardVpnService : VpnService() {
                                 val delta = currentTotal - lastTrafficBytes
                                 if (delta < 100L * 1024L * 1024L) {
                                     intervalBytes = delta
-                                    prefs.addUsedBytes(delta)
+                                    pendingUsedBytes += delta
                                 }
                             }
                             lastTrafficBytes = currentTotal
@@ -236,7 +264,7 @@ class WifiGuardVpnService : VpnService() {
                         }
 
                         if (!powerManager.isInteractive) {
-                            screenOffSeconds++
+                            screenOffSeconds += 5
                         } else {
                             screenOffSeconds = 0
                         }
@@ -271,7 +299,19 @@ class WifiGuardVpnService : VpnService() {
                         ) {
                             savedDelta += (intervalBytes * 35L) / 100L
                         }
-                        if (savedDelta > 0L) prefs.addSavedBytes(savedDelta)
+                        if (savedDelta > 0L) pendingSavedBytes += savedDelta
+                        val nowMs = System.currentTimeMillis()
+                        if (pendingUsedBytes >= 1024L * 1024L || pendingSavedBytes >= 1024L * 1024L || (nowMs - lastFlushMs >= 15_000L && (pendingUsedBytes > 0L || pendingSavedBytes > 0L))) {
+                            if (pendingUsedBytes > 0L) {
+                                prefs.addUsedBytes(pendingUsedBytes)
+                                pendingUsedBytes = 0L
+                            }
+                            if (pendingSavedBytes > 0L) {
+                                prefs.addSavedBytes(pendingSavedBytes)
+                                pendingSavedBytes = 0L
+                            }
+                            lastFlushMs = nowMs
+                        }
 
                         // Per-app quota percentage tracking
                         val appQuotas = cfg.speedPolicy.appQuotaPercents
@@ -300,12 +340,17 @@ class WifiGuardVpnService : VpnService() {
                         }.keys
 
                         tokenBucket.setRateBytesPerSec(effective.targetBytesPerSec)
+                        val mediaSaverOn = effective.saverActive && cfg.speedPolicy.mediaCdnSaverEnabled
+                        val blockUpdatesOn = effective.saverActive && cfg.speedPolicy.blockAppUpdatesInSaver
+                        proxyServer?.updateMediaSaverConfig(mediaSaverOn, cfg.speedPolicy.mediaCdnSpeedMbps, blockUpdatesOn)
                         val blockAllNow = effective.state == ConnectionState.BLOCKED || effective.state == ConnectionState.IDLE_FROZEN
-                        val proxyNeeded = !blockAllNow && overQuotaApps.isEmpty() && effective.targetBytesPerSec < Long.MAX_VALUE
+                        val proxyNeeded = !blockAllNow && overQuotaApps.isEmpty() && (effective.targetBytesPerSec < Long.MAX_VALUE || mediaSaverOn || blockUpdatesOn)
+                        val useLocalDnsNow = BuildConfig.ENABLE_DNS_ADBLOCK && !isSystemPrivateDnsActive()
 
                         if (blockAllNow != currentBlockAll ||
                             overQuotaApps != currentBlockedApps ||
                             proxyNeeded != currentProxyActive ||
+                            useLocalDnsNow != currentUseLocalDns ||
                             cfg.whitelist != currentWhitelist ||
                             tunInterface == null
                         ) {
@@ -322,7 +367,7 @@ class WifiGuardVpnService : VpnService() {
                     }
                 }
 
-                delay(1000L)
+                delay(if (powerManager.isInteractive) 1000L else 5000L)
             }
         }
     }
@@ -340,11 +385,15 @@ class WifiGuardVpnService : VpnService() {
         currentProxyActive = enableProxy
         currentWhitelist = whitelist
 
+        val useLocalDns = BuildConfig.ENABLE_DNS_ADBLOCK && !isSystemPrivateDnsActive()
+        currentUseLocalDns = useLocalDns
         val builder = Builder()
-            .setSession("حارس الواي فاي")
+            .setSession("No Quota")
             .addAddress("10.0.0.2", 32)
-            .addDnsServer("10.0.0.1")
             .setMtu(1400)
+        if (useLocalDns) {
+            builder.addDnsServer("10.0.0.1")
+        }
 
         if (blockAll) {
             builder.addRoute("0.0.0.0", 0)
@@ -356,7 +405,9 @@ class WifiGuardVpnService : VpnService() {
             builder.addRoute("::", 0)
             blockedApps.forEach { pkg -> runCatching { builder.addAllowedApplication(pkg) } }
         } else {
-            builder.addRoute("10.0.0.1", 32)
+            if (useLocalDns) {
+                builder.addRoute("10.0.0.1", 32)
+            }
             builder.addRoute("10.254.0.0", 16)
             if (enableProxy && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 runCatching {
@@ -378,9 +429,8 @@ class WifiGuardVpnService : VpnService() {
             while (isActive) {
                 val len = runCatching { input.read(buffer) }.getOrElse { -1 }
                 if (len < 0) break
-                if (len > 0 && !blockAll && blockedApps.isEmpty()) {
-                    val cfg = runCatching { prefs.getLocalLimitConfig() }.getOrNull()
-                    val policy = cfg?.speedPolicy
+                if (len > 0 && !blockAll && blockedApps.isEmpty() && useLocalDns) {
+                    val policy = cachedPolicy
                     val pktCopy = buffer.copyOf(len)
                     launch {
                         val resp = runCatching {
@@ -400,6 +450,13 @@ class WifiGuardVpnService : VpnService() {
                 }
             }
         }
+    }
+
+    private fun isSystemPrivateDnsActive(): Boolean {
+        return runCatching {
+            val mode = Settings.Global.getString(contentResolver, "private_dns_mode")
+            mode.equals("hostname", ignoreCase = true)
+        }.getOrDefault(false)
     }
 
     private fun isOnWifi(): Boolean {
@@ -439,6 +496,9 @@ class WifiGuardVpnService : VpnService() {
     }
 
     private fun updateNotification(text: String, title: String) {
+        if (text == lastNotifText && title == lastNotifTitle) return
+        lastNotifText = text
+        lastNotifTitle = title
         runCatching {
             val nm = getSystemService(NotificationManager::class.java)
             nm.notify(NOTIF_ID, buildNotification(text, title))

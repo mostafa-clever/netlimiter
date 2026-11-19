@@ -39,10 +39,12 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
 
     private lateinit var prefs: PreferencesManager
+    private var isRequestingVpnPermission = false
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
+        isRequestingVpnPermission = false
         if (result.resultCode == RESULT_OK) {
             WifiGuardVpnService.start(this)
         }
@@ -67,9 +69,11 @@ class MainActivity : ComponentActivity() {
                 var isDownloadingUpdate by remember { mutableStateOf(false) }
 
                 LaunchedEffect(Unit) {
-                    val res = GitHubUpdater.checkLatestRelease(this@MainActivity, githubRepo)
-                    res.onSuccess { info ->
-                        if (info.hasUpdate) availableUpdate = info
+                    if (BuildConfig.ENABLE_GITHUB_UPDATER) {
+                        val res = GitHubUpdater.checkLatestRelease(this@MainActivity, githubRepo)
+                        res.onSuccess { info ->
+                            if (info.hasUpdate) availableUpdate = info
+                        }
                     }
                 }
 
@@ -158,9 +162,13 @@ class MainActivity : ComponentActivity() {
 
     private fun startVpnWithPermission() {
         runCatching {
+            if (WifiGuardVpnService.isRunning.value) return
             val intent = VpnService.prepare(this)
             if (intent != null) {
-                vpnPermissionLauncher.launch(intent)
+                if (!isRequestingVpnPermission) {
+                    isRequestingVpnPermission = true
+                    vpnPermissionLauncher.launch(intent)
+                }
             } else {
                 WifiGuardVpnService.start(this)
             }
@@ -192,9 +200,7 @@ class MainActivity : ComponentActivity() {
         ) {
             needed.add(Manifest.permission.POST_NOTIFICATIONS)
         }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
-        }
+
         if (needed.isNotEmpty()) {
             multiPermissionLauncher.launch(needed.toTypedArray())
         }

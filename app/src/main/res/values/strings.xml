@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">حارس الواي فاي</string>
+    <string name="app_name">No Quota</string>
     <string name="device_admin_description">يحمي التطبيق من الحذف أو الإيقاف المفاجئ ويُرسل تنبيهاً لجهاز المشرف عند محاولة التجاوز.</string>
 </resources>

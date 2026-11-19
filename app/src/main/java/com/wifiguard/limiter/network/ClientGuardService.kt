@@ -167,7 +167,8 @@ class ClientGuardService : Service() {
                         globalSpeedCapMbps = obj.optDouble("globalSpeedCapMbps", 0.0),
                         forceQuotaSaver = obj.optBoolean("forceQuotaSaver", false),
                         targetNetworkOnly = obj.optBoolean("targetNetworkOnly", false),
-                        targetNetworkSig = obj.optString("targetNetworkSig", "")
+                        targetNetworkSig = obj.optString("targetNetworkSig", ""),
+                        isPaused = obj.optBoolean("isPaused", false)
                     )
                     JSONObject().put("ok", true)
                 } else {
@@ -303,7 +304,8 @@ class ClientGuardService : Service() {
                 globalSpeedCapMbps = updated.globalSpeedCapMbps,
                 forceQuotaSaver = updated.forceQuotaSaver,
                 targetNetworkOnly = updated.targetNetworkOnly,
-                targetNetworkSig = updated.targetNetworkSig
+                targetNetworkSig = updated.targetNetworkSig,
+                isPaused = updated.isPaused
             )
             return true
         }

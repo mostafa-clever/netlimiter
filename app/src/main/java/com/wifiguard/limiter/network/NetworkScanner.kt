@@ -143,6 +143,32 @@ object NetworkScanner {
         return map
     }
 
+    /**
+     * Reliably detects if a host IP is physically alive on the Wi-Fi LAN on Android 11-15 (even when /proc/net/arp is restricted).
+     * Both a successful ICMP echo OR a TCP Connection Refused (ECONNREFUSED / TCP RST) prove the device kernel is active on Wi-Fi.
+     */
+    suspend fun isHostAliveOnLan(ip: String): Boolean = withContext(Dispatchers.IO) {
+        if (ip.isBlank()) return@withContext false
+        val icmpOk = runCatching { InetAddress.getByName(ip).isReachable(450) }.getOrDefault(false)
+        if (icmpOk) return@withContext true
+
+        // TCP connect probe: Connection Refused (ConnectException) means the phone actively sent TCP RST -> definitely on Wi-Fi!
+        for (port in listOf(LocalLanClient.CLIENT_PORT, 5353, 80)) {
+            val alive = try {
+                java.net.Socket().use { s ->
+                    s.connect(java.net.InetSocketAddress(ip, port), 400)
+                }
+                true
+            } catch (e: java.net.ConnectException) {
+                true // TCP RST received -> host is physically online on Wi-Fi!
+            } catch (_: Throwable) {
+                false
+            }
+            if (alive) return@withContext true
+        }
+        false
+    }
+
     suspend fun probeIpForArp(ip: String) = withContext(Dispatchers.IO) {
         if (ip.isBlank()) return@withContext
         runCatching {

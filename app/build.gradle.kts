@@ -20,9 +20,20 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = file("wifiguard-release.jks")
+            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "wifiguard2026"
+            keyAlias = System.getenv("KEY_ALIAS") ?: "wifiguard"
+            keyPassword = System.getenv("KEY_PASSWORD") ?: "wifiguard2026"
+        }
+    }
+
     buildTypes {
         release {
-            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -39,8 +50,23 @@ android {
         jvmTarget = "17"
     }
 
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("github") {
+            dimension = "distribution"
+            buildConfigField("boolean", "ENABLE_GITHUB_UPDATER", "true")
+            buildConfigField("boolean", "ENABLE_DNS_ADBLOCK", "true")
+        }
+        create("playStore") {
+            dimension = "distribution"
+            buildConfigField("boolean", "ENABLE_GITHUB_UPDATER", "false")
+            buildConfigField("boolean", "ENABLE_DNS_ADBLOCK", "false")
+        }
+    }
+
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     composeOptions {

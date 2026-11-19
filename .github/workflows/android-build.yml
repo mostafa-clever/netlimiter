@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build No Quota (GitHub APK + Play Store AAB)
 
 on:
   push:
@@ -29,16 +29,35 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Build Debug APK
-        run: gradle assembleDebug -PbuildNumber=${{ github.run_number }} --no-daemon
+      - name: Decode Release Keystore from Secrets (if configured)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > app/wifiguard-release.jks
+          fi
 
-      - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk WifiGuard.apk
+      - name: Build GitHub Release APK & Play Store Release AAB
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          gradle assembleGithubRelease bundlePlayStoreRelease -PbuildNumber=${{ github.run_number }} --no-daemon
 
-      - name: Publish Direct APK to GitHub Releases
+      - name: Rename GitHub Release APK
+        run: cp app/build/outputs/apk/github/release/app-github-release.apk WifiGuard.apk
+
+      - name: Upload Play Store AAB (Private Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: noquota-playstore-aab
+          path: app/build/outputs/bundle/playStoreRelease/app-playStore-release.aab
+
+      - name: Publish Direct GitHub APK to Releases
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release delete latest --yes || true
-          gh release create latest WifiGuard.apk --title "WifiGuard Latest APK" --notes "build:${{ github.run_number }} — Direct APK download."
+          gh release create latest WifiGuard.apk --title "No Quota v1.0.${{ github.run_number }}" --notes "build:${{ github.run_number }} — Signed Release APK."

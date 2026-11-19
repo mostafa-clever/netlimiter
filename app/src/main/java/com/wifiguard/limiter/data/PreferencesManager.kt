@@ -53,6 +53,7 @@ class PreferencesManager(private val context: Context) {
         val FORCE_QUOTA_SAVER_ALL = booleanPreferencesKey("force_quota_saver_all")
         val TARGET_NETWORK_ONLY = booleanPreferencesKey("target_network_only")
         val TARGET_NETWORK_SIG = stringPreferencesKey("target_network_sig")
+        val IS_PAUSED = booleanPreferencesKey("is_paused")
 
         // Period usage tracking
         val USED_BYTES_DAY = longPreferencesKey("used_bytes_today")
@@ -246,7 +247,8 @@ class PreferencesManager(private val context: Context) {
         globalSpeedCapMbps: Double = 0.0,
         forceQuotaSaver: Boolean? = null,
         targetNetworkOnly: Boolean? = null,
-        targetNetworkSig: String? = null
+        targetNetworkSig: String? = null,
+        isPaused: Boolean? = null
     ) {
         context.dataStore.edit { prefs ->
             prefs[Keys.DAILY_LIMIT_MB] = limitMb.coerceAtLeast(10L)
@@ -257,6 +259,7 @@ class PreferencesManager(private val context: Context) {
             if (forceQuotaSaver != null) prefs[Keys.FORCE_QUOTA_SAVER_ALL] = forceQuotaSaver
             if (targetNetworkOnly != null) prefs[Keys.TARGET_NETWORK_ONLY] = targetNetworkOnly
             if (targetNetworkSig != null) prefs[Keys.TARGET_NETWORK_SIG] = targetNetworkSig
+            if (isPaused != null) prefs[Keys.IS_PAUSED] = isPaused
         }
     }
 
@@ -386,7 +389,8 @@ class PreferencesManager(private val context: Context) {
         val globalSpeedCapMbps: Double,
         val forceQuotaSaver: Boolean,
         val targetNetworkOnly: Boolean,
-        val targetNetworkSig: String
+        val targetNetworkSig: String,
+        val isPaused: Boolean
     )
 
     suspend fun getLocalLimitConfig(): LocalConfigSnapshot {
@@ -407,7 +411,8 @@ class PreferencesManager(private val context: Context) {
             globalSpeedCapMbps = prefs[Keys.GLOBAL_SPEED_CAP_MBPS] ?: 0.0,
             forceQuotaSaver = prefs[Keys.FORCE_QUOTA_SAVER_ALL] ?: false,
             targetNetworkOnly = prefs[Keys.TARGET_NETWORK_ONLY] ?: false,
-            targetNetworkSig = prefs[Keys.TARGET_NETWORK_SIG] ?: ""
+            targetNetworkSig = prefs[Keys.TARGET_NETWORK_SIG] ?: "",
+            isPaused = prefs[Keys.IS_PAUSED] ?: false
         )
     }
 

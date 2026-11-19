@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Shield outer silhouette -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.16"
+        android:pathData="M54,20 L80,30 L80,53 C80,70 68.5,83.5 54,89 C39.5,83.5 28,70 28,53 L28,30 Z" />
+    <!-- Shield crisp outline -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.5"
+        android:strokeLineJoin="round"
+        android:pathData="M54,22 L78,31 L78,53 C78,68.8 67.5,81.4 54,86.5 C40.5,81.4 30,68.8 30,53 L30,31 Z" />
+    <!-- Wi-Fi outer arc -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.8"
+        android:strokeLineCap="round"
+        android:pathData="M39,48 C43.5,43.5 48.5,41.5 54,41.5 C59.5,41.5 64.5,43.5 69,48" />
+    <!-- Wi-Fi middle arc -->
+    <path
+        android:strokeColor="#A7F3D0"
+        android:strokeWidth="3.8"
+        android:strokeLineCap="round"
+        android:pathData="M44.5,55.5 C47.3,52.8 50.5,51.5 54,51.5 C57.5,51.5 60.7,52.8 63.5,55.5" />
+    <!-- Wi-Fi center dot -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,60.5 A3.5,3.5 0 1,1 53.99,60.5 Z" />
+</vector>

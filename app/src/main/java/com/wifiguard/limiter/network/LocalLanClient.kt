@@ -34,7 +34,8 @@ data class SyncedLimitConfig(
     val globalSpeedCapMbps: Double,
     val forceQuotaSaver: Boolean,
     val targetNetworkOnly: Boolean,
-    val targetNetworkSig: String
+    val targetNetworkSig: String,
+    val isPaused: Boolean = false
 )
 
 object LocalLanClient {
@@ -178,7 +179,8 @@ object LocalLanClient {
         globalSpeedCapMbps: Double,
         forceQuotaSaver: Boolean,
         targetNetworkOnly: Boolean,
-        targetNetworkSig: String
+        targetNetworkSig: String,
+        isPaused: Boolean = false
     ): Boolean = withContext(Dispatchers.IO) {
         if (clientIp.isBlank()) return@withContext false
         runCatching {
@@ -191,6 +193,7 @@ object LocalLanClient {
                 put("forceQuotaSaver", forceQuotaSaver)
                 put("targetNetworkOnly", targetNetworkOnly)
                 put("targetNetworkSig", targetNetworkSig)
+                put("isPaused", isPaused)
             }
             val resp = postJson("http://$clientIp:$CLIENT_PORT/config", payload)
             resp.optBoolean("ok", false)
@@ -230,7 +233,8 @@ object LocalLanClient {
             globalSpeedCapMbps = resp.optDouble("globalSpeedCapMbps", 0.0),
             forceQuotaSaver = resp.optBoolean("forceQuotaSaver", false),
             targetNetworkOnly = resp.optBoolean("targetNetworkOnly", false),
-            targetNetworkSig = resp.optString("targetNetworkSig", "")
+            targetNetworkSig = resp.optString("targetNetworkSig", ""),
+            isPaused = resp.optBoolean("isPaused", false)
         )
     }
 

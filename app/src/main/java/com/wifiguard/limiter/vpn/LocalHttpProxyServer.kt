@@ -17,13 +17,44 @@ class LocalHttpProxyServer(
 ) {
     companion object {
         const val PROXY_PORT = 8888
+
+        private val MEDIA_CDN_SUFFIXES = listOf(
+            "googlevideo.com",
+            "tiktokcdn.com",
+            "tiktokcdn-us.com",
+            "tiktokv.com",
+            "fbcdn.net",
+            "cdninstagram.com",
+            "twimg.com",
+            "vimeocdn.com",
+            "nflxvideo.net",
+            "sc-cdn.net"
+        )
+
+        private val AUTO_UPDATE_HOSTS = listOf(
+            "gvt1.com",
+            "ota.googlezip.net",
+            "android.clients.google.com"
+        )
     }
 
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
+    private val mediaTokenBucket = TokenBucket()
 
-    @Volatile
-    private var running = true
+    @Volatile var mediaCdnSaverActive: Boolean = false
+    @Volatile var blockAppUpdatesActive: Boolean = false
+    @Volatile private var running = true
+
+    fun updateMediaSaverConfig(enabled: Boolean, mediaSpeedMbps: Double, blockUpdates: Boolean) {
+        mediaCdnSaverActive = enabled
+        blockAppUpdatesActive = blockUpdates
+        if (enabled && mediaSpeedMbps > 0.0) {
+            mediaTokenBucket.setRateMbps(mediaSpeedMbps)
+        } else {
+            mediaTokenBucket.setRateBytesPerSec(Long.MAX_VALUE)
+        }
+    }
 
     fun start() {
         executor.execute {
@@ -41,6 +72,16 @@ class LocalHttpProxyServer(
         running = false
         runCatching { serverSocket?.close() }
         runCatching { executor.shutdownNow() }
+    }
+
+    private fun isMediaCdnHost(host: String): Boolean {
+        val h = host.lowercase()
+        return MEDIA_CDN_SUFFIXES.any { h == it || h.endsWith(".$it") }
+    }
+
+    private fun isAppUpdateHost(host: String): Boolean {
+        val h = host.lowercase()
+        return AUTO_UPDATE_HOSTS.any { h == it || h.endsWith(".$it") }
     }
 
     private fun handleClient(client: Socket) {
@@ -65,6 +106,14 @@ class LocalHttpProxyServer(
                     val host = hostPort[0]
                     val port = hostPort.getOrNull(1)?.toIntOrNull() ?: 443
 
+                    if (blockAppUpdatesActive && isAppUpdateHost(host)) {
+                        cOut.write("HTTP/1.1 403 Forbidden\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                        cOut.flush()
+                        return
+                    }
+
+                    val useMediaBucket = mediaCdnSaverActive && isMediaCdnHost(host)
+
                     val remote = Socket()
                     vpnService.protect(remote)
                     remote.tcpNoDelay = true
@@ -75,17 +124,24 @@ class LocalHttpProxyServer(
                         cOut.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII))
                         cOut.flush()
 
-                        val upThread = Thread {
-                            copyStream(cIn, r.getOutputStream(), paced = false)
-                        }.apply { isDaemon = true; start() }
-
-                        copyStream(r.getInputStream(), cOut, paced = true)
-                        runCatching { upThread.join(500) }
+                        val upFuture = executor.submit {
+                            copyStream(cIn, r.getOutputStream(), paced = false, useMediaBucket = false)
+                        }
+                        copyStream(r.getInputStream(), cOut, paced = true, useMediaBucket = useMediaBucket)
+                        upFuture.cancel(true)
                     }
                 } else {
                     val uri = URI(target)
                     val host = uri.host ?: extractHostHeader(lines) ?: return
                     val port = if (uri.port > 0) uri.port else 80
+
+                    if (blockAppUpdatesActive && isAppUpdateHost(host)) {
+                        cOut.write("HTTP/1.1 403 Forbidden\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                        cOut.flush()
+                        return
+                    }
+
+                    val useMediaBucket = mediaCdnSaverActive && isMediaCdnHost(host)
                     val path = (uri.rawPath?.ifEmpty { "/" } ?: "/") +
                         (if (uri.rawQuery != null) "?${uri.rawQuery}" else "")
 
@@ -109,34 +165,37 @@ class LocalHttpProxyServer(
                         rOut.write(rebuilt.toString().toByteArray(Charsets.US_ASCII))
                         rOut.flush()
 
-                        val upThread = Thread {
-                            copyStream(cIn, rOut, paced = false)
-                        }.apply { isDaemon = true; start() }
-
-                        copyStream(r.getInputStream(), cOut, paced = true)
-                        runCatching { upThread.join(500) }
+                        val upFuture = executor.submit {
+                            copyStream(cIn, rOut, paced = false, useMediaBucket = false)
+                        }
+                        copyStream(r.getInputStream(), cOut, paced = true, useMediaBucket = useMediaBucket)
+                        upFuture.cancel(true)
                     }
                 }
             }
         }
     }
 
-    private fun copyStream(input: InputStream, output: OutputStream, paced: Boolean) {
+    private fun copyStream(input: InputStream, output: OutputStream, paced: Boolean, useMediaBucket: Boolean) {
         val buf = ByteArray(16384)
         while (running) {
             var maxRead = buf.size
-            if (paced && !tokenBucket.isUnlimited()) {
-                var avail = tokenBucket.availableBytes()
+            val bucket = if (useMediaBucket && !mediaTokenBucket.isUnlimited()) mediaTokenBucket else tokenBucket
+            if (paced && !bucket.isUnlimited()) {
+                var avail = bucket.availableBytes()
                 while (avail < 256 && running) {
-                    Thread.sleep(10L)
-                    avail = tokenBucket.availableBytes()
+                    Thread.sleep(bucket.millisUntilBytes(256))
+                    avail = bucket.availableBytes()
                 }
                 if (!running) break
                 maxRead = avail.coerceIn(256, buf.size)
             }
             val read = runCatching { input.read(buf, 0, maxRead) }.getOrElse { -1 }
             if (read <= 0) break
-            if (paced) tokenBucket.consume(read)
+            if (paced) {
+                tokenBucket.consume(read)
+                if (useMediaBucket) mediaTokenBucket.consume(read)
+            }
             runCatching {
                 output.write(buf, 0, read)
                 output.flush()

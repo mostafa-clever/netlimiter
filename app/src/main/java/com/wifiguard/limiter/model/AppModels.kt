@@ -23,6 +23,7 @@ enum class ConnectionState {
     GRACE_EXTRA,
     IDLE_FROZEN,
     OUTSIDE_TARGET_WIFI,
+    PAUSED,
     BLOCKED,
     PROTECTION_OFF
 }
@@ -57,7 +58,10 @@ data class SpeedPolicyConfig(
     val nightSaverEnabled: Boolean = false,
     val nightSaverSpeedMbPerSec: Double = 0.5,
     val upstreamDnsIp: String = "94.140.14.14",
-    val appQuotaPercents: Map<String, Int> = emptyMap()
+    val appQuotaPercents: Map<String, Int> = emptyMap(),
+    val mediaCdnSaverEnabled: Boolean = true,
+    val mediaCdnSpeedMbps: Double = 1.2,
+    val blockAppUpdatesInSaver: Boolean = true
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("baseSpeedLimitMbPerSec", baseSpeedLimitMbPerSec)
@@ -85,6 +89,9 @@ data class SpeedPolicyConfig(
         put("nightSaverSpeedMbPerSec", nightSaverSpeedMbPerSec)
         put("upstreamDnsIp", upstreamDnsIp)
         put("appQuotaPercents", JSONObject(appQuotaPercents.mapValues { it.value }))
+        put("mediaCdnSaverEnabled", mediaCdnSaverEnabled)
+        put("mediaCdnSpeedMbps", mediaCdnSpeedMbps)
+        put("blockAppUpdatesInSaver", blockAppUpdatesInSaver)
     }
 
     companion object {
@@ -115,7 +122,10 @@ data class SpeedPolicyConfig(
                 nightSaverEnabled = obj.optBoolean("nightSaverEnabled", false),
                 nightSaverSpeedMbPerSec = obj.optDouble("nightSaverSpeedMbPerSec", 0.5).coerceAtLeast(0.1),
                 upstreamDnsIp = obj.optString("upstreamDnsIp", "94.140.14.14").ifBlank { "94.140.14.14" },
-                appQuotaPercents = parseAppQuotaMap(obj.optJSONObject("appQuotaPercents"))
+                appQuotaPercents = parseAppQuotaMap(obj.optJSONObject("appQuotaPercents")),
+                mediaCdnSaverEnabled = obj.optBoolean("mediaCdnSaverEnabled", true),
+                mediaCdnSpeedMbps = obj.optDouble("mediaCdnSpeedMbps", 1.2).coerceAtLeast(0.25),
+                blockAppUpdatesInSaver = obj.optBoolean("blockAppUpdatesInSaver", true)
             )
         }
 
@@ -365,6 +375,7 @@ data class ManagedDevice(
     val lastSeenMillis: Long = 0L,
     val isOnline: Boolean = false,
     val pendingConfigPush: Boolean = false,
+    val isPaused: Boolean = false,
     val tamperWarning: String? = null
 ) {
     val usagePercent: Int
@@ -398,6 +409,7 @@ data class ManagedDevice(
         put("lastSeenMillis", lastSeenMillis)
         put("isOnline", isOnline)
         put("pendingConfigPush", pendingConfigPush)
+        put("isPaused", isPaused)
         put("tamperWarning", tamperWarning ?: JSONObject.NULL)
     }
 
@@ -449,6 +461,7 @@ data class ManagedDevice(
                 lastSeenMillis = obj.optLong("lastSeenMillis", 0L),
                 isOnline = obj.optBoolean("isOnline", false),
                 pendingConfigPush = obj.optBoolean("pendingConfigPush", false),
+                isPaused = obj.optBoolean("isPaused", false),
                 tamperWarning = warning
             )
         }

@@ -272,6 +272,7 @@ class SupervisorServerService : Service() {
             put("forceQuotaSaver", forceAll || device.forceQuotaSaver)
             put("targetNetworkOnly", targetOnly)
             put("targetNetworkSig", targetSig)
+            put("isPaused", device.isPaused)
         }
     }
 
@@ -339,6 +340,7 @@ class SupervisorServerService : Service() {
             put("forceQuotaSaver", forceAll || updated.forceQuotaSaver)
             put("targetNetworkOnly", targetOnly)
             put("targetNetworkSig", targetSig)
+            put("isPaused", updated.isPaused)
         }
     }
 
@@ -386,7 +388,8 @@ class SupervisorServerService : Service() {
                 globalSpeedCapMbps = globalCap,
                 forceQuotaSaver = forceAll || d.forceQuotaSaver,
                 targetNetworkOnly = targetOnly,
-                targetNetworkSig = targetSig
+                targetNetworkSig = targetSig,
+                isPaused = d.isPaused
             )
             if (ok) {
                 prefs.upsertManagedDevice(d.copy(pendingConfigPush = false))
@@ -460,23 +463,32 @@ class SupervisorServerService : Service() {
                         }
                     }
 
-                    // Layer 1 Anti-Cheat: Device is physically active on Wi-Fi (same MAC or IP) while offline or VPN off!
+                    // Multi-layer Anti-Cheat (works on Android 11-15):
+                    // 1. MAC match in ARP/neigh table
+                    // 2. Active ICMP + TCP RST (ConnectException) probe on lastKnownIp
                     val presentByMac = cur.macAddress.isNotBlank() && refreshedMacs.contains(cur.macAddress.lowercase())
-                    val presentByIp = cur.lastKnownIp.isNotBlank() && refreshedIps.contains(cur.lastKnownIp)
-                    val presentOnWifi = presentByMac || presentByIp
+                    val presentByArpIp = cur.lastKnownIp.isNotBlank() && refreshedIps.contains(cur.lastKnownIp)
+                    val presentByProbe = if ((heartbeatTimedOut || !cur.isOnline || !cur.protectionActive) && cur.lastKnownIp.isNotBlank()) {
+                        NetworkScanner.isHostAliveOnLan(cur.lastKnownIp)
+                    } else false
+                    val presentOnWifi = presentByMac || presentByArpIp || presentByProbe
 
                     if (presentOnWifi && (!cur.isOnline || !cur.protectionActive)) {
                         if (!alertedMacCheatDevices.contains(cur.deviceId)) {
                             alertedMacCheatDevices.add(cur.deviceId)
                             val idTag = if (cur.macAddress.isNotBlank()) "MAC: ${cur.macAddress}" else "IP: ${cur.lastKnownIp}"
-                            val msg = "تحايل مؤكد: جهاز ${cur.deviceName} متصل بالواي فاي حالياً ($idTag) بدون حماية أو حذف التطبيق!"
+                            val msg = if (alertedOfflineDevices.contains(cur.deviceId)) {
+                                "تحايل مؤكد: عاد جهاز ${cur.deviceName} للاتصال بالواي فاي ($idTag) بعد إيقاف التطبيق أو حذفه!"
+                            } else {
+                                "تحايل مؤكد: جهاز ${cur.deviceName} متصل بالواي فاي حالياً ($idTag) مع إيقاف الحماية أو إغلاق التطبيق قسرياً!"
+                            }
                             recordAndNotifyTamper(cur.deviceId, cur.deviceName, msg)
                             cur = cur.copy(tamperWarning = msg)
                             changed = true
                         }
                     } else if (heartbeatTimedOut && !presentOnWifi && !alertedOfflineDevices.contains(cur.deviceId)) {
                         alertedOfflineDevices.add(cur.deviceId)
-                        val msg = "جهاز ${cur.deviceName} غادر شبكة الواي فاي حالياً (غير متصل بالشبكة)"
+                        val msg = "جهاز ${cur.deviceName} غادر شبكة الواي فاي حالياً (سيتم تنبيهك فوراً إذا عاد بدون حماية)"
                         recordAndNotifyTamper(cur.deviceId, cur.deviceName, msg)
                         cur = cur.copy(tamperWarning = msg)
                         changed = true

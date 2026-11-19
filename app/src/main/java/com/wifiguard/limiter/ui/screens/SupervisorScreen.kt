@@ -34,7 +34,15 @@ import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.HourglassBottom
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.BatteryChargingFull
+import androidx.compose.material.icons.rounded.PauseCircle
 import androidx.compose.material.icons.rounded.Person
+import androidx.compose.material.icons.rounded.PlayCircle
+import android.content.Intent
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
+import androidx.compose.material.icons.rounded.HelpOutline
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Shield
@@ -79,12 +87,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.wifiguard.limiter.BuildConfig
 import com.wifiguard.limiter.admin.WifiGuardDeviceAdminReceiver
 import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.AppRole
@@ -99,6 +113,8 @@ import com.wifiguard.limiter.network.NetworkScanner
 import com.wifiguard.limiter.network.LocalLanClient
 import com.wifiguard.limiter.network.SupervisorServerService
 import com.wifiguard.limiter.update.GitHubUpdater
+import com.wifiguard.limiter.ui.components.GuideType
+import com.wifiguard.limiter.ui.components.SetupGuideDialog
 import com.wifiguard.limiter.ui.components.UsageRingCard
 import com.wifiguard.limiter.ui.components.AppQuotaPercentsDialog
 import com.wifiguard.limiter.ui.components.WhitelistPickerDialog
@@ -158,6 +174,7 @@ fun SupervisorScreen(
     var showSelfWhitelistDialog by remember { mutableStateOf(false) }
     var showSelfLimitDialog by remember { mutableStateOf(false) }
     var pinGateAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var showSupervisorGuide by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         prefs.getOrCreatePairingCode()
@@ -169,7 +186,7 @@ fun SupervisorScreen(
                 title = {
                     Text(
                         when (selectedTab) {
-                            0 -> "حارس الواي فاي — المشرف"
+                            0 -> "No Quota — المشرف"
                             1 -> "حدي الشخصي"
                             2 -> "التحليلات والتوفير"
                             else -> "الإعدادات المتقدمة"
@@ -179,6 +196,9 @@ fun SupervisorScreen(
                     )
                 },
                 actions = {
+                    IconButton(onClick = { showSupervisorGuide = true }) {
+                        Icon(Icons.Rounded.HelpOutline, contentDescription = "دليل المشرف", tint = Color.White)
+                    }
                     if (selectedTab == 0 && devices.isNotEmpty()) {
                         IconButton(onClick = {
                             scope.launch {
@@ -271,6 +291,25 @@ fun SupervisorScreen(
                     onToggleForceQuotaSaverAll = { forced -> scope.launch { prefs.setForceQuotaSaverAll(forced) } },
                     onClearAlerts = { scope.launch { prefs.clearTamperAlerts() } },
                     onEditDevice = { editingDevice = it },
+                    onTogglePauseDevice = { dev ->
+                        val toggled = dev.copy(isPaused = !dev.isPaused)
+                        scope.launch {
+                            prefs.upsertManagedDevice(toggled)
+                            val ok = LocalLanClient.pushConfigToClient(
+                                clientIp = toggled.lastKnownIp,
+                                dailyLimitMb = toggled.dailyLimitMb,
+                                limitPeriod = toggled.limitPeriod,
+                                speedPolicy = toggled.speedPolicy,
+                                whitelistedPackages = toggled.whitelistedPackages,
+                                globalSpeedCapMbps = globalSpeedCapMbps,
+                                forceQuotaSaver = forceQuotaSaverAll || toggled.forceQuotaSaver,
+                                targetNetworkOnly = targetNetworkOnly,
+                                targetNetworkSig = targetNetworkSig,
+                                isPaused = toggled.isPaused
+                            )
+                            if (!ok) prefs.upsertManagedDevice(toggled.copy(pendingConfigPush = true))
+                        }
+                    },
                     onQuickGlobalCapChange = { cap ->
                         scope.launch {
                             prefs.setGlobalSpeedCapMbps(cap)
@@ -306,7 +345,7 @@ fun SupervisorScreen(
                         val action = {
                             scope.launch {
                                 prefs.setSelfLimitEnabled(enable)
-                                if (enable) onRequestStartVpn() else onStopVpn()
+                                if (!enable) onStopVpn()
                             }
                         }
                         if (!enable && supervisorPin.isNotBlank()) {
@@ -442,6 +481,13 @@ fun SupervisorScreen(
         )
     }
 
+    if (showSupervisorGuide) {
+        SetupGuideDialog(
+            guideType = GuideType.SUPERVISOR_GUIDE,
+            onDismiss = { showSupervisorGuide = false }
+        )
+    }
+
     pinGateAction?.let { action ->
         PinCheckDialog(
             expectedPin = supervisorPin,
@@ -466,6 +512,7 @@ private fun DevicesTab(
     onToggleForceQuotaSaverAll: (Boolean) -> Unit,
     onClearAlerts: () -> Unit,
     onEditDevice: (ManagedDevice) -> Unit,
+    onTogglePauseDevice: (ManagedDevice) -> Unit,
     onQuickGlobalCapChange: (Double) -> Unit
 ) {
     if (alerts.isNotEmpty()) {
@@ -504,6 +551,39 @@ private fun DevicesTab(
                         modifier = Modifier.padding(vertical = 2.dp)
                     )
                 }
+            }
+        }
+    }
+
+    val supCtx = LocalContext.current
+    val supPm = remember { supCtx.getSystemService(android.content.Context.POWER_SERVICE) as PowerManager }
+    var supBatteryExempt by remember { mutableStateOf(supPm.isIgnoringBatteryOptimizations(supCtx.packageName)) }
+    if (!supBatteryExempt) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = SoftMint)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Rounded.BatteryChargingFull, contentDescription = null, tint = PrimaryTeal)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("استثنِ المشرف من توفير البطارية لضمان استقرار الاتصال", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+                TextButton(onClick = {
+                    runCatching {
+                        val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                            data = Uri.parse("package:${supCtx.packageName}")
+                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                        }
+                        supCtx.startActivity(i)
+                        supBatteryExempt = true
+                    }
+                }) { Text("تفعيل") }
             }
         }
     }
@@ -628,17 +708,17 @@ private fun DevicesTab(
         }
     } else {
         devices.forEach { device ->
-            DeviceMonitorCard(device = device, onClick = { onEditDevice(device) })
+            DeviceMonitorCard(device = device, onClick = { onEditDevice(device) }, onTogglePause = { onTogglePauseDevice(device) })
         }
     }
 }
 
 @Composable
-private fun DeviceMonitorCard(device: ManagedDevice, onClick: () -> Unit) {
+private fun DeviceMonitorCard(device: ManagedDevice, onClick: () -> Unit, onTogglePause: () -> Unit) {
     val progress = (device.usagePercent / 100f).coerceIn(0f, 1f)
     val barColor = when {
         !device.isOnline || !device.protectionActive -> AlertRed
-        device.connectionState == ConnectionState.BLOCKED -> AlertRed
+        device.isPaused || device.connectionState == ConnectionState.BLOCKED || device.connectionState == ConnectionState.PAUSED -> AlertRed
         device.connectionState == ConnectionState.SLOWED || device.connectionState == ConnectionState.GRACE_EXTRA -> WarnAmber
         else -> PrimaryTeal
     }
@@ -671,7 +751,18 @@ private fun DeviceMonitorCard(device: ManagedDevice, onClick: () -> Unit) {
                         fontSize = 16.sp
                     )
                 }
-                Icon(Icons.Rounded.Edit, contentDescription = "تعديل", tint = TextMuted, modifier = Modifier.size(18.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onTogglePause, modifier = Modifier.size(34.dp)) {
+                        Icon(
+                            imageVector = if (device.isPaused) Icons.Rounded.PlayCircle else Icons.Rounded.PauseCircle,
+                            contentDescription = if (device.isPaused) "استئناف الإنترنت" else "إيقاف مؤقت",
+                            tint = if (device.isPaused) SuccessGreen else AlertRed,
+                            modifier = Modifier.size(26.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Icon(Icons.Rounded.Edit, contentDescription = "تعديل", tint = TextMuted, modifier = Modifier.size(18.dp))
+                }
             }
 
             Spacer(modifier = Modifier.height(8.dp))
@@ -699,6 +790,7 @@ private fun DeviceMonitorCard(device: ManagedDevice, onClick: () -> Unit) {
                     text = when {
                         !device.isOnline -> "غير متصل"
                         !device.protectionActive -> "الحماية متوقفة!"
+                        device.isPaused || device.connectionState == ConnectionState.PAUSED -> "موقوف مؤقتاً بواسطة المشرف"
                         device.connectionState == ConnectionState.BLOCKED -> "موقوف (انتهى الحد)"
                         device.connectionState == ConnectionState.IDLE_FROZEN -> "تجميد الخلفية"
                         device.connectionState == ConnectionState.GRACE_EXTRA -> "رصيد إضافي"
@@ -1028,12 +1120,34 @@ private fun AdvancedSettingsTab(
                     }
                 )
             }
+            if (targetNetworkSig.isNotBlank()) {
+                Text(
+                    text = "الشبكة المقفولة حالياً: ${NetworkScanner.formatSignatureForDisplay(targetNetworkSig)}",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = PrimaryTeal
+                )
+            }
             val btnNetScope = rememberCoroutineScope()
+            var showLocationRationale by remember { mutableStateOf(false) }
+            val locationLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.RequestPermission()
+            ) { granted ->
+                btnNetScope.launch {
+                    val sig = NetworkScanner.getCurrentWifiSignatureActive(ctx)
+                    if (sig.isNotBlank()) onSetTargetNetwork(true, sig)
+                }
+            }
             OutlinedButton(
                 onClick = {
-                    btnNetScope.launch {
-                        val sig = NetworkScanner.getCurrentWifiSignatureActive(ctx)
-                        if (sig.isNotBlank()) onSetTargetNetwork(true, sig)
+                    val hasLoc = ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                    if (!hasLoc) {
+                        showLocationRationale = true
+                    } else {
+                        btnNetScope.launch {
+                            val sig = NetworkScanner.getCurrentWifiSignatureActive(ctx)
+                            if (sig.isNotBlank()) onSetTargetNetwork(true, sig)
+                        }
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
@@ -1045,17 +1159,37 @@ private fun AdvancedSettingsTab(
                     fontSize = 12.sp
                 )
             }
+            if (showLocationRationale) {
+                AlertDialog(
+                    onDismissRequest = { showLocationRationale = false },
+                    title = { Text("لماذا نحتاج إذن الموقع؟", fontWeight = FontWeight.Bold) },
+                    text = {
+                        Text(
+                            "يشترط نظام أندرويد إذن الموقع فقط لقراءة اسم وبصمة راوتر الواي فاي (BSSID) لتمييز شبكتك عن أي شبكة أخرى. التطبيق لا يتتبع موقعك أبداً."
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            showLocationRationale = false
+                            locationLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+                        }) { Text("موافق، منح الإذن") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showLocationRationale = false }) { Text("إلغاء") }
+                    }
+                )
+            }
         }
     }
 
-    // Section 4.8: Auto-Update from GitHub Releases
+    // Section 4.8: Auto-Update from GitHub Releases (GitHub flavor only)
+    if (BuildConfig.ENABLE_GITHUB_UPDATER) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         val updateScope = rememberCoroutineScope()
-        var repoInput by remember(githubRepo) { mutableStateOf(githubRepo) }
         var updateMsg by remember { mutableStateOf<String?>(null) }
         var isChecking by remember { mutableStateOf(false) }
 
@@ -1063,25 +1197,22 @@ private fun AdvancedSettingsTab(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Rounded.SystemUpdate, contentDescription = null, tint = PrimaryTeal)
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("التحديث التلقائي من GitHub", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                Text("تحديثات التطبيق", fontWeight = FontWeight.Bold, fontSize = 14.sp)
             }
-            OutlinedTextField(
-                value = repoInput,
-                onValueChange = { repoInput = it },
-                label = { Text("مستودع GitHub (مثال: user/netlimiter)") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
+            Text(
+                "الإصدار الحالي: 1.0.${GitHubUpdater.getInstalledVersionCode(ctx)}",
+                fontSize = 12.sp,
+                color = TextMuted
             )
             if (updateMsg != null) {
                 Text(updateMsg!!, fontSize = 12.sp, color = PrimaryTeal, fontWeight = FontWeight.Medium)
             }
             Button(
                 onClick = {
-                    onSaveGithubRepo(repoInput)
                     isChecking = true
                     updateMsg = "جاري التحقق من آخر إصدار..."
                     updateScope.launch {
-                        val res = GitHubUpdater.checkLatestRelease(ctx, repoInput)
+                        val res = GitHubUpdater.checkLatestRelease(ctx, GitHubUpdater.DEFAULT_REPO)
                         res.onSuccess { info ->
                             if (!info.hasUpdate) {
                                 updateMsg = "لديك أحدث إصدار بالفعل (1.0.${info.localBuildNumber})"
@@ -1100,13 +1231,15 @@ private fun AdvancedSettingsTab(
                         isChecking = false
                     }
                 },
-                enabled = !isChecking && repoInput.contains("/"),
+                enabled = !isChecking,
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp)
             ) {
-                Text(if (isChecking) "جاري التحقق..." else "تحقق وحمّل آخر تحديث APK")
+                Text(if (isChecking) "جاري التحقق..." else "التحقق من التحديثات")
             }
         }
+    }
+
     }
 
     // Section 5: Security & Role
@@ -1324,6 +1457,7 @@ private fun SmartAutomationControls(
     HorizontalDivider()
     Text("تخصيص مكونات وضع التوفير:", fontWeight = FontWeight.Bold, fontSize = 13.sp)
 
+    if (BuildConfig.ENABLE_DNS_ADBLOCK) {
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Checkbox(
             checked = policy.dnsSinkholeEnabled,
@@ -1351,12 +1485,53 @@ private fun SmartAutomationControls(
         Text("منع التطبيقات من تجاوز حجب الإعلانات", fontSize = 12.sp)
     }
 
+    }
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Checkbox(
             checked = policy.blockQuicUdp443Enabled,
             onCheckedChange = { onChange(policy.copy(blockQuicUdp443Enabled = it)) }
         )
         Text("تحسين تقليل جودة الفيديو التلقائي (360p/480p)", fontSize = 12.sp)
+    }
+
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Checkbox(
+            checked = policy.mediaCdnSaverEnabled,
+            onCheckedChange = { onChange(policy.copy(mediaCdnSaverEnabled = it)) }
+        )
+        Column {
+            Text("توفير ذكي للفيديو والريلز (360p/480p تلقائياً)", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text("يخفض سرعة خوادم الفيديو فقط مع إبقاء التصفح والمحادثات سريعة", fontSize = 11.sp, color = TextMuted)
+        }
+    }
+    if (policy.mediaCdnSaverEnabled) {
+        var mediaSpeedText by remember(policy.mediaCdnSpeedMbps) {
+            mutableStateOf(policy.mediaCdnSpeedMbps.toString())
+        }
+        OutlinedTextField(
+            value = mediaSpeedText,
+            onValueChange = { txt ->
+                mediaSpeedText = txt
+                txt.toDoubleOrNull()?.let { v ->
+                    if (v >= 0.25) onChange(policy.copy(mediaCdnSpeedMbps = v))
+                }
+            },
+            label = { Text("سرعة خوادم الفيديو والريلز (ميجابت/ث)") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Checkbox(
+            checked = policy.blockAppUpdatesInSaver,
+            onCheckedChange = { onChange(policy.copy(blockAppUpdatesInSaver = it)) }
+        )
+        Column {
+            Text("منع التحديثات الصامتة للتطبيقات أثناء التوفير", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text("يمنع تحميل تحديثات المتجر والنظام الضخمة في الخلفية", fontSize = 11.sp, color = TextMuted)
+        }
     }
 
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -1410,6 +1585,7 @@ private fun SmartAutomationControls(
         Text("تخفيف ساعات الذروة (6م – 12ص ← ${policy.peakHoursSpeedMbPerSec} ميجابت/ث)", fontSize = 12.sp)
     }
 
+    if (BuildConfig.ENABLE_DNS_ADBLOCK) {
     HorizontalDivider()
     Text("مزود تصفية الإعلانات (DNS):", fontWeight = FontWeight.Bold, fontSize = 13.sp)
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1438,6 +1614,8 @@ private fun SmartAutomationControls(
         singleLine = true,
         modifier = Modifier.fillMaxWidth()
     )
+
+    }
 
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Checkbox(
