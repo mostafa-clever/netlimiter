@@ -439,7 +439,7 @@ data class ManagedDevice(
             val period = runCatching { LimitPeriod.valueOf(periodStr) }.getOrDefault(LimitPeriod.DAILY)
             val stateStr = obj.optString("connectionState", ConnectionState.SMART_SAVING.name)
             val state = runCatching { ConnectionState.valueOf(stateStr) }.getOrDefault(ConnectionState.SMART_SAVING)
-            val warning = if (obj.isNull("tamperWarning")) null else obj.optString("tamperWarning", null)
+            val warning = if (obj.isNull("tamperWarning")) null else obj.optString("tamperWarning", "").ifBlank { null }
             return ManagedDevice(
                 deviceId = obj.optString("deviceId", ""),
                 deviceName = obj.optString("deviceName", "جهاز غير معروف"),

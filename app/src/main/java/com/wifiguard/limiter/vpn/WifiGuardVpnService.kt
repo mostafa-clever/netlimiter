@@ -437,9 +437,9 @@ class WifiGuardVpnService : VpnService() {
                             dnsHandler.handlePacket(
                                 packet = pktCopy,
                                 length = len,
-                                sinkholeEnabled = policy?.dnsSinkholeEnabled ?: true,
-                                cacheEnabled = policy?.dnsCacheEnabled ?: true,
-                                blockDohDot = policy?.blockDohDotEnabled ?: false,
+                                sinkholeEnabled = policy.dnsSinkholeEnabled,
+                                cacheEnabled = policy.dnsCacheEnabled,
+                                blockDohDot = policy.blockDohDotEnabled,
                                 blockQuicUdp443 = false
                             )
                         }.getOrNull()
