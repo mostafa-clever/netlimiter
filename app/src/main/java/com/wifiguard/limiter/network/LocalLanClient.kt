@@ -231,10 +231,11 @@ object LocalLanClient {
         }
     }
 
-    suspend fun fetchClientStatus(clientIp: String): JSONObject? = withContext(Dispatchers.IO) {
+    suspend fun fetchClientStatus(clientIp: String, fullAnalytics: Boolean = false): JSONObject? = withContext(Dispatchers.IO) {
         if (clientIp.isBlank()) return@withContext null
         runCatching {
-            val url = URL("http://$clientIp:$CLIENT_PORT/status")
+            val query = if (fullAnalytics) "?full=1" else ""
+            val url = URL("http://$clientIp:$CLIENT_PORT/status$query")
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 connectTimeout = 3000

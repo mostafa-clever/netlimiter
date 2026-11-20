@@ -187,6 +187,39 @@ fun SupervisorScreen(
         prefs.getOrCreatePairingCode()
     }
 
+    // On-demand per-app analytics pull whenever Supervisor opens the Analytics tab
+    LaunchedEffect(selectedTab) {
+        if (selectedTab == 2) {
+            val now = System.currentTimeMillis()
+            val todayKey = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+            devices.forEach { d ->
+                if (d.lastKnownIp.isNotBlank()) {
+                    val live = LocalLanClient.fetchClientStatus(d.lastKnownIp, fullAnalytics = true)
+                    if (live != null && live.optBoolean("ok", false)) {
+                        val newUsed = live.optLong("usedMb", d.usedMb)
+                        val newSaved = live.optLong("savedMbToday", d.savedMbToday)
+                        val appObj = live.optJSONObject("appUsageMb")
+                        val liveApps = mutableMapOf<String, Long>()
+                        appObj?.keys()?.forEach { k -> liveApps[k] = appObj.optLong(k, 0L) }
+                        val uHist = d.dailyUsageHistory.toMutableMap().apply { put(todayKey, newUsed) }
+                        val sHist = d.dailySavedHistory.toMutableMap().apply { put(todayKey, newSaved) }
+                        prefs.upsertManagedDevice(
+                            d.copy(
+                                usedMb = newUsed,
+                                savedMbToday = newSaved,
+                                appUsageMb = if (liveApps.isNotEmpty()) liveApps else d.appUsageMb,
+                                dailyUsageHistory = uHist,
+                                dailySavedHistory = sHist,
+                                lastSeenMillis = now,
+                                isOnline = true
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(

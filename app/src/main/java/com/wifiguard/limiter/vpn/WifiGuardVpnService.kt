@@ -34,7 +34,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -67,6 +69,9 @@ class WifiGuardVpnService : VpnService() {
     private var pendingSavedBytes: Long = 0L
     private var lastFlushMs: Long = 0L
     private var lastAppStatsQueryMs: Long = 0L
+    private var lastFullAnalyticsQueryMs: Long = 0L
+    private var lastWifiSigCheckMs: Long = 0L
+    private var cachedWifiSig: String = ""
     private var cachedAppUsedMbMap: Map<String, Long> = emptyMap()
     private var lastNotifTitle: String = ""
     private var lastNotifText: String = ""
@@ -97,6 +102,11 @@ class WifiGuardVpnService : VpnService() {
 
         private val _liveSpeedMbps = MutableStateFlow(0.0)
         val liveSpeedMbps: StateFlow<Double> = _liveSpeedMbps
+
+        private val wakeSignal = Channel<Unit>(Channel.CONFLATED)
+        fun notifyConfigChanged() {
+            wakeSignal.trySend(Unit)
+        }
 
         fun start(context: Context) {
             runCatching {
@@ -246,18 +256,18 @@ class WifiGuardVpnService : VpnService() {
                     dnsHandler.upstreamDnsIp = cfg.speedPolicy.upstreamDnsIp
                     val onWifi = isOnWifi()
 
-                    val currentWifiSig = if (onWifi) {
-                        NetworkScanner.getCurrentWifiSignature(applicationContext)
-                            .ifBlank { NetworkScanner.getCurrentWifiSignatureActive(applicationContext) }
-                    } else ""
-
+                    val loopNowMs = System.currentTimeMillis()
                     val isClientOnHomeLan = ClientGuardService.isSupervisorReachable
-                    val outsideTargetWifi = cfg.targetNetworkOnly &&
-                        cfg.targetNetworkSig.isNotBlank() &&
-                        onWifi &&
-                        !isClientOnHomeLan &&
-                        currentWifiSig.isNotBlank() &&
-                        !NetworkScanner.matchesNetworkSignature(currentWifiSig, cfg.targetNetworkSig)
+                    val outsideTargetWifi = if (cfg.targetNetworkOnly && cfg.targetNetworkSig.isNotBlank() && onWifi && !isClientOnHomeLan) {
+                        if (loopNowMs - lastWifiSigCheckMs >= 30_000L || cachedWifiSig.isBlank()) {
+                            lastWifiSigCheckMs = loopNowMs
+                            cachedWifiSig = NetworkScanner.getCurrentWifiSignature(applicationContext)
+                                .ifBlank { NetworkScanner.getCurrentWifiSignatureActive(applicationContext) }
+                        }
+                        cachedWifiSig.isNotBlank() && !NetworkScanner.matchesNetworkSignature(cachedWifiSig, cfg.targetNetworkSig)
+                    } else {
+                        false
+                    }
 
                     if (cfg.isPaused) {
                         _connectionState.value = ConnectionState.PAUSED
@@ -290,7 +300,7 @@ class WifiGuardVpnService : VpnService() {
                                 if (delta < 100L * 1024L * 1024L) {
                                     intervalBytes = delta
                                     pendingUsedBytes += delta
-                                    val secs = if (powerManager.isInteractive) 1.0 else 5.0
+                                    val secs = if (powerManager.isInteractive) 30.0 else 60.0
                                     _liveSpeedMbps.value = (delta / 125_000.0) / secs
                                 }
                             }
@@ -301,7 +311,7 @@ class WifiGuardVpnService : VpnService() {
                         }
 
                         if (!powerManager.isInteractive) {
-                            screenOffSeconds += 5
+                            screenOffSeconds += 60
                         } else {
                             screenOffSeconds = 0
                         }
@@ -356,15 +366,27 @@ class WifiGuardVpnService : VpnService() {
                             lastFlushMs = nowMs
                         }
 
-                        // Accurate Per-App Wi-Fi Usage via NetworkStatsManager (works on Android 8-15!)
+                        // Battery-efficient Per-App Wi-Fi Usage via NetworkStatsManager:
+                        // - Only run while screen is ON
+                        // - Query capped apps every 30s; full analytics scan of all apps only once every 5 minutes!
                         val appQuotas = cfg.speedPolicy.appQuotaPercents
-                        if (onWifi && (nowMs - lastAppStatsQueryMs >= 10_000L || lastAppStatsQueryMs == 0L)) {
-                            lastAppStatsQueryMs = nowMs
-                            val allPkgs = (appQuotas.keys + com.wifiguard.limiter.model.getInstalledLaunchableApps(applicationContext).map { it.packageName }).toSet()
-                            val queried = AppUsageStatsHelper.getWifiUsageMbByPackage(applicationContext, allPkgs, cfg.limitPeriod)
-                            if (queried.isNotEmpty()) {
-                                cachedAppUsedMbMap = queried
-                                prefs.setAppUsedMbMap(queried, cfg.limitPeriod)
+                        if (onWifi && powerManager.isInteractive) {
+                            if (nowMs - lastFullAnalyticsQueryMs >= 3_600_000L || lastFullAnalyticsQueryMs == 0L) {
+                                lastFullAnalyticsQueryMs = nowMs
+                                lastAppStatsQueryMs = nowMs
+                                val allPkgs = (appQuotas.keys + com.wifiguard.limiter.model.getInstalledLaunchableApps(applicationContext).map { it.packageName }).toSet()
+                                val queried = AppUsageStatsHelper.getWifiUsageMbByPackage(applicationContext, allPkgs, cfg.limitPeriod)
+                                if (queried.isNotEmpty()) {
+                                    cachedAppUsedMbMap = queried
+                                    prefs.setAppUsedMbMap(queried, cfg.limitPeriod)
+                                }
+                            } else if (appQuotas.isNotEmpty() && nowMs - lastAppStatsQueryMs >= 30_000L) {
+                                lastAppStatsQueryMs = nowMs
+                                val queried = AppUsageStatsHelper.getWifiUsageMbByPackage(applicationContext, appQuotas.keys, cfg.limitPeriod)
+                                if (queried.isNotEmpty()) {
+                                    cachedAppUsedMbMap = cachedAppUsedMbMap + queried
+                                    prefs.setAppUsedMbMap(cachedAppUsedMbMap, cfg.limitPeriod)
+                                }
                             }
                         }
                         val overQuotaApps = appQuotas.filter { (pkg, pct) ->
@@ -404,7 +426,7 @@ class WifiGuardVpnService : VpnService() {
                     }
                 }
 
-                delay(if (powerManager.isInteractive) 1000L else 5000L)
+                withTimeoutOrNull(if (powerManager.isInteractive) 30_000L else 60_000L) { wakeSignal.receive() }
             }
         }
     }

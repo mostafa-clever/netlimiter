@@ -243,16 +243,23 @@ class SupervisorServerService : Service() {
             macAddress = mac.ifBlank { existing.macAddress },
             lastSeenMillis = System.currentTimeMillis(),
             isOnline = true
-        ) ?: ManagedDevice(
-            deviceId = deviceId,
-            deviceName = deviceName,
-            dailyLimitMb = 1024L,
-            installedApps = parsedApps,
-            lastKnownIp = remoteIp,
-            macAddress = mac,
-            lastSeenMillis = System.currentTimeMillis(),
-            isOnline = true
-        )
+        ) ?: run {
+            val defaultPolicy = prefs.speedPolicyFlow.first().copy(appQuotaPercents = emptyMap())
+            val defaultPeriod = prefs.limitPeriodFlow.first()
+            val defaultLimitMb = prefs.dailyLimitMbFlow.first().coerceAtLeast(100L)
+            ManagedDevice(
+                deviceId = deviceId,
+                deviceName = deviceName,
+                limitPeriod = defaultPeriod,
+                dailyLimitMb = defaultLimitMb,
+                speedPolicy = defaultPolicy,
+                installedApps = parsedApps,
+                lastKnownIp = remoteIp,
+                macAddress = mac,
+                lastSeenMillis = System.currentTimeMillis(),
+                isOnline = true
+            )
+        }
         prefs.upsertManagedDevice(device)
         alertedOfflineDevices.remove(deviceId)
         alertedMacCheatDevices.remove(deviceId)

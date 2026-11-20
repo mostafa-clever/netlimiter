@@ -18,6 +18,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.wifiguard.limiter.MainActivity
 import com.wifiguard.limiter.admin.WifiGuardDeviceAdminReceiver
+import com.wifiguard.limiter.data.AppUsageStatsHelper
 import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.AppRole
 import com.wifiguard.limiter.model.ConnectionState
@@ -182,6 +183,7 @@ class ClientGuardService : Service() {
                         targetNetworkSig = obj.optString("targetNetworkSig", ""),
                         isPaused = obj.optBoolean("isPaused", false)
                     )
+                    WifiGuardVpnService.notifyConfigChanged()
                     JSONObject().put("ok", true)
                 } else {
                     val vpnUp = WifiGuardVpnService.isRunning.value
@@ -191,7 +193,16 @@ class ClientGuardService : Service() {
                         put("savedMbToday", prefs.getSavedMbToday())
                         put("actualSpeedMbps", WifiGuardVpnService.liveSpeedMbps.value)
                         val curPeriod = prefs.limitPeriodFlow.first()
-                        val appMap = prefs.getAppUsedMbMap(curPeriod)
+                        val appMap = if (path.contains("full=1")) {
+                            val allPkgs = getInstalledLaunchableApps(applicationContext).map { it.packageName }
+                            val fresh = AppUsageStatsHelper.getWifiUsageMbByPackage(applicationContext, allPkgs, curPeriod)
+                            if (fresh.isNotEmpty()) {
+                                prefs.setAppUsedMbMap(fresh, curPeriod)
+                                fresh
+                            } else prefs.getAppUsedMbMap(curPeriod)
+                        } else {
+                            prefs.getAppUsedMbMap(curPeriod)
+                        }
                         put("appUsageMb", JSONObject(appMap.mapValues { it.value }))
                         put("protectionActive", vpnUp)
                         put("uninstallProtectionActive", WifiGuardDeviceAdminReceiver.isActive(applicationContext))
@@ -232,34 +243,33 @@ class ClientGuardService : Service() {
     }
 
     private fun startPersistentHeartbeatAndVpnWatchdog() {
+        // Zero-CPU reactive collector (no 3s polling!): fires immediately the millisecond VPN stops
         serviceScope.launch {
-            while (isActive) {
+            WifiGuardVpnService.isRunning.collect { vpnNow ->
                 runCatching {
                     val role = prefs.roleFlow.first()
-                    if (role == AppRole.CLIENT) {
-                        val vpnNow = WifiGuardVpnService.isRunning.value
-                        if (wasVpnRunning && !vpnNow) {
-                            val host = prefs.getSupervisorHost()
-                            val port = prefs.getSupervisorPort()
-                            val id = prefs.getOrCreateDeviceId()
-                            val name = prefs.getDeviceName()
-                            LocalLanClient.sendTamperAlert(
-                                host,
-                                port,
-                                id,
-                                name,
-                                "تحايل: قام جهاز $name بإيقاف الحماية (VPN) دون حذف التطبيق!"
-                            )
-                            syncWithSupervisorOnce()
-                        }
-                        wasVpnRunning = vpnNow
+                    if (role == AppRole.CLIENT && wasVpnRunning && !vpnNow) {
+                        val host = prefs.getSupervisorHost()
+                        val port = prefs.getSupervisorPort()
+                        val id = prefs.getOrCreateDeviceId()
+                        val name = prefs.getDeviceName()
+                        LocalLanClient.sendTamperAlert(
+                            host,
+                            port,
+                            id,
+                            name,
+                            "تحايل: قام جهاز $name بإيقاف الحماية (VPN) دون حذف التطبيق!"
+                        )
+                        syncWithSupervisorOnce()
                     }
+                    wasVpnRunning = vpnNow
                 }
-                delay(3_000L)
             }
         }
 
+        // Battery-saving adaptive heartbeat: 60s when screen ON, 180s when screen OFF
         serviceScope.launch {
+            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
             var failures = 0
             while (isActive) {
                 runCatching {
@@ -283,7 +293,7 @@ class ClientGuardService : Service() {
                         }
                     }
                 }
-                delay(20_000L)
+                delay(if (pm.isInteractive) 60_000L else 180_000L)
             }
         }
     }
