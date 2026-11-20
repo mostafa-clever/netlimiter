@@ -38,6 +38,12 @@ data class SyncedLimitConfig(
     val isPaused: Boolean = false
 )
 
+sealed class ClientProbeResult {
+    data class Online(val json: JSONObject) : ClientProbeResult()
+    object PortClosedOnLan : ClientProbeResult() // TCP RST (ECONNREFUSED) -> phone is awake on Wi-Fi, app was force-stopped or uninstalled!
+    object UnreachableOrSleeping : ClientProbeResult() // Timeout / NoRoute -> phone is asleep in Doze or left Wi-Fi
+}
+
 object LocalLanClient {
 
     const val SERVICE_TYPE = "_wifiguard._tcp."
@@ -124,6 +130,8 @@ object LocalLanClient {
         deviceName: String,
         usedMb: Long,
         savedMbToday: Long = 0L,
+        actualSpeedMbps: Double = 0.0,
+        appUsageMb: Map<String, Long> = emptyMap(),
         protectionActive: Boolean,
         uninstallProtectionActive: Boolean,
         connectionState: ConnectionState,
@@ -136,6 +144,10 @@ object LocalLanClient {
                 put("deviceName", deviceName)
                 put("usedMb", usedMb)
                 put("savedMbToday", savedMbToday)
+                put("actualSpeedMbps", actualSpeedMbps)
+                if (appUsageMb.isNotEmpty()) {
+                    put("appUsageMb", JSONObject(appUsageMb.mapValues { it.value }))
+                }
                 put("protectionActive", protectionActive)
                 put("uninstallProtectionActive", uninstallProtectionActive)
                 put("connectionState", connectionState.name)
@@ -198,6 +210,25 @@ object LocalLanClient {
             val resp = postJson("http://$clientIp:$CLIENT_PORT/config", payload)
             resp.optBoolean("ok", false)
         }.getOrDefault(false)
+    }
+
+    suspend fun probeClientStatus(clientIp: String): ClientProbeResult = withContext(Dispatchers.IO) {
+        if (clientIp.isBlank()) return@withContext ClientProbeResult.UnreachableOrSleeping
+        try {
+            val url = URL("http://$clientIp:$CLIENT_PORT/status")
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 3500
+                readTimeout = 3500
+            }
+            val text = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
+            conn.disconnect()
+            ClientProbeResult.Online(JSONObject(text))
+        } catch (_: java.net.ConnectException) {
+            ClientProbeResult.PortClosedOnLan
+        } catch (_: Throwable) {
+            ClientProbeResult.UnreachableOrSleeping
+        }
     }
 
     suspend fun fetchClientStatus(clientIp: String): JSONObject? = withContext(Dispatchers.IO) {

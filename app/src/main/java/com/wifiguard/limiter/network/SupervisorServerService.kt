@@ -281,6 +281,10 @@ class SupervisorServerService : Service() {
         val deviceName = body.optString("deviceName", "جهاز")
         val usedMb = body.optLong("usedMb", 0L)
         val savedMbToday = body.optLong("savedMbToday", 0L)
+        val actualSpeedMbps = body.optDouble("actualSpeedMbps", 0.0)
+        val appUsageObj = body.optJSONObject("appUsageMb")
+        val parsedAppUsage = mutableMapOf<String, Long>()
+        appUsageObj?.keys()?.forEach { k -> parsedAppUsage[k] = appUsageObj.optLong(k, 0L) }
         val protectionActive = body.optBoolean("protectionActive", false)
         val uninstallProtectionActive = body.optBoolean("uninstallProtectionActive", false)
         val stateStr = body.optString("connectionState", ConnectionState.SMART_SAVING.name)
@@ -309,6 +313,8 @@ class SupervisorServerService : Service() {
             deviceName = deviceName,
             usedMb = usedMb,
             savedMbToday = savedMbToday,
+            actualSpeedMbps = actualSpeedMbps,
+            appUsageMb = if (parsedAppUsage.isNotEmpty()) parsedAppUsage else (existing?.appUsageMb ?: emptyMap()),
             dailyUsageHistory = usageHist,
             dailySavedHistory = savedHist,
             installedApps = if (parsedApps.isNotEmpty()) parsedApps else (existing?.installedApps ?: emptyList()),
@@ -426,54 +432,49 @@ class SupervisorServerService : Service() {
                         }
                     }
 
-                    var heartbeatTimedOut = cur.lastSeenMillis > 0L && (now - cur.lastSeenMillis > 65_000L)
-                    if (heartbeatTimedOut && cur.lastKnownIp.isNotBlank()) {
-                        // Actively query Client port 8766 before declaring offline
-                        val liveStatus = LocalLanClient.fetchClientStatus(cur.lastKnownIp)
-                        if (liveStatus != null && liveStatus.optBoolean("ok", false)) {
-                            heartbeatTimedOut = false
-                            cur = cur.copy(
-                                usedMb = liveStatus.optLong("usedMb", cur.usedMb),
-                                savedMbToday = liveStatus.optLong("savedMbToday", cur.savedMbToday),
-                                protectionActive = liveStatus.optBoolean("protectionActive", cur.protectionActive),
-                                lastSeenMillis = now,
-                                isOnline = true
-                            )
-                            changed = true
+                    val silentMs = if (cur.lastSeenMillis > 0L) (now - cur.lastSeenMillis) else 0L
+                    val wasIdleSleeping = cur.connectionState == ConnectionState.IDLE_FROZEN
+                    // Give idle/sleeping devices a 5-minute Doze grace window before marking offline
+                    val timeoutThresholdMs = if (wasIdleSleeping) 300_000L else 90_000L
+                    var heartbeatTimedOut = cur.lastSeenMillis > 0L && (silentMs > timeoutThresholdMs)
+                    var portClosedCheat = false
+
+                    if (silentMs > 65_000L && cur.lastKnownIp.isNotBlank()) {
+                        when (val probe = LocalLanClient.probeClientStatus(cur.lastKnownIp)) {
+                            is ClientProbeResult.Online -> {
+                                val liveStatus = probe.json
+                                if (liveStatus.optBoolean("ok", false)) {
+                                    heartbeatTimedOut = false
+                                    cur = cur.copy(
+                                        usedMb = liveStatus.optLong("usedMb", cur.usedMb),
+                                        savedMbToday = liveStatus.optLong("savedMbToday", cur.savedMbToday),
+                                        actualSpeedMbps = liveStatus.optDouble("actualSpeedMbps", cur.actualSpeedMbps),
+                                        protectionActive = liveStatus.optBoolean("protectionActive", cur.protectionActive),
+                                        lastSeenMillis = now,
+                                        isOnline = true
+                                    )
+                                    alertedOfflineDevices.remove(cur.deviceId)
+                                    if (cur.protectionActive) alertedMacCheatDevices.remove(cur.deviceId)
+                                    changed = true
+                                }
+                            }
+                            ClientProbeResult.PortClosedOnLan -> {
+                                // Immediate TCP RST on port 8766 -> phone IS awake on Wi-Fi, app was force-stopped or uninstalled!
+                                portClosedCheat = true
+                                heartbeatTimedOut = true
+                            }
+                            ClientProbeResult.UnreachableOrSleeping -> {
+                                // Timeout -> phone is either in deep Doze sleep or left the Wi-Fi
+                            }
                         }
                     }
+
                     if (heartbeatTimedOut && cur.isOnline) {
                         cur = cur.copy(isOnline = false)
                         changed = true
                     }
 
-                    var refreshedMacs = activeMacs
-                    var refreshedIps = activeIps
-                    if ((heartbeatTimedOut || !cur.protectionActive) && cur.lastKnownIp.isNotBlank()) {
-                        NetworkScanner.probeIpForArp(cur.lastKnownIp)
-                        val freshPeers = NetworkScanner.readArpAndNeighTable()
-                        refreshedMacs = freshPeers.map { it.mac.lowercase() }.toSet()
-                        refreshedIps = freshPeers.map { it.ip }.toSet()
-                        if (cur.macAddress.isBlank()) {
-                            val foundMac = freshPeers.firstOrNull { it.ip == cur.lastKnownIp }?.mac
-                            if (!foundMac.isNullOrBlank()) {
-                                cur = cur.copy(macAddress = foundMac)
-                                changed = true
-                            }
-                        }
-                    }
-
-                    // Multi-layer Anti-Cheat (works on Android 11-15):
-                    // 1. MAC match in ARP/neigh table
-                    // 2. Active ICMP + TCP RST (ConnectException) probe on lastKnownIp
-                    val presentByMac = cur.macAddress.isNotBlank() && refreshedMacs.contains(cur.macAddress.lowercase())
-                    val presentByArpIp = cur.lastKnownIp.isNotBlank() && refreshedIps.contains(cur.lastKnownIp)
-                    val presentByProbe = if ((heartbeatTimedOut || !cur.isOnline || !cur.protectionActive) && cur.lastKnownIp.isNotBlank()) {
-                        NetworkScanner.isHostAliveOnLan(cur.lastKnownIp)
-                    } else false
-                    val presentOnWifi = presentByMac || presentByArpIp || presentByProbe
-
-                    if (presentOnWifi && (!cur.isOnline || !cur.protectionActive)) {
+                    if (portClosedCheat || (!cur.protectionActive && cur.isOnline)) {
                         if (!alertedMacCheatDevices.contains(cur.deviceId)) {
                             alertedMacCheatDevices.add(cur.deviceId)
                             val idTag = if (cur.macAddress.isNotBlank()) "MAC: ${cur.macAddress}" else "IP: ${cur.lastKnownIp}"
@@ -486,7 +487,8 @@ class SupervisorServerService : Service() {
                             cur = cur.copy(tamperWarning = msg)
                             changed = true
                         }
-                    } else if (heartbeatTimedOut && !presentOnWifi && !alertedOfflineDevices.contains(cur.deviceId)) {
+                    } else if (heartbeatTimedOut && !wasIdleSleeping && !alertedOfflineDevices.contains(cur.deviceId)) {
+                        // Only mark offline if not peacefully sleeping in IDLE_FROZEN
                         alertedOfflineDevices.add(cur.deviceId)
                         val msg = "جهاز ${cur.deviceName} غادر شبكة الواي فاي حالياً (سيتم تنبيهك فوراً إذا عاد بدون حماية)"
                         recordAndNotifyTamper(cur.deviceId, cur.deviceName, msg)

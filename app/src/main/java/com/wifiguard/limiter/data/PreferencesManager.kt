@@ -54,6 +54,7 @@ class PreferencesManager(private val context: Context) {
         val TARGET_NETWORK_ONLY = booleanPreferencesKey("target_network_only")
         val TARGET_NETWORK_SIG = stringPreferencesKey("target_network_sig")
         val IS_PAUSED = booleanPreferencesKey("is_paused")
+        val ALWAYS_ON_CONFIRMED = booleanPreferencesKey("always_on_confirmed")
 
         // Period usage tracking
         val USED_BYTES_DAY = longPreferencesKey("used_bytes_today")
@@ -62,6 +63,7 @@ class PreferencesManager(private val context: Context) {
         val DAILY_SAVED_HISTORY_JSON = stringPreferencesKey("daily_saved_history_json")
         val APP_USAGE_BYTES_JSON = stringPreferencesKey("app_usage_bytes_json")
         val APP_USAGE_PERIOD_KEY = stringPreferencesKey("app_usage_period_key")
+        val HOURLY_USAGE_JSON = stringPreferencesKey("hourly_usage_json")
         val DATE_DAY = stringPreferencesKey("usage_date")
         val USED_BYTES_WEEK = longPreferencesKey("used_bytes_week")
         val DATE_WEEK = stringPreferencesKey("usage_week")
@@ -74,6 +76,10 @@ class PreferencesManager(private val context: Context) {
     }
 
     private fun dayStr(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+    private fun hourKeyForOffset(hoursAgo: Int): String {
+        val c = java.util.Calendar.getInstance().apply { add(java.util.Calendar.HOUR_OF_DAY, -hoursAgo) }
+        return SimpleDateFormat("yyyy-MM-dd-HH", Locale.US).format(c.time)
+    }
     private fun weekStr(): String = SimpleDateFormat("yyyy-'W'ww", Locale.US).format(Date())
     private fun monthStr(): String = SimpleDateFormat("yyyy-MM", Locale.US).format(Date())
 
@@ -92,6 +98,14 @@ class PreferencesManager(private val context: Context) {
 
     val supervisorPinFlow: Flow<String> = context.dataStore.data.map { prefs ->
         prefs[Keys.SUPERVISOR_PIN] ?: ""
+    }
+
+    val alwaysOnConfirmedFlow: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[Keys.ALWAYS_ON_CONFIRMED] ?: false
+    }
+
+    suspend fun setAlwaysOnConfirmed(confirmed: Boolean) {
+        context.dataStore.edit { it[Keys.ALWAYS_ON_CONFIRMED] = confirmed }
     }
 
     val githubRepoFlow: Flow<String> = context.dataStore.data.map { prefs ->
@@ -162,6 +176,10 @@ class PreferencesManager(private val context: Context) {
 
     val localSavedHistoryFlow: Flow<Map<String, Long>> = context.dataStore.data.map { prefs ->
         parseLongMap(prefs[Keys.DAILY_SAVED_HISTORY_JSON] ?: "{}")
+    }
+
+    val localAppUsageMbFlow: Flow<Map<String, Long>> = context.dataStore.data.map { prefs ->
+        parseLongMap(prefs[Keys.APP_USAGE_BYTES_JSON] ?: "{}").mapValues { it.value / (1024L * 1024L) }
     }
 
     val tamperAlertsFlow: Flow<List<TamperAlert>> = context.dataStore.data.map { prefs ->
@@ -265,7 +283,9 @@ class PreferencesManager(private val context: Context) {
 
     suspend fun applyPolicyToAllDevices(policy: SpeedPolicyConfig) {
         updateAllManagedDevices { list ->
-            list.map { it.copy(speedPolicy = policy) }
+            list.map {
+                it.copy(speedPolicy = policy.copy(appQuotaPercents = it.speedPolicy.appQuotaPercents))
+            }
         }
     }
 
@@ -301,6 +321,14 @@ class PreferencesManager(private val context: Context) {
             val curMonth = if (prefs[Keys.DATE_MONTH] == m) prefs[Keys.USED_BYTES_MONTH] ?: 0L else 0L
             prefs[Keys.DATE_MONTH] = m
             prefs[Keys.USED_BYTES_MONTH] = curMonth + deltaBytes
+
+            val curHourKey = hourKeyForOffset(0)
+            val hourlyMap = parseLongMap(prefs[Keys.HOURLY_USAGE_JSON] ?: "{}").toMutableMap()
+            hourlyMap[curHourKey] = (hourlyMap[curHourKey] ?: 0L) + deltaBytes
+            // Keep only last 24 hours so JSON stays tiny
+            val validKeys = (0..24).map { hourKeyForOffset(it) }.toSet()
+            hourlyMap.keys.retainAll(validKeys)
+            prefs[Keys.HOURLY_USAGE_JSON] = JSONObject(hourlyMap as Map<*, *>).toString()
 
             val newDayBytes = prefs[Keys.USED_BYTES_DAY] ?: 0L
             val hist = parseLongMap(prefs[Keys.DAILY_USAGE_HISTORY_JSON] ?: "{}").toMutableMap()
@@ -346,10 +374,27 @@ class PreferencesManager(private val context: Context) {
         }
     }
 
+    suspend fun setAppUsedMbMap(mbMap: Map<String, Long>, period: LimitPeriod) {
+        val pKey = activePeriodKey(period)
+        context.dataStore.edit { prefs ->
+            prefs[Keys.APP_USAGE_PERIOD_KEY] = pKey
+            val byteMap = mbMap.mapValues { it.value * 1024L * 1024L }
+            prefs[Keys.APP_USAGE_BYTES_JSON] = JSONObject(byteMap as Map<*, *>).toString()
+        }
+    }
+
     suspend fun getAppUsedMbMap(period: LimitPeriod): Map<String, Long> {
         val prefs = context.dataStore.data.first()
         if (prefs[Keys.APP_USAGE_PERIOD_KEY] != activePeriodKey(period)) return emptyMap()
         return parseLongMap(prefs[Keys.APP_USAGE_BYTES_JSON] ?: "{}").mapValues { it.value / (1024L * 1024L) }
+    }
+
+    suspend fun getWindowUsedMb(windowHours: Int): Long {
+        val prefs = context.dataStore.data.first()
+        val map = parseLongMap(prefs[Keys.HOURLY_USAGE_JSON] ?: "{}")
+        val validKeys = (0 until windowHours.coerceIn(1, 24)).map { hourKeyForOffset(it) }
+        val totalBytes = validKeys.sumOf { map[it] ?: 0L }
+        return totalBytes / (1024L * 1024L)
     }
 
     suspend fun getSavedMbToday(): Long {
@@ -378,6 +423,7 @@ class PreferencesManager(private val context: Context) {
             prefs[Keys.DATE_MONTH] = monthStr()
             prefs[Keys.USED_BYTES_MONTH] = 0L
             prefs[Keys.APP_USAGE_BYTES_JSON] = "{}"
+            prefs[Keys.HOURLY_USAGE_JSON] = "{}"
         }
     }
 

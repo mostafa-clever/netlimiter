@@ -2,6 +2,9 @@ package com.wifiguard.limiter.network
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.LinkProperties
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
@@ -42,22 +45,63 @@ object NetworkScanner {
         return gw?.hostAddress ?: ""
     }
 
+    @Volatile private var cachedSsid: String = ""
+    @Volatile private var cachedBssid: String = ""
+    @Volatile private var trackerRegistered: Boolean = false
+
+    fun ensureWifiInfoTracker(context: Context) {
+        if (trackerRegistered) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            runCatching {
+                val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                val req = NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                    .build()
+                val cb = object : ConnectivityManager.NetworkCallback(FLAG_INCLUDE_LOCATION_INFO) {
+                    override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                        val info = caps.transportInfo as? WifiInfo ?: return
+                        val rawSsid = info.ssid?.trim('"') ?: ""
+                        if (rawSsid.isNotBlank() && !rawSsid.equals("<unknown ssid>", ignoreCase = true)) {
+                            cachedSsid = rawSsid
+                        }
+                        val rawBssid = info.bssid?.lowercase() ?: ""
+                        if (rawBssid.isNotBlank() && rawBssid != "02:00:00:00:00:00" && rawBssid != "00:00:00:00:00:00") {
+                            cachedBssid = rawBssid
+                        }
+                    }
+
+                    override fun onLost(network: Network) {
+                        cachedSsid = ""
+                        cachedBssid = ""
+                    }
+                }
+                cm.registerNetworkCallback(req, cb)
+                trackerRegistered = true
+            }
+        }
+    }
+
     private fun getWifiSsidAndBssid(context: Context): Pair<String, String> {
+        ensureWifiInfoTracker(context)
         return runCatching {
-            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            val net = cm.activeNetwork
-            val caps = if (net != null) cm.getNetworkCapabilities(net) else null
-            val info: WifiInfo? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && caps?.transportInfo is WifiInfo) {
-                caps.transportInfo as WifiInfo
-            } else {
+            // 1. Try cached Android 12+ FLAG_INCLUDE_LOCATION_INFO result
+            var ssid = cachedSsid
+            var bssid = cachedBssid
+
+            // 2. Always check WifiManager.connectionInfo (works even while VPN is active!)
+            if (ssid.isBlank() || bssid.isBlank()) {
                 val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
                 @Suppress("DEPRECATION")
-                wm.connectionInfo
+                val info = wm.connectionInfo
+                val rawSsid = info?.ssid?.trim('"') ?: ""
+                if (ssid.isBlank() && rawSsid.isNotBlank() && !rawSsid.equals("<unknown ssid>", ignoreCase = true)) {
+                    ssid = rawSsid
+                }
+                val rawBssid = info?.bssid?.lowercase() ?: ""
+                if (bssid.isBlank() && rawBssid.isNotBlank() && rawBssid != "02:00:00:00:00:00" && rawBssid != "00:00:00:00:00:00") {
+                    bssid = rawBssid
+                }
             }
-            val rawSsid = info?.ssid?.trim('"') ?: ""
-            val ssid = if (rawSsid.equals("<unknown ssid>", ignoreCase = true)) "" else rawSsid
-            val rawBssid = info?.bssid?.lowercase() ?: ""
-            val bssid = if (rawBssid == "02:00:00:00:00:00" || rawBssid == "00:00:00:00:00:00") "" else rawBssid
             ssid to bssid
         }.getOrDefault("" to "")
     }

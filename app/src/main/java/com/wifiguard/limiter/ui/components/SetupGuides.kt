@@ -43,7 +43,9 @@ fun SetupGuideDialog(
     guideType: GuideType,
     onDismiss: () -> Unit,
     onPrimaryAction: (() -> Unit)? = null,
-    primaryActionLabel: String? = null
+    primaryActionLabel: String? = null,
+    onSecondaryAction: (() -> Unit)? = null,
+    secondaryActionLabel: String? = null
 ) {
     val title = when (guideType) {
         GuideType.CLIENT_FULL_SETUP -> "دليل التفعيل خطوة بخطوة"
@@ -55,14 +57,15 @@ fun SetupGuideDialog(
         GuideType.ALWAYS_ON_VPN -> listOf(
             "اضغط على زر (فتح الإعدادات) بالأسفل للانتقال مباشرة إلى صفحة الحماية في هاتفك.",
             "ابحث عن تطبيق (No Quota) واضغط على علامة الترس (الإعدادات) بجانبه.",
-            "فعّل خيار (التشغيل الدائم / Always-on) ثم فعّل (حظر الاتصالات بدونه).",
+            "فعّل خيار (التشغيل الدائم / Always-on) فقط — واترك (حظر الاتصالات بدون VPN) مغلقاً حتى تعمل التطبيقات المستثناة والمزامنة المحلية بشكل سليم.",
             "ارجع للتطبيق — ستختفي هذه الخطوة تلقائياً فور التفعيل."
         )
         GuideType.CLIENT_FULL_SETUP -> listOf(
             "تفعيل الحماية اليومية: اضغط (تفعيل) ثم وافق على رسالة النظام لبدء تنظيم الواي فاي.",
-            "تثبيت الحماية الدائمة: افتح الإعدادات ← اضغط الترس بجانب No Quota ← فعّل التشغيل الدائم ومنع الاتصال بدونه.",
+            "تثبيت الحماية الدائمة: افتح الإعدادات ← اضغط الترس بجانب No Quota ← فعّل (التشغيل الدائم / Always-on) فقط (اترك حظر الاتصالات بدون VPN مغلقاً).",
             "الحماية ضد الحذف: اضغط (تفعيل) ثم (تفعيل تطبيق مسؤول الجهاز) لمنع إزالة التطبيق بسهولة.",
-            "استثناء البطارية: اضغط (تفعيل) ثم (سماح) حتى لا يغلق النظام التطبيق أثناء إغلاق الشاشة."
+            "استثناء البطارية: اضغط (تفعيل) ثم (سماح) حتى لا يغلق النظام التطبيق أثناء إغلاق الشاشة.",
+            "توفير إضافي لأندرويد 9 وأقل: افتح إعدادات الواي فاي ← اضغط على شبكتك ← متقدم ← فعّل (شبكة محدودة / Metered) لتقليل استهلاك التطبيقات مثل بيانات الهاتف."
         )
         GuideType.SUPERVISOR_GUIDE -> listOf(
             "ربط جهاز جديد: ثبّت No Quota على جهاز العضو، اختر (جهاز عضو)، وأدخل رمز الربط المكون من 6 أرقام الظاهر في شاشتك.",
@@ -131,7 +134,19 @@ fun SetupGuideDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = onDismiss) { Text("فهمت") }
+            if (onSecondaryAction != null && secondaryActionLabel != null) {
+                TextButton(onClick = {
+                    onSecondaryAction()
+                    onDismiss()
+                }) { Text(secondaryActionLabel) }
+            } else {
+                TextButton(onClick = onDismiss) { Text("فهمت") }
+            }
+        },
+        dismissButton = {
+            if (onSecondaryAction != null) {
+                TextButton(onClick = onDismiss) { Text("إغلاق") }
+            }
         }
     )
 }

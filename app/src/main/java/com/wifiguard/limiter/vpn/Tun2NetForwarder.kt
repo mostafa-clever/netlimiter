@@ -403,16 +403,25 @@ class Tun2NetForwarder(
                 if (!key.isValid) continue
 
                 when (val att = key.attachment()) {
-                    is TcpSession -> handleTcpKey(key, att, readBuf)
-                    is UdpSession -> handleUdpKey(key, att, udpBuf)
+                    is TcpSession -> runCatching { handleTcpKey(key, att, readBuf) }.onFailure { closeTcpSession(att) }
+                    is UdpSession -> runCatching { handleUdpKey(key, att, udpBuf) }.onFailure {
+                        udpSessions.remove(att.key)
+                        runCatching { att.channel.close() }
+                    }
                 }
             }
 
             val now = System.currentTimeMillis()
-            if (now - lastCleanupMs > 15_000L) {
+            if (now - lastCleanupMs > 5_000L) {
                 lastCleanupMs = now
-                tcpSessions.values.filter { now - it.lastActivityMs > 90_000L }.forEach { closeTcpSession(it) }
-                udpSessions.values.filter { now - it.lastActivityMs > 45_000L }.forEach {
+                tcpSessions.values.filter {
+                    (it.state == TcpState.SYN_SENT && now - it.lastActivityMs > 8_000L) ||
+                    (now - it.lastActivityMs > 35_000L)
+                }.forEach { closeTcpSession(it) }
+                if (tcpSessions.size > 120) {
+                    tcpSessions.values.sortedBy { it.lastActivityMs }.take(tcpSessions.size - 100).forEach { closeTcpSession(it) }
+                }
+                udpSessions.values.filter { now - it.lastActivityMs > 20_000L }.forEach {
                     udpSessions.remove(it.key)
                     runCatching { it.channel.close() }
                 }

@@ -24,6 +24,7 @@ import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.BatteryChargingFull
 import androidx.compose.material.icons.rounded.HelpOutline
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.TextButton
@@ -48,6 +49,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -65,6 +68,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wifiguard.limiter.BuildConfig
 import com.wifiguard.limiter.admin.WifiGuardDeviceAdminReceiver
+import com.wifiguard.limiter.data.AppUsageStatsHelper
 import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.LimitPeriod
 import com.wifiguard.limiter.ui.components.UsageRingCard
@@ -100,10 +104,14 @@ fun ClientScreen(
     val connState by WifiGuardVpnService.connectionState.collectAsState()
     val statusLabel by WifiGuardVpnService.statusLabel.collectAsState()
     val blockedAds by WifiGuardVpnService.blockedAdsCount.collectAsState()
-    val alwaysOnActive by WifiGuardVpnService.isAlwaysOnActive.collectAsState()
+    val alwaysOnSystem by WifiGuardVpnService.isAlwaysOnActive.collectAsState()
+    val alwaysOnConfirmed by prefs.alwaysOnConfirmedFlow.collectAsState(initial = false)
+    val alwaysOnActive = alwaysOnSystem || alwaysOnConfirmed
+    val clientScope = rememberCoroutineScope()
     var adminActive by remember { mutableStateOf(WifiGuardDeviceAdminReceiver.isActive(context)) }
     val pmPower = remember { context.getSystemService(android.content.Context.POWER_SERVICE) as PowerManager }
     var batteryExempt by remember { mutableStateOf(pmPower.isIgnoringBatteryOptimizations(context.packageName)) }
+    var hasUsageAccess by remember { mutableStateOf(AppUsageStatsHelper.hasUsageStatsPermission(context)) }
     var activeGuide by remember { mutableStateOf<GuideType?>(null) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -111,6 +119,7 @@ fun ClientScreen(
             if (event == Lifecycle.Event.ON_RESUME) {
                 adminActive = WifiGuardDeviceAdminReceiver.isActive(context)
                 batteryExempt = pmPower.isIgnoringBatteryOptimizations(context.packageName)
+                hasUsageAccess = AppUsageStatsHelper.hasUsageStatsPermission(context)
                 val cm = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
                 systemVpnDetected = cm.allNetworks.any { net ->
                     cm.getNetworkCapabilities(net)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
@@ -141,6 +150,11 @@ fun ClientScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = {
+                        if (vpnRunning) WifiGuardVpnService.restart(context) else onRequestStartVpn()
+                    }) {
+                        Icon(Icons.Rounded.Refresh, contentDescription = "إعادة تشغيل الاتصال", tint = Color.White)
+                    }
                     IconButton(onClick = { activeGuide = GuideType.CLIENT_FULL_SETUP }) {
                         Icon(Icons.Rounded.HelpOutline, contentDescription = "دليل التفعيل", tint = Color.White)
                     }
@@ -168,6 +182,18 @@ fun ClientScreen(
                 protectionActive = vpnRunning,
                 statusLabelOverride = statusLabel
             )
+
+            OutlinedButton(
+                onClick = {
+                    if (vpnRunning) WifiGuardVpnService.restart(context) else onRequestStartVpn()
+                },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("إعادة تشغيل الحماية (تحديث الاتصال)", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            }
 
             if (targetNetworkOnly && targetNetworkSig.isNotBlank()) {
                 Card(
@@ -201,7 +227,7 @@ fun ClientScreen(
                 }
             }
 
-            if (!vpnRunning || !alwaysOnActive || !adminActive || !batteryExempt) {
+            if (!vpnRunning || !alwaysOnActive || !adminActive || !batteryExempt || !hasUsageAccess) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(20.dp),
@@ -254,6 +280,24 @@ fun ClientScreen(
                                 isActive = false,
                                 actionLabel = "تفعيل",
                                 onAction = onRequestDeviceAdmin
+                            )
+                        }
+
+                        if (!hasUsageAccess) {
+                            ProtectionStepRow(
+                                icon = Icons.Rounded.Apps,
+                                title = "إذن إحصائيات التطبيقات",
+                                subtitle = "مطلوب لتطبيق حد نسبة الباقة على التطبيقات وعرض تقارير الاستهلاك",
+                                isActive = false,
+                                actionLabel = "تفعيل",
+                                onAction = {
+                                    runCatching {
+                                        val i = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).apply {
+                                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                        }
+                                        context.startActivity(i)
+                                    }
+                                }
                             )
                         }
 
@@ -330,7 +374,11 @@ fun ClientScreen(
             guideType = guide,
             onDismiss = { activeGuide = null },
             onPrimaryAction = if (guide == GuideType.ALWAYS_ON_VPN) onOpenAlwaysOnSettings else null,
-            primaryActionLabel = if (guide == GuideType.ALWAYS_ON_VPN) "فتح إعدادات الحماية الآن" else null
+            primaryActionLabel = if (guide == GuideType.ALWAYS_ON_VPN) "فتح إعدادات الحماية الآن" else null,
+            onSecondaryAction = if (guide == GuideType.ALWAYS_ON_VPN) {
+                { clientScope.launch { prefs.setAlwaysOnConfirmed(true) } }
+            } else null,
+            secondaryActionLabel = if (guide == GuideType.ALWAYS_ON_VPN) "تم التفعيل ✓" else null
         )
     }
 }

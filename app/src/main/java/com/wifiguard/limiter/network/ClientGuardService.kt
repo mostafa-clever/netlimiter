@@ -46,12 +46,14 @@ class ClientGuardService : Service() {
     private lateinit var prefs: PreferencesManager
     private var controlSocket: ServerSocket? = null
     private var wifiCallback: ConnectivityManager.NetworkCallback? = null
+    private var screenOnReceiver: android.content.BroadcastReceiver? = null
     private var wasVpnRunning: Boolean = false
     private var sentAppsOnce: Boolean = false
 
     companion object {
         const val CHANNEL_ID = "wifiguard_client_guard_channel"
         const val NOTIF_ID = 2002
+        @Volatile var isSupervisorReachable: Boolean = false
 
         fun start(context: Context) {
             runCatching {
@@ -83,6 +85,15 @@ class ClientGuardService : Service() {
         }
         startControlServer()
         registerWifiReconnectCallback()
+        runCatching {
+            val rx = object : android.content.BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    serviceScope.launch { syncWithSupervisorOnce() }
+                }
+            }
+            screenOnReceiver = rx
+            registerReceiver(rx, android.content.IntentFilter(Intent.ACTION_SCREEN_ON))
+        }
         startPersistentHeartbeatAndVpnWatchdog()
     }
 
@@ -97,6 +108,7 @@ class ClientGuardService : Service() {
                 (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(it)
             }
         }
+        runCatching { screenOnReceiver?.let { unregisterReceiver(it) } }
         runCatching { controlSocket?.close() }
         serviceScope.cancel()
     }
@@ -177,6 +189,10 @@ class ClientGuardService : Service() {
                         put("ok", true)
                         put("usedMb", prefs.getUsedMbActivePeriod())
                         put("savedMbToday", prefs.getSavedMbToday())
+                        put("actualSpeedMbps", WifiGuardVpnService.liveSpeedMbps.value)
+                        val curPeriod = prefs.limitPeriodFlow.first()
+                        val appMap = prefs.getAppUsedMbMap(curPeriod)
+                        put("appUsageMb", JSONObject(appMap.mapValues { it.value }))
                         put("protectionActive", vpnUp)
                         put("uninstallProtectionActive", WifiGuardDeviceAdminReceiver.isActive(applicationContext))
                         put("connectionState", if (vpnUp) WifiGuardVpnService.connectionState.value.name else ConnectionState.PROTECTION_OFF.name)
@@ -289,12 +305,15 @@ class ClientGuardService : Service() {
             deviceName = name,
             usedMb = usedMb,
             savedMbToday = savedMb,
+            actualSpeedMbps = WifiGuardVpnService.liveSpeedMbps.value,
+            appUsageMb = prefs.getAppUsedMbMap(prefs.limitPeriodFlow.first()),
             protectionActive = vpnUp,
             uninstallProtectionActive = adminActive,
             connectionState = if (vpnUp) WifiGuardVpnService.connectionState.value else ConnectionState.PROTECTION_OFF,
             installedApps = if (!sentAppsOnce) getInstalledLaunchableApps(applicationContext) else emptyList()
         )
         if (updated != null) {
+            isSupervisorReachable = true
             sentAppsOnce = true
             prefs.updateLocalLimits(
                 limitMb = updated.dailyLimitMb,
@@ -309,6 +328,7 @@ class ClientGuardService : Service() {
             )
             return true
         }
+        isSupervisorReachable = false
         return false
     }
 

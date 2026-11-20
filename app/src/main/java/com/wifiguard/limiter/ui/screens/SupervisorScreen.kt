@@ -74,7 +74,11 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -155,12 +159,15 @@ fun SupervisorScreen(
     val targetNetworkOnly by prefs.targetNetworkOnlyFlow.collectAsState(initial = false)
     val targetNetworkSig by prefs.targetNetworkSigFlow.collectAsState(initial = "")
     val blockedAds by WifiGuardVpnService.blockedAdsCount.collectAsState()
-    val alwaysOnActive by WifiGuardVpnService.isAlwaysOnActive.collectAsState()
+    val alwaysOnSystem by WifiGuardVpnService.isAlwaysOnActive.collectAsState()
+    val alwaysOnConfirmed by prefs.alwaysOnConfirmedFlow.collectAsState(initial = false)
+    val alwaysOnActive = alwaysOnSystem || alwaysOnConfirmed
 
     // Self-limit & template policy states
     val selfLimitEnabled by prefs.selfLimitEnabledFlow.collectAsState(initial = false)
     val localUsageHist by prefs.localUsageHistoryFlow.collectAsState(initial = emptyMap())
     val localSavedHist by prefs.localSavedHistoryFlow.collectAsState(initial = emptyMap())
+    val localAppUsageMb by prefs.localAppUsageMbFlow.collectAsState(initial = emptyMap())
     val limitPeriod by prefs.limitPeriodFlow.collectAsState(initial = LimitPeriod.DAILY)
     val usedMb by prefs.usedMbActivePeriodFlow.collectAsState(initial = 0L)
     val dailyLimitMb by prefs.dailyLimitMbFlow.collectAsState(initial = 1024L)
@@ -210,6 +217,10 @@ fun SupervisorScreen(
                                         if (live != null && live.optBoolean("ok", false)) {
                                             val newUsed = live.optLong("usedMb", d.usedMb)
                                             val newSaved = live.optLong("savedMbToday", d.savedMbToday)
+                                            val newSpeed = live.optDouble("actualSpeedMbps", d.actualSpeedMbps)
+                                            val appObj = live.optJSONObject("appUsageMb")
+                                            val liveApps = mutableMapOf<String, Long>()
+                                            appObj?.keys()?.forEach { k -> liveApps[k] = appObj.optLong(k, 0L) }
                                             val prot = live.optBoolean("protectionActive", d.protectionActive)
                                             val st = runCatching {
                                                 ConnectionState.valueOf(live.optString("connectionState", d.connectionState.name))
@@ -220,6 +231,8 @@ fun SupervisorScreen(
                                                 d.copy(
                                                     usedMb = newUsed,
                                                     savedMbToday = newSaved,
+                                                    actualSpeedMbps = newSpeed,
+                                                    appUsageMb = if (liveApps.isNotEmpty()) liveApps else d.appUsageMb,
                                                     protectionActive = prot,
                                                     connectionState = if (prot) st else ConnectionState.PROTECTION_OFF,
                                                     dailyUsageHistory = uHist,
@@ -378,6 +391,7 @@ fun SupervisorScreen(
                     devices = devices,
                     localUsageHistory = localUsageHist,
                     localSavedHistory = localSavedHist,
+                    localAppUsageMb = localAppUsageMb,
                     includeSelf = selfLimitEnabled
                 )
                 else -> AdvancedSettingsTab(
@@ -558,6 +572,16 @@ private fun DevicesTab(
     val supCtx = LocalContext.current
     val supPm = remember { supCtx.getSystemService(android.content.Context.POWER_SERVICE) as PowerManager }
     var supBatteryExempt by remember { mutableStateOf(supPm.isIgnoringBatteryOptimizations(supCtx.packageName)) }
+    val supLifecycle = LocalLifecycleOwner.current
+    DisposableEffect(supLifecycle) {
+        val obs = LifecycleEventObserver { _, ev ->
+            if (ev == Lifecycle.Event.ON_RESUME) {
+                supBatteryExempt = supPm.isIgnoringBatteryOptimizations(supCtx.packageName)
+            }
+        }
+        supLifecycle.lifecycle.addObserver(obs)
+        onDispose { supLifecycle.lifecycle.removeObserver(obs) }
+    }
     if (!supBatteryExempt) {
         Card(
             modifier = Modifier.fillMaxWidth(),
@@ -581,36 +605,9 @@ private fun DevicesTab(
                             flags = Intent.FLAG_ACTIVITY_NEW_TASK
                         }
                         supCtx.startActivity(i)
-                        supBatteryExempt = true
                     }
                 }) { Text("تفعيل") }
             }
-        }
-    }
-
-    // Force Quota Saver on ALL devices card
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text("فرض وضع التوفير على جميع الأجهزة", fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                Text(
-                    "يُفعّل حجب الإعلانات وتجميد الخلفية وتوفير الوسائط على الكل",
-                    fontSize = 12.sp,
-                    color = TextMuted
-                )
-            }
-            Switch(checked = forceQuotaSaverAll, onCheckedChange = onToggleForceQuotaSaverAll)
         }
     }
 
@@ -805,11 +802,11 @@ private fun DeviceMonitorCard(device: ManagedDevice, onClick: () -> Unit, onTogg
                 )
             }
 
+            val liveSpd = if (device.isOnline) String.format(Locale("ar"), "%.1f ميجابت/ث", device.actualSpeedMbps) else "0 ميجابت/ث"
             val capText = formatSpeedArabic(device.speedPolicy.baseSpeedLimitMbPerSec)
-            val macText = if (device.macAddress.isNotBlank()) " • MAC: ${device.macAddress}" else ""
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "السرعة: $capText • المستثناة: ${device.whitelistedPackages.size}$macText",
+                text = "السرعة الفعلية: $liveSpd (الحد: $capText) • المستثناة: ${device.whitelistedPackages.size}",
                 fontSize = 12.sp,
                 color = TextMuted
             )
@@ -970,7 +967,7 @@ private fun AdvancedSettingsTab(
                 FilterChip(
                     selected = false,
                     onClick = {
-                        draftPolicy = SpeedPolicyConfig.presetBalanced()
+                        draftPolicy = SpeedPolicyConfig.presetBalanced().copy(appQuotaPercents = draftPolicy.appQuotaPercents)
                         onSavePolicy(draftPolicy)
                     },
                     label = { Text("متوازن") }
@@ -978,7 +975,7 @@ private fun AdvancedSettingsTab(
                 FilterChip(
                     selected = false,
                     onClick = {
-                        draftPolicy = SpeedPolicyConfig.presetMaxSaver()
+                        draftPolicy = SpeedPolicyConfig.presetMaxSaver().copy(appQuotaPercents = draftPolicy.appQuotaPercents)
                         onSavePolicy(draftPolicy)
                     },
                     label = { Text("توفير أقصى") }
@@ -986,7 +983,7 @@ private fun AdvancedSettingsTab(
                 FilterChip(
                     selected = false,
                     onClick = {
-                        draftPolicy = SpeedPolicyConfig.presetRelaxed()
+                        draftPolicy = SpeedPolicyConfig.presetRelaxed().copy(appQuotaPercents = draftPolicy.appQuotaPercents)
                         onSavePolicy(draftPolicy)
                     },
                     label = { Text("مرن (سرعة عالية)") }
@@ -1035,8 +1032,8 @@ private fun AdvancedSettingsTab(
     // Section 2: Phased Speed Rules
     AccordionCard(
         icon = Icons.Rounded.Tune,
-        title = "2. مراحل التهدئة التلقائية",
-        subtitle = "تبدأ عند ${draftPolicy.slowdownStartPercent}% • تنخفض إلى ${draftPolicy.finalPhaseSpeedMbPerSec} ميجابت/ث",
+        title = "2. السرعة النهائية قبل انتهاء الباقة",
+        subtitle = "عند تبقي ${draftPolicy.finalPhaseRemainingPercent}% ← ${draftPolicy.finalPhaseSpeedMbPerSec} ميجابت/ث",
         expanded = expandPhases,
         onToggle = { expandPhases = !expandPhases }
     ) {
@@ -1058,7 +1055,7 @@ private fun AdvancedSettingsTab(
     AccordionCard(
         icon = Icons.Rounded.AutoAwesome,
         title = "4. التوفير الذكي التلقائي",
-        subtitle = if (draftPolicy.quotaSaverModeEnabled) "مفعّل + حجب الإعلانات" else "تلقائي عند ${draftPolicy.autoEnableSaverAtPercent}%",
+        subtitle = if (draftPolicy.quotaSaverModeEnabled) "مفعّل" else "معطّل",
         expanded = expandAutomation,
         onToggle = { expandAutomation = !expandAutomation }
     ) {
@@ -1383,27 +1380,6 @@ private fun PhasedRulesControls(
         mutableStateOf(policy.finalPhaseSpeedMbPerSec.toString())
     }
 
-    Text("تبدأ التهدئة التدريجية عند استهلاك: ${policy.slowdownStartPercent}%", fontSize = 12.sp)
-    Slider(
-        value = policy.slowdownStartPercent.toFloat(),
-        onValueChange = { onChange(policy.copy(slowdownStartPercent = it.toInt())) },
-        valueRange = 10f..90f
-    )
-
-    Text("السرعة عند بداية التهدئة: ${policy.slowdownInitialSpeedPercent}%", fontSize = 12.sp)
-    Slider(
-        value = policy.slowdownInitialSpeedPercent.toFloat(),
-        onValueChange = { onChange(policy.copy(slowdownInitialSpeedPercent = it.toInt())) },
-        valueRange = 10f..90f
-    )
-
-    Text("مقدار النقص لكل 1% استهلاك إضافي: -${policy.slowdownStepPerPercent}%", fontSize = 12.sp)
-    Slider(
-        value = policy.slowdownStepPerPercent.toFloat(),
-        onValueChange = { onChange(policy.copy(slowdownStepPerPercent = it.toInt())) },
-        valueRange = 1f..5f
-    )
-
     Text("المرحلة الأخيرة عند تبقي: ${policy.finalPhaseRemainingPercent}% من الباقة", fontSize = 12.sp)
     Slider(
         value = policy.finalPhaseRemainingPercent.toFloat(),
@@ -1424,6 +1400,53 @@ private fun PhasedRulesControls(
         singleLine = true,
         modifier = Modifier.fillMaxWidth()
     )
+
+    HorizontalDivider()
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text("منع السحب السريع خلال فترة زمنية", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            Text("يمنع استهلاك نسبة كبيرة من الباقة في وقت قصير ويُهدئ السرعة حتى تنتهي الفترة", fontSize = 11.sp, color = TextMuted)
+        }
+        Switch(
+            checked = policy.windowPaceEnabled,
+            onCheckedChange = { onChange(policy.copy(windowPaceEnabled = it)) }
+        )
+    }
+
+    if (policy.windowPaceEnabled) {
+        Text("أقصى استهلاك مسموح: ${policy.windowMaxPercent}% خلال ${policy.windowHours} ساعات", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = PrimaryTeal)
+        Slider(
+            value = policy.windowMaxPercent.toFloat(),
+            onValueChange = { onChange(policy.copy(windowMaxPercent = it.toInt())) },
+            valueRange = 15f..90f
+        )
+        Text("مدة النافذة الزمنية: ${policy.windowHours} ساعات", fontSize = 12.sp)
+        Slider(
+            value = policy.windowHours.toFloat(),
+            onValueChange = { onChange(policy.copy(windowHours = it.toInt())) },
+            valueRange = 1f..12f
+        )
+        var winSpeedText by remember(policy.windowSlowSpeedMbps) {
+            mutableStateOf(policy.windowSlowSpeedMbps.toString())
+        }
+        OutlinedTextField(
+            value = winSpeedText,
+            onValueChange = { txt ->
+                winSpeedText = txt
+                txt.toDoubleOrNull()?.let { v ->
+                    if (v >= 0.1) onChange(policy.copy(windowSlowSpeedMbps = v))
+                }
+            },
+            label = { Text("السرعة عند الوصول لحد الفترة (ميجابت/ث)") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
 }
 
 @Composable
@@ -1474,32 +1497,18 @@ private fun SmartAutomationControls(
     policy: SpeedPolicyConfig,
     onChange: (SpeedPolicyConfig) -> Unit
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text("تفعيل وضع التوفير يدوياً", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-            Text("حجب الإعلانات + تقليل استهلاك الفيديو + تجميد الخلفية", fontSize = 11.sp, color = TextMuted)
-        }
-        Switch(
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Checkbox(
             checked = policy.quotaSaverModeEnabled,
-            onCheckedChange = { onChange(policy.copy(quotaSaverModeEnabled = it)) }
+            onCheckedChange = {
+                onChange(policy.copy(quotaSaverModeEnabled = it, autoEnableSaverAtPercent = if (it) 0 else 100))
+            }
         )
+        Column {
+            Text("تفعيل وضع التوفير الذكي", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            Text("تقليل جودة الفيديو + معاملة الواي فاي كباقة محدودة + تجميد الخلفية", fontSize = 11.sp, color = TextMuted)
+        }
     }
-
-    val autoLabel = when (policy.autoEnableSaverAtPercent) {
-        0 -> "تفعيل تلقائي: من بداية الاستهلاك (0%)"
-        100 -> "تفعيل تلقائي: معطّل (يدوي أو مفروض فقط)"
-        else -> "تفعيل تلقائي عند استهلاك: ${policy.autoEnableSaverAtPercent}%"
-    }
-    Text(autoLabel, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-    Slider(
-        value = policy.autoEnableSaverAtPercent.toFloat(),
-        onValueChange = { onChange(policy.copy(autoEnableSaverAtPercent = it.toInt())) },
-        valueRange = 0f..100f
-    )
 
     HorizontalDivider()
     Text("تخصيص مكونات وضع التوفير:", fontWeight = FontWeight.Bold, fontSize = 13.sp)
@@ -1539,6 +1548,17 @@ private fun SmartAutomationControls(
             onCheckedChange = { onChange(policy.copy(blockQuicUdp443Enabled = it)) }
         )
         Text("تحسين تقليل جودة الفيديو التلقائي (360p/480p)", fontSize = 12.sp)
+    }
+
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Checkbox(
+            checked = policy.meteredWifiSaverEnabled,
+            onCheckedChange = { onChange(policy.copy(meteredWifiSaverEnabled = it)) }
+        )
+        Column {
+            Text("معاملة الواي فاي كباقة محدودة (مثل بيانات الهاتف)", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text("يخفض استهلاك يوتيوب وفيسبوك والواتساب والمتجر تلقائياً بنسبة تصل إلى 70% (أندرويد 10+)", fontSize = 11.sp, color = TextMuted)
+        }
     }
 
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -1759,7 +1779,7 @@ private fun EditDeviceDialog(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("فرض وضع التوفير على هذا الجهاز", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text("تفعيل وضع التوفير لهذا الجهاز", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     Switch(checked = forceSaverForDevice, onCheckedChange = { forceSaverForDevice = it })
                 }
 

@@ -61,7 +61,13 @@ data class SpeedPolicyConfig(
     val appQuotaPercents: Map<String, Int> = emptyMap(),
     val mediaCdnSaverEnabled: Boolean = true,
     val mediaCdnSpeedMbps: Double = 1.2,
-    val blockAppUpdatesInSaver: Boolean = true
+    val blockAppUpdatesInSaver: Boolean = true,
+    // Time-window pacing limit (e.g. max 50% within a 6-hour window)
+    val windowPaceEnabled: Boolean = false,
+    val windowHours: Int = 6,
+    val windowMaxPercent: Int = 50,
+    val windowSlowSpeedMbps: Double = 0.5,
+    val meteredWifiSaverEnabled: Boolean = true
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("baseSpeedLimitMbPerSec", baseSpeedLimitMbPerSec)
@@ -92,6 +98,11 @@ data class SpeedPolicyConfig(
         put("mediaCdnSaverEnabled", mediaCdnSaverEnabled)
         put("mediaCdnSpeedMbps", mediaCdnSpeedMbps)
         put("blockAppUpdatesInSaver", blockAppUpdatesInSaver)
+        put("windowPaceEnabled", windowPaceEnabled)
+        put("windowHours", windowHours)
+        put("windowMaxPercent", windowMaxPercent)
+        put("windowSlowSpeedMbps", windowSlowSpeedMbps)
+        put("meteredWifiSaverEnabled", meteredWifiSaverEnabled)
     }
 
     companion object {
@@ -125,7 +136,12 @@ data class SpeedPolicyConfig(
                 appQuotaPercents = parseAppQuotaMap(obj.optJSONObject("appQuotaPercents")),
                 mediaCdnSaverEnabled = obj.optBoolean("mediaCdnSaverEnabled", true),
                 mediaCdnSpeedMbps = obj.optDouble("mediaCdnSpeedMbps", 1.2).coerceAtLeast(0.25),
-                blockAppUpdatesInSaver = obj.optBoolean("blockAppUpdatesInSaver", true)
+                blockAppUpdatesInSaver = obj.optBoolean("blockAppUpdatesInSaver", true),
+                windowPaceEnabled = obj.optBoolean("windowPaceEnabled", false),
+                windowHours = obj.optInt("windowHours", 6).coerceIn(1, 24),
+                windowMaxPercent = obj.optInt("windowMaxPercent", 50).coerceIn(10, 95),
+                windowSlowSpeedMbps = obj.optDouble("windowSlowSpeedMbps", 0.5).coerceAtLeast(0.1),
+                meteredWifiSaverEnabled = obj.optBoolean("meteredWifiSaverEnabled", true)
             )
         }
 
@@ -220,7 +236,8 @@ fun computeEffectiveSpeed(
     forcedBySupervisor: Boolean = false,
     globalSpeedCapMbPerSec: Double = 0.0,
     burstDetected: Boolean = false,
-    isScreenOffIdle: Boolean = false
+    isScreenOffIdle: Boolean = false,
+    windowUsedMb: Long = 0L
 ): EffectiveSpeedStatus {
     val graceMb = (limitMb * policy.graceExtraPercent) / 100L
     val hardCapMb = limitMb + graceMb
@@ -275,6 +292,31 @@ fun computeEffectiveSpeed(
     val remainingPercent = 100.0 - usedPercent
     val finalPhaseBytesPerSec = (policy.finalPhaseSpeedMbPerSec * 125_000.0).toLong().coerceAtLeast(8_000L)
 
+    // Time-window pacing limit (e.g. max 50% within 6 hours -> slows before reaching cap & drops speed until window clears)
+    if (policy.windowPaceEnabled && limitMb > 0L) {
+        val windowCapMb = ((limitMb * policy.windowMaxPercent) / 100L).coerceAtLeast(10L)
+        val windowRatio = (windowUsedMb * 100.0) / windowCapMb.toDouble()
+        if (windowUsedMb >= windowCapMb) {
+            val dropBytes = (policy.windowSlowSpeedMbps * 125_000.0).toLong().coerceAtLeast(8_000L)
+            return EffectiveSpeedStatus(
+                state = ConnectionState.SLOWED,
+                targetBytesPerSec = dropBytes,
+                activeSpeedPercent = 15,
+                saverActive = saverActive,
+                statusLabelArabic = "حد فترة ${policy.windowHours} ساعات • سرعة ${formatSpeedArabic(policy.windowSlowSpeedMbps)}"
+            )
+        } else if (windowRatio >= 80.0) {
+            val preSlowBytes = (policy.finalPhaseSpeedMbPerSec * 125_000.0).toLong().coerceAtLeast(8_000L)
+            return EffectiveSpeedStatus(
+                state = ConnectionState.SLOWED,
+                targetBytesPerSec = preSlowBytes,
+                activeSpeedPercent = 30,
+                saverActive = saverActive,
+                statusLabelArabic = "اقتراب من حد ${policy.windowHours} ساعات • ${formatSpeedArabic(policy.finalPhaseSpeedMbPerSec)}"
+            )
+        }
+    }
+
     if (remainingPercent <= policy.finalPhaseRemainingPercent.toDouble()) {
         val capped = if (globalSpeedCapMbPerSec > 0.0) {
             minOf(finalPhaseBytesPerSec, (globalSpeedCapMbPerSec * 125_000.0).toLong())
@@ -289,19 +331,7 @@ fun computeEffectiveSpeed(
         )
     }
 
-    if (usedPercent >= policy.slowdownStartPercent.toDouble()) {
-        val stepsUsed = (usedPercent - policy.slowdownStartPercent).toInt().coerceAtLeast(0)
-        val speedPct = (policy.slowdownInitialSpeedPercent - (stepsUsed * policy.slowdownStepPerPercent)).coerceIn(1, 100)
-        val computedBytes = maxOf(finalPhaseBytesPerSec, (baseBytesPerSec * speedPct) / 100L)
-        val mbps = computedBytes / 125_000.0
-        return EffectiveSpeedStatus(
-            state = ConnectionState.SLOWED,
-            targetBytesPerSec = computedBytes,
-            activeSpeedPercent = speedPct,
-            saverActive = saverActive,
-            statusLabelArabic = "تهدئة تدريجية • $speedPct% (${formatSpeedArabic(mbps)})"
-        )
-    }
+    // Gradual step-down removed; jumps cleanly to Final Speed Phase when remaining <= finalPhaseRemainingPercent
 
     var targetBytes = if (effectiveBaseMbPerSec > 0.0) baseBytesPerSec else Long.MAX_VALUE
     var state = if (saverActive || effectiveBaseMbPerSec > 0.0) ConnectionState.SMART_SAVING else ConnectionState.NORMAL
@@ -361,6 +391,8 @@ data class ManagedDevice(
     val dailyLimitMb: Long = 1024L,
     val usedMb: Long = 0L,
     val savedMbToday: Long = 0L,
+    val actualSpeedMbps: Double = 0.0,
+    val appUsageMb: Map<String, Long> = emptyMap(),
     val dailyUsageHistory: Map<String, Long> = emptyMap(),
     val dailySavedHistory: Map<String, Long> = emptyMap(),
     val forceQuotaSaver: Boolean = false,
@@ -388,6 +420,8 @@ data class ManagedDevice(
         put("dailyLimitMb", dailyLimitMb)
         put("usedMb", usedMb)
         put("savedMbToday", savedMbToday)
+        put("actualSpeedMbps", actualSpeedMbps)
+        put("appUsageMb", JSONObject(appUsageMb.mapValues { it.value }))
         put("dailyUsageHistory", JSONObject(dailyUsageHistory.mapValues { it.value }))
         put("dailySavedHistory", JSONObject(dailySavedHistory.mapValues { it.value }))
         put("forceQuotaSaver", forceQuotaSaver)
@@ -447,6 +481,8 @@ data class ManagedDevice(
                 dailyLimitMb = obj.optLong("dailyLimitMb", 1024L),
                 usedMb = obj.optLong("usedMb", 0L),
                 savedMbToday = obj.optLong("savedMbToday", 0L),
+                actualSpeedMbps = obj.optDouble("actualSpeedMbps", 0.0),
+                appUsageMb = parseHistoryMap(obj.optJSONObject("appUsageMb")),
                 dailyUsageHistory = parseHistoryMap(obj.optJSONObject("dailyUsageHistory")),
                 dailySavedHistory = parseHistoryMap(obj.optJSONObject("dailySavedHistory")),
                 forceQuotaSaver = obj.optBoolean("forceQuotaSaver", false),
