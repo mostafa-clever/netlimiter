@@ -49,6 +49,7 @@ class WifiGuardVpnService : VpnService() {
     private val tokenBucket = TokenBucket()
     private var tunInterface: ParcelFileDescriptor? = null
     private var proxyServer: LocalHttpProxyServer? = null
+    private var legacyForwarder: Tun2NetForwarder? = null
     private var packetLoopJob: Job? = null
 
     private var currentBlockAll: Boolean = false
@@ -177,6 +178,8 @@ class WifiGuardVpnService : VpnService() {
         super.onDestroy()
         _isRunning.value = false
         packetLoopJob?.cancel()
+        runCatching { legacyForwarder?.close() }
+        legacyForwarder = null
         runCatching { proxyServer?.stop() }
         proxyServer = null
         runCatching { tunInterface?.close() }
@@ -379,14 +382,18 @@ class WifiGuardVpnService : VpnService() {
         whitelist: Set<String>
     ) {
         packetLoopJob?.cancel()
+        runCatching { legacyForwarder?.close() }
+        legacyForwarder = null
         runCatching { tunInterface?.close() }
         currentBlockAll = blockAll
         currentBlockedApps = blockedApps
         currentProxyActive = enableProxy
         currentWhitelist = whitelist
 
-        val useLocalDns = BuildConfig.ENABLE_DNS_ADBLOCK && !isSystemPrivateDnsActive()
+        val useLegacyTunThrottle = enableProxy && Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+        val useLocalDns = (BuildConfig.ENABLE_DNS_ADBLOCK && !isSystemPrivateDnsActive()) || useLegacyTunThrottle
         currentUseLocalDns = useLocalDns
+
         val builder = Builder()
             .setSession("No Quota")
             .addAddress("10.0.0.2", 32)
@@ -404,6 +411,11 @@ class WifiGuardVpnService : VpnService() {
             builder.addRoute("0.0.0.0", 0)
             builder.addRoute("::", 0)
             blockedApps.forEach { pkg -> runCatching { builder.addAllowedApplication(pkg) } }
+        } else if (useLegacyTunThrottle) {
+            // Android 8/9 (API < 29, e.g. Oppo A1k) does not support VpnService.setHttpProxy -> use Tun2NetForwarder + TokenBucket
+            builder.addRoute("0.0.0.0", 0)
+            runCatching { builder.addDisallowedApplication(packageName) }
+            whitelist.forEach { pkg -> runCatching { builder.addDisallowedApplication(pkg) } }
         } else {
             if (useLocalDns) {
                 builder.addRoute("10.0.0.1", 32)
@@ -423,6 +435,30 @@ class WifiGuardVpnService : VpnService() {
         val pfd = tunInterface ?: return
         val input = FileInputStream(pfd.fileDescriptor)
         val output = FileOutputStream(pfd.fileDescriptor)
+
+        if (useLegacyTunThrottle) {
+            val fwd = runCatching { Tun2NetForwarder(this, dnsHandler, tokenBucket, output) }.getOrNull()
+            legacyForwarder = fwd
+            if (fwd != null) {
+                val policy = cachedPolicy
+                fwd.flags = Tun2NetForwarder.PacketPolicyFlags(
+                    blockAll = false,
+                    sinkholeEnabled = BuildConfig.ENABLE_DNS_ADBLOCK && policy.dnsSinkholeEnabled,
+                    cacheEnabled = policy.dnsCacheEnabled,
+                    blockDohDot = false,
+                    blockQuicUdp443 = true
+                )
+                packetLoopJob = serviceScope.launch {
+                    val buffer = ByteArray(32767)
+                    while (isActive) {
+                        val len = runCatching { input.read(buffer) }.getOrElse { -1 }
+                        if (len < 0) break
+                        if (len > 0) runCatching { fwd.processTunPacket(buffer, len) }
+                    }
+                }
+            }
+            return
+        }
 
         packetLoopJob = serviceScope.launch {
             val buffer = ByteArray(32767)

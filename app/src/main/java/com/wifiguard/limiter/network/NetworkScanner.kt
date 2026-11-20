@@ -96,9 +96,8 @@ object NetworkScanner {
         val ssid = map["ssid"] ?: ""
         val mac = map["bssid"] ?: map["gwmac"] ?: ""
         return when {
-            ssid.isNotBlank() && mac.isNotBlank() -> "$ssid ($mac)"
             ssid.isNotBlank() -> ssid
-            mac.isNotBlank() -> "راوتر ($mac)"
+            mac.isNotBlank() -> "شبكة ($mac)"
             else -> sig
         }
     }

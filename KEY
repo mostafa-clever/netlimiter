@@ -1,0 +1,7 @@
+keytool -genkeypair -v \
+  -keystore noquota-release.jks \
+  -alias noquota \
+  -keyalg RSA -keysize 2048 -validity 10000 \
+  -storepass YOUR_STRONG_PASSWORD \
+  -keypass YOUR_STRONG_PASSWORD \
+  -dname "CN=NoQuota, OU=App, O=NoQuota, L=Cairo, S=Egypt, C=EG"

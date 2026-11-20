@@ -1130,13 +1130,27 @@ private fun AdvancedSettingsTab(
             }
             val btnNetScope = rememberCoroutineScope()
             var showLocationRationale by remember { mutableStateOf(false) }
-            val locationLauncher = rememberLauncherForActivityResult(
-                ActivityResultContracts.RequestPermission()
-            ) { granted ->
+            var showManualSsidDialog by remember { mutableStateOf(false) }
+            var manualSsidText by remember { mutableStateOf("") }
+            var detectedMacPart by remember { mutableStateOf("") }
+
+            fun captureOrAskSsid() {
                 btnNetScope.launch {
                     val sig = NetworkScanner.getCurrentWifiSignatureActive(ctx)
-                    if (sig.isNotBlank()) onSetTargetNetwork(true, sig)
+                    if (sig.contains("ssid=")) {
+                        onSetTargetNetwork(true, sig)
+                    } else {
+                        detectedMacPart = sig
+                        manualSsidText = ""
+                        showManualSsidDialog = true
+                    }
                 }
+            }
+
+            val locationLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.RequestPermission()
+            ) { _ ->
+                captureOrAskSsid()
             }
             OutlinedButton(
                 onClick = {
@@ -1144,10 +1158,7 @@ private fun AdvancedSettingsTab(
                     if (!hasLoc) {
                         showLocationRationale = true
                     } else {
-                        btnNetScope.launch {
-                            val sig = NetworkScanner.getCurrentWifiSignatureActive(ctx)
-                            if (sig.isNotBlank()) onSetTargetNetwork(true, sig)
-                        }
+                        captureOrAskSsid()
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
@@ -1159,6 +1170,42 @@ private fun AdvancedSettingsTab(
                     fontSize = 12.sp
                 )
             }
+            if (showManualSsidDialog) {
+                AlertDialog(
+                    onDismissRequest = { showManualSsidDialog = false },
+                    title = { Text("أدخل اسم شبكة الواي فاي", fontWeight = FontWeight.Bold) },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                "فعّل زر الموقع (GPS) في شريط الإشعارات لقراءة الاسم تلقائياً، أو اكتب اسم شبكة الواي فاي هنا مباشرة:",
+                                fontSize = 12.sp,
+                                color = TextMuted
+                            )
+                            OutlinedTextField(
+                                value = manualSsidText,
+                                onValueChange = { manualSsidText = it },
+                                label = { Text("اسم شبكة الواي فاي (SSID)") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            val clean = manualSsidText.trim()
+                            if (clean.isNotBlank()) {
+                                val combined = if (detectedMacPart.isNotBlank()) "ssid=$clean|$detectedMacPart" else "ssid=$clean"
+                                onSetTargetNetwork(true, combined)
+                                showManualSsidDialog = false
+                            }
+                        }) { Text("حفظ") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showManualSsidDialog = false }) { Text("إلغاء") }
+                    }
+                )
+            }
+
             if (showLocationRationale) {
                 AlertDialog(
                     onDismissRequest = { showLocationRationale = false },

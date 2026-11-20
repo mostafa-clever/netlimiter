@@ -29,12 +29,24 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Decode Release Keystore from Secrets (if configured)
+      - name: Prepare Release Keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
             echo "$KEYSTORE_BASE64" | base64 --decode > app/wifiguard-release.jks
+          elif [ ! -f app/wifiguard-release.jks ]; then
+            echo "KEYSTORE_BASE64 secret not set; generating fallback release keystore..."
+            keytool -genkeypair -v \
+              -keystore app/wifiguard-release.jks \
+              -alias "${KEY_ALIAS:-wifiguard}" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "${KEYSTORE_PASSWORD:-wifiguard2026}" \
+              -keypass "${KEY_PASSWORD:-wifiguard2026}" \
+              -dname "CN=NoQuota, OU=App, O=NoQuota, L=Cairo, S=Egypt, C=EG"
           fi
 
       - name: Build GitHub Release APK & Play Store Release AAB

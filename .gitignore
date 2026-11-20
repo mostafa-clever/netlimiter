@@ -10,5 +10,3 @@
 .cxx/
 *.jks
 *.keystore
-KEY
-keystore_base64.txt
