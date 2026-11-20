@@ -152,17 +152,7 @@ class WifiGuardVpnService : VpnService() {
             }
         }
         _isRunning.value = true
-        serviceScope.launch {
-            proxyServer = LocalHttpProxyServer(this@WifiGuardVpnService, tokenBucket).also { it.start() }
-            runCatching {
-                establishTunnel(
-                    blockAll = false,
-                    blockedApps = emptySet(),
-                    enableProxy = true,
-                    whitelist = emptySet()
-                )
-            }
-        }
+        proxyServer = LocalHttpProxyServer(this@WifiGuardVpnService, tokenBucket).also { it.start() }
         startMonitoringLoop()
     }
 
@@ -388,7 +378,8 @@ class WifiGuardVpnService : VpnService() {
                         proxyServer?.updateMediaSaverConfig(mediaSaverOn, cfg.speedPolicy.mediaCdnSpeedMbps, blockUpdatesOn)
                         val blockAllNow = effective.state == ConnectionState.BLOCKED || effective.state == ConnectionState.IDLE_FROZEN
                         val proxyNeeded = !blockAllNow && overQuotaApps.isEmpty() && (effective.targetBytesPerSec < Long.MAX_VALUE || mediaSaverOn || blockUpdatesOn)
-                        val useLocalDnsNow = BuildConfig.ENABLE_DNS_ADBLOCK && !isSystemPrivateDnsActive()
+                        val useLegacyNow = proxyNeeded && Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+                        val useLocalDnsNow = (BuildConfig.ENABLE_DNS_ADBLOCK && !isSystemPrivateDnsActive()) || useLegacyNow
                         val meteredNow = effective.saverActive && cfg.speedPolicy.meteredWifiSaverEnabled
 
                         if (blockAllNow != currentBlockAll ||
@@ -432,6 +423,7 @@ class WifiGuardVpnService : VpnService() {
         currentBlockAll = blockAll
         currentBlockedApps = blockedApps
         currentProxyActive = enableProxy
+        currentMeteredMode = meteredMode
         currentWhitelist = whitelist
 
         val lockdownOn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
