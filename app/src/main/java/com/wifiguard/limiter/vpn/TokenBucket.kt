@@ -39,6 +39,8 @@ class TokenBucket {
         }
     }
 
+    fun getRateBytesPerSec(): Long = rateBytesPerSec.get()
+
     fun isUnlimited(): Boolean = rateBytesPerSec.get() == Long.MAX_VALUE
 
     fun isBlocked(): Boolean = rateBytesPerSec.get() <= 0L
@@ -64,11 +66,12 @@ class TokenBucket {
     fun millisUntilBytes(minBytes: Int): Long {
         val rate = rateBytesPerSec.get()
         if (rate == Long.MAX_VALUE) return 0L
-        if (rate <= 0L) return 100L
+        if (rate <= 0L) return 200L
         refillLocked(rate)
         val needed = (minBytes - tokens).coerceAtLeast(0.0)
         if (needed <= 0.0) return 0L
-        return ((needed * 1000.0) / rate.toDouble()).toLong().coerceIn(5L, 100L)
+        // Coalesce wakeups (25ms..200ms) so CPU & Wi-Fi radio burst instead of 5ms spin-looping
+        return ((needed * 1000.0) / rate.toDouble()).toLong().coerceIn(25L, 200L)
     }
 
     @Synchronized
@@ -76,7 +79,6 @@ class TokenBucket {
         val rate = rateBytesPerSec.get()
         if (rate == Long.MAX_VALUE || bytes <= 0) return
         val maxBurst = maxOf(16_384.0, rate * 0.25)
-        // Allow bounded token debt so concurrent threads cannot bypass the rate limit
         tokens = (tokens - bytes.toDouble()).coerceAtLeast(-maxBurst)
     }
 }

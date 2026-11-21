@@ -55,8 +55,8 @@ class LocalHttpProxyServer(
     private var serverSocket: ServerSocket? = null
     private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
     private val executor = ThreadPoolExecutor(
-        8,
-        160,
+        2,
+        64,
         30L,
         TimeUnit.SECONDS,
         LinkedBlockingQueue(256)
@@ -204,8 +204,8 @@ class LocalHttpProxyServer(
                             remote.use { r ->
                                 if (!vpnService.protect(r)) return
                                 r.tcpNoDelay = true
-                                r.soTimeout = 300_000
-                                c.soTimeout = 300_000
+                                r.soTimeout = 60_000
+                                c.soTimeout = 60_000
                                 r.connect(InetSocketAddress(host, port), 8000)
 
                                 cOut.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII))
@@ -321,13 +321,13 @@ class LocalHttpProxyServer(
                         val gAvail = if (globalLimited) tokenBucket.availableBytes() else buf.size
                         val mAvail = if (mediaLimited) mediaTokenBucket.availableBytes() else buf.size
                         val avail = minOf(gAvail, mAvail)
-                        if (avail >= 256) {
-                            maxRead = avail.coerceIn(256, buf.size)
+                        if (avail >= 4096) {
+                            maxRead = avail.coerceIn(4096, buf.size)
                             break
                         }
-                        val gSleep = if (globalLimited && gAvail < 256) tokenBucket.millisUntilBytes(256) else 0L
-                        val mSleep = if (mediaLimited && mAvail < 256) mediaTokenBucket.millisUntilBytes(256) else 0L
-                        val sleepMs = maxOf(gSleep, mSleep, 5L)
+                        val gSleep = if (globalLimited && gAvail < 256) tokenBucket.millisUntilBytes(4096) else 0L
+                        val mSleep = if (mediaLimited && mAvail < 256) mediaTokenBucket.millisUntilBytes(4096) else 0L
+                        val sleepMs = maxOf(gSleep, mSleep, 25L)
                         try {
                             Thread.sleep(sleepMs)
                         } catch (_: InterruptedException) {

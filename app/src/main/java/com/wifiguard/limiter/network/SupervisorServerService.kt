@@ -113,21 +113,7 @@ class SupervisorServerService : Service() {
                 startForeground(NOTIF_ID, notif)
             }
         }
-        runCatching {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            if (wm != null) {
-                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                } else {
-                    @Suppress("DEPRECATION")
-                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
-                }
-                wifiLock = wm.createWifiLock(mode, "WifiGuard:SupervisorLock").apply {
-                    setReferenceCounted(false)
-                    acquire()
-                }
-            }
-        }
+        // Avoid holding permanent LOW_LATENCY WifiLock to preserve Supervisor battery
         registerNsdService()
         startHttpServer()
         registerSupervisorWifiReconnect()
@@ -611,7 +597,7 @@ class SupervisorServerService : Service() {
                         val silentMs = if (d.lastSeenMillis > 0L) (now - d.lastSeenMillis) else 0L
                         val wasIdleSleeping = d.connectionState == ConnectionState.IDLE_FROZEN
                         // Screen-off heartbeats run every 180s; allow >= 240s (or 360s when IDLE_FROZEN) before offline alert
-                        val timeoutThresholdMs = if (wasIdleSleeping) 360_000L else 240_000L
+                        val timeoutThresholdMs = if (wasIdleSleeping) 1_200_000L else 480_000L
                         var heartbeatTimedOut = d.lastSeenMillis > 0L && (silentMs > timeoutThresholdMs)
                         var portClosedCheat = false
 
@@ -623,7 +609,7 @@ class SupervisorServerService : Service() {
                         var probeOnline: Boolean? = null
                         var probeWarning: String? = null
 
-                        if (silentMs > 120_000L && d.lastKnownIp.isNotBlank()) {
+                        if (silentMs > 360_000L && d.lastKnownIp.isNotBlank()) {
                             when (val probe = LocalLanClient.probeClientStatus(d.lastKnownIp, d.authToken)) {
                                 is ClientProbeResult.Online -> {
                                     val liveStatus = probe.json

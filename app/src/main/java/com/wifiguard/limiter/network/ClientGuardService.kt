@@ -62,6 +62,10 @@ class ClientGuardService : Service() {
     private var screenOnReceiver: android.content.BroadcastReceiver? = null
     private var wasVpnRunning: Boolean = false
     private var lastAppsSentMs: Long = 0L
+    private var lastScreenOnSyncMs: Long = 0L
+    private var lastNsdScanMs: Long = 0L
+    private var lastSyncedConfig: SyncedLimitConfig? = null
+    private val wakeSyncChannel = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
 
     companion object {
         const val CHANNEL_ID = "wifiguard_client_guard_channel"
@@ -115,7 +119,11 @@ class ClientGuardService : Service() {
         runCatching {
             val rx = object : android.content.BroadcastReceiver() {
                 override fun onReceive(context: Context?, intent: Intent?) {
-                    serviceScope.launch { syncWithSupervisorOnce() }
+                    val now = System.currentTimeMillis()
+                    if (now - lastScreenOnSyncMs >= 60_000L) {
+                        lastScreenOnSyncMs = now
+                        wakeSyncChannel.trySend(Unit)
+                    }
                 }
             }
             screenOnReceiver = rx
@@ -379,9 +387,13 @@ class ClientGuardService : Service() {
                             failures = 0
                         } else if (!_isUnpairedFlow.value) {
                             failures++
-                            if (failures >= 2) {
+                            val screenOnNow = pm?.isInteractive ?: true
+                            val nowMs = System.currentTimeMillis()
+                            // Never run multicast mDNS discovery while screen is off; rate-limit to once per 10 min when screen is on
+                            if (screenOnNow && failures >= 3 && (nowMs - lastNsdScanMs >= 600_000L)) {
                                 failures = 0
-                                val candidates = withTimeoutOrNull(8_000L) {
+                                lastNsdScanMs = nowMs
+                                val candidates = withTimeoutOrNull(4_000L) {
                                     LocalLanClient.discoverSupervisors(applicationContext).first { it.isNotEmpty() }
                                 } ?: emptyList()
                                 for (cand in candidates) {
@@ -395,7 +407,8 @@ class ClientGuardService : Service() {
                     }
                 }
                 val interactive = pm?.isInteractive ?: true
-                delay(if (interactive) 60_000L else 180_000L)
+                val waitMs = if (interactive) 180_000L else 900_000L
+                withTimeoutOrNull(waitMs) { wakeSyncChannel.receive() }
             }
         }
     }
@@ -443,18 +456,21 @@ class ClientGuardService : Service() {
                 if (updated.authToken.isNotBlank() && token.isBlank()) {
                     prefs.setClientAuthToken(updated.authToken)
                 }
-                prefs.updateLocalLimits(
-                    limitMb = updated.dailyLimitMb,
-                    limitPeriod = updated.limitPeriod,
-                    speedPolicy = updated.speedPolicy,
-                    whitelist = updated.whitelistedPackages,
-                    globalSpeedCapMbps = updated.globalSpeedCapMbps,
-                    forceQuotaSaver = updated.forceQuotaSaver,
-                    targetNetworkOnly = updated.targetNetworkOnly,
-                    targetNetworkSig = updated.targetNetworkSig,
-                    isPaused = updated.isPaused
-                )
-                WifiGuardVpnService.notifyConfigChanged()
+                if (updated != lastSyncedConfig) {
+                    lastSyncedConfig = updated
+                    prefs.updateLocalLimits(
+                        limitMb = updated.dailyLimitMb,
+                        limitPeriod = updated.limitPeriod,
+                        speedPolicy = updated.speedPolicy,
+                        whitelist = updated.whitelistedPackages,
+                        globalSpeedCapMbps = updated.globalSpeedCapMbps,
+                        forceQuotaSaver = updated.forceQuotaSaver,
+                        targetNetworkOnly = updated.targetNetworkOnly,
+                        targetNetworkSig = updated.targetNetworkSig,
+                        isPaused = updated.isPaused
+                    )
+                    WifiGuardVpnService.notifyConfigChanged()
+                }
                 return true
             }
             HeartbeatOutcome.Unpaired -> {

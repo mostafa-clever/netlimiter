@@ -67,7 +67,7 @@ fun normalizeArabicDigits(input: String): String {
 
 data class SpeedPolicyConfig(
     // Base speed cap in Mbps (megabits/sec; 0.0 = unlimited / full speed)
-    val baseSpeedLimitMbPerSec: Double = 3.0,
+    val baseSpeedLimitMbPerSec: Double = 2.0,
     // Phased slowdown rules (kept for schema compatibility)
     val slowdownStartPercent: Int = 50,
     val slowdownInitialSpeedPercent: Int = 40,
@@ -97,7 +97,7 @@ data class SpeedPolicyConfig(
     val upstreamDnsIp: String = "94.140.14.14",
     val appQuotaPercents: Map<String, Int> = emptyMap(),
     val mediaCdnSaverEnabled: Boolean = true,
-    val mediaCdnSpeedMbps: Double = 1.2,
+    val mediaCdnSpeedMbps: Double = 0.75,
     val blockAppUpdatesInSaver: Boolean = true,
     // Time-window pacing limit (e.g. max 50% within a 6-hour window)
     val windowPaceEnabled: Boolean = false,
@@ -107,7 +107,7 @@ data class SpeedPolicyConfig(
     val meteredWifiSaverEnabled: Boolean = true
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
-        put("baseSpeedLimitMbPerSec", baseSpeedLimitMbPerSec.sanitizeFinite(3.0, 0.0, 1000.0))
+        put("baseSpeedLimitMbPerSec", baseSpeedLimitMbPerSec.sanitizeFinite(2.0, 0.0, 1000.0))
         put("slowdownStartPercent", slowdownStartPercent.coerceIn(10, 95))
         put("slowdownInitialSpeedPercent", slowdownInitialSpeedPercent.coerceIn(5, 100))
         put("slowdownStepPerPercent", slowdownStepPerPercent.coerceIn(1, 5))
@@ -133,7 +133,7 @@ data class SpeedPolicyConfig(
         put("upstreamDnsIp", if (isValidIpv4(upstreamDnsIp)) upstreamDnsIp.trim() else "94.140.14.14")
         put("appQuotaPercents", JSONObject(appQuotaPercents.filterValues { it in 1..100 }))
         put("mediaCdnSaverEnabled", mediaCdnSaverEnabled)
-        put("mediaCdnSpeedMbps", mediaCdnSpeedMbps.sanitizeFinite(1.2, 0.25, 1000.0))
+        put("mediaCdnSpeedMbps", mediaCdnSpeedMbps.sanitizeFinite(0.75, 0.25, 1000.0))
         put("blockAppUpdatesInSaver", blockAppUpdatesInSaver)
         put("windowPaceEnabled", windowPaceEnabled)
         put("windowHours", windowHours.coerceIn(1, 24))
@@ -148,7 +148,7 @@ data class SpeedPolicyConfig(
             val rawDns = obj.optCleanString("upstreamDnsIp", "94.140.14.14").trim()
             val validDns = if (isValidIpv4(rawDns)) rawDns else "94.140.14.14"
             return SpeedPolicyConfig(
-                baseSpeedLimitMbPerSec = obj.optDouble("baseSpeedLimitMbPerSec", 3.0).sanitizeFinite(3.0, 0.0, 1000.0),
+                baseSpeedLimitMbPerSec = obj.optDouble("baseSpeedLimitMbPerSec", 2.0).sanitizeFinite(2.0, 0.0, 1000.0),
                 slowdownStartPercent = obj.optInt("slowdownStartPercent", 50).coerceIn(10, 95),
                 slowdownInitialSpeedPercent = obj.optInt("slowdownInitialSpeedPercent", 40).coerceIn(5, 100),
                 slowdownStepPerPercent = obj.optInt("slowdownStepPerPercent", 1).coerceIn(1, 5),
@@ -174,7 +174,7 @@ data class SpeedPolicyConfig(
                 upstreamDnsIp = validDns,
                 appQuotaPercents = parseAppQuotaMap(obj.optJSONObject("appQuotaPercents")),
                 mediaCdnSaverEnabled = obj.optBoolean("mediaCdnSaverEnabled", true),
-                mediaCdnSpeedMbps = obj.optDouble("mediaCdnSpeedMbps", 1.2).sanitizeFinite(1.2, 0.25, 1000.0),
+                mediaCdnSpeedMbps = obj.optDouble("mediaCdnSpeedMbps", 0.75).sanitizeFinite(0.75, 0.25, 1000.0),
                 blockAppUpdatesInSaver = obj.optBoolean("blockAppUpdatesInSaver", true),
                 windowPaceEnabled = obj.optBoolean("windowPaceEnabled", false),
                 windowHours = obj.optInt("windowHours", 6).coerceIn(1, 24),
@@ -197,7 +197,7 @@ data class SpeedPolicyConfig(
         fun presetBalanced() = SpeedPolicyConfig()
 
         fun presetMaxSaver() = SpeedPolicyConfig(
-            baseSpeedLimitMbPerSec = 2.0,
+            baseSpeedLimitMbPerSec = 1.5,
             slowdownStartPercent = 40,
             slowdownInitialSpeedPercent = 35,
             slowdownStepPerPercent = 1,
@@ -219,7 +219,8 @@ data class SpeedPolicyConfig(
             burstThresholdMbPerMin = 30,
             burstCapSpeedMbPerSec = 0.75,
             nightSaverEnabled = true,
-            nightSaverSpeedMbPerSec = 0.3
+            nightSaverSpeedMbPerSec = 0.3,
+            mediaCdnSpeedMbps = 0.55
         )
 
         fun presetRelaxed() = SpeedPolicyConfig(

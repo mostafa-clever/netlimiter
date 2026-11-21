@@ -18,6 +18,9 @@ class DnsPacketHandler(private val vpnService: VpnService) {
 
     private val dnsCache = ConcurrentHashMap<String, CachedDns>()
     val blockedRequestsCount = AtomicLong(0L)
+    val blockedUpdateQueriesCount = AtomicLong(0L)
+    val strippedHttpsQueriesCount = AtomicLong(0L)
+
     @Volatile
     var upstreamDnsIp: String = "94.140.14.14"
         set(value) {
@@ -27,34 +30,184 @@ class DnsPacketHandler(private val vpnService: VpnService) {
             }
         }
 
-    private val blockedDomainSuffixes = listOf(
+    // O(label-depth) HashSet for fast suffix lookup (~3-4 lookups per DNS query instead of O(N) list scan)
+    private val blockedAdDomains: Set<String> = hashSetOf(
+        // Google & YouTube Ads / Telemetry
         "doubleclick.net",
         "googlesyndication.com",
         "googleadservices.com",
         "adservice.google.com",
+        "pagead2.googlesyndication.com",
         "app-measurement.com",
         "crashlytics.com",
+        "firebase-settings.crashlytics.com",
+        "firebaselogging-pa.googleapis.com",
+        "admob.com",
+        "google-analytics.com",
+        "googletagmanager.com",
+        "googletagservices.com",
+        // Meta / Facebook / Instagram Ads & Analytics
         "ads.facebook.com",
         "an.facebook.com",
+        "graph.instagram.com",
+        "pixel.facebook.com",
+        "analytics.facebook.com",
+        // TikTok / ByteDance Ads & Telemetry
         "analytics.tiktok.com",
         "ads.tiktok.com",
+        "ads-sg.tiktok.com",
+        "log-va.tiktokv.com",
+        "mon-va.tiktokv.com",
+        "log.byteoversea.com",
+        "maliva-mcs.byteoversea.com",
+        "mcs-va.tiktokv.com",
+        "mssdk-va.tiktokv.com",
+        "p16-ad-sg.ibyteimg.com",
+        // Mobile Ad Networks & Mediation SDKs
         "taboola.com",
         "outbrain.com",
         "scorecardresearch.com",
         "mixpanel.com",
         "amplitude.com",
         "appsflyer.com",
+        "appsflyersdk.com",
         "adjust.com",
         "branch.io",
         "mopub.com",
         "unityads.unity3d.com",
         "applovin.com",
+        "applvn.com",
         "vungle.com",
         "ironsrc.com",
+        "supersonicads.com",
         "chartboost.com",
         "inmobi.com",
-        "adcolony.com"
+        "adcolony.com",
+        "criteo.com",
+        "criteo.net",
+        "pubmatic.com",
+        "openx.net",
+        "rubiconproject.com",
+        "adnxs.com",
+        "casalemedia.com",
+        "amazon-adsystem.com",
+        "flurry.com",
+        "branchmetrics.io",
+        "braze.com",
+        "onesignal.com",
+        "clevertap-prod.com",
+        "kochava.com",
+        "singular.net",
+        "startappservice.com",
+        "pangle-ads.com",
+        "pangolin-sdk-toutiao.com",
+        "bytegoofy.com",
+        "mintegral.com",
+        "rayjump.com",
+        "liftoff.io",
+        "fyber.com",
+        "tapjoy.com",
+        "smaato.net",
+        "yandex.ru",
+        "appmetrica.yandex.ru",
+        "ads.twitter.com",
+        "analytics.twitter.com",
+        "ads.snapchat.com",
+        "sc-analytics.appspot.com",
+        "sentry.io",
+        "bugsnag.com",
+        "newrelic.com",
+        "segment.io",
+        "segment.com",
+        "hotjar.com",
+        "fullstory.com",
+        "quantserve.com",
+        "doubleverify.com",
+        "moatads.com",
+        "adsafeprotected.com",
+        "demdex.net",
+        "omtrdc.net",
+        "krxd.net",
+        "bluekai.com",
+        "exelator.com",
+        "rlcdn.com",
+        "smartadserver.com",
+        "yieldmo.com",
+        "sharethrough.com",
+        "triplelift.com",
+        "indexww.com",
+        "33across.com",
+        "bidswitch.net",
+        "liadm.com",
+        "id5-sync.com",
+        "tapad.com",
+        "agkn.com",
+        "mathtag.com",
+        "rfihub.com",
+        "turn.com",
+        "adform.net",
+        "serving-sys.com",
+        "mediavine.com",
+        "adthrive.com",
+        // OEM Telemetry
+        "tracking.miui.com",
+        "data.mistat.xiaomi.com",
+        "sdkconfig.ad.xiaomi.com",
+        "metrics.data.hicloud.com",
+        "logservice.hicloud.com",
+        "samsungacr.com",
+        "samsungcloudsolution.com",
+        "smetrics.samsung.com",
+        "nmetrics.samsung.com",
+        "ads.heytapmobi.com"
     )
+
+    private val blockedUpdateDomains: Set<String> = hashSetOf(
+        "gvt1.com",
+        "gvt2.com",
+        "ota.googlezip.net",
+        "ota-cache1.googlezip.net",
+        "ota-cache2.googlezip.net",
+        "android.clients.google.com",
+        "update.googleapis.com",
+        "dl.google.com",
+        "fota-cloud-dn.ospserver.net",
+        "vas.samsungapps.com",
+        "otacdn.coloros.com",
+        "bigota.d.miui.com",
+        "hugeota.d.miui.com",
+        "update.miui.com",
+        "query.hicloud.com",
+        "update.dbankcdn.com"
+    )
+
+    private val blockedDohDomains: Set<String> = hashSetOf(
+        "dns.google",
+        "dns.google.com",
+        "cloudflare-dns.com",
+        "mozilla.cloudflare-dns.com",
+        "dns.quad9.net",
+        "doh.opendns.com",
+        "dns.nextdns.io",
+        "doh.cleanbrowsing.org",
+        "doh.dns.sb"
+    )
+
+    companion object {
+        private const val CACHE_TTL_MS = 30L * 60L * 1000L // 30 minutes to minimize radio wakeups
+        private const val MAX_CACHE_ENTRIES = 1000
+    }
+
+    private fun matchesDomainSet(domain: String, domainSet: Set<String>): Boolean {
+        if (domain in domainSet) return true
+        var idx = domain.indexOf('.')
+        while (idx != -1) {
+            val parent = domain.substring(idx + 1)
+            if (parent in domainSet) return true
+            idx = domain.indexOf('.', idx + 1)
+        }
+        return false
+    }
 
     fun handlePacket(
         packet: ByteArray,
@@ -63,7 +216,8 @@ class DnsPacketHandler(private val vpnService: VpnService) {
         cacheEnabled: Boolean,
         blockDohDot: Boolean,
         blockQuicUdp443: Boolean,
-        stripAaaa: Boolean = false
+        stripAaaa: Boolean = false,
+        blockAppUpdates: Boolean = false
     ): ByteArray? {
         if (length < 28 || length > packet.size) return null
         val version = (packet[0].toInt() ushr 4) and 0xF
@@ -75,12 +229,11 @@ class DnsPacketHandler(private val vpnService: VpnService) {
         val ipTotalLen = ((packet[2].toInt() and 0xFF) shl 8) or (packet[3].toInt() and 0xFF)
         if (ipTotalLen < ihl + 8 || ipTotalLen > length) return null
 
-        // Drop fragmented IPv4 packets
         val fragFlagsAndOffset = ((packet[6].toInt() and 0x3F) shl 8) or (packet[7].toInt() and 0xFF)
         if (fragFlagsAndOffset != 0) return null
 
         val protocol = packet[9].toInt() and 0xFF
-        if (protocol != 17) return null // Only UDP handled here
+        if (protocol != 17) return null
 
         val srcIp = packet.copyOfRange(12, 16)
         val dstIp = packet.copyOfRange(16, 20)
@@ -89,14 +242,12 @@ class DnsPacketHandler(private val vpnService: VpnService) {
         val udpLen = ((packet[ihl + 4].toInt() and 0xFF) shl 8) or (packet[ihl + 5].toInt() and 0xFF)
         if (udpLen < 8 || ihl + udpLen > ipTotalLen) return null
 
-        // Drop QUIC (UDP 443) or DoT/DoH UDP bypasses
         if (dstPort == 443 && (blockQuicUdp443 || blockDohDot)) {
             return null
         }
         if (dstPort == 853 && blockDohDot) {
             return null
         }
-
         if (dstPort != 53) return null
 
         val dnsOffset = ihl + 8
@@ -108,14 +259,27 @@ class DnsPacketHandler(private val vpnService: VpnService) {
         val domain = extractQueryDomain(dnsPayload)?.trimEnd('.')?.lowercase()
         val qType = extractQueryType(dnsPayload)
 
-        // 1. Local DNS Sinkhole (type-aware: 0.0.0.0 for A, :: for AAAA, NXDOMAIN for others)
-        if (sinkholeEnabled && domain != null && isBlockedDomain(domain)) {
-            blockedRequestsCount.incrementAndGet()
-            val sinkholeDns = buildSinkholeResponse(dnsPayload, qType) ?: return null
-            return wrapIpv4UdpPacket(dstIp, srcIp, dstPort, srcPort, sinkholeDns)
+        // 1. Strip HTTPS/SVCB (qType=65) when QUIC blocking is enabled so apps cleanly skip HTTP/3 & use TCP/TLS 443
+        if (blockQuicUdp443 && qType == 65) {
+            strippedHttpsQueriesCount.incrementAndGet()
+            val emptyResp = buildEmptyNoErrorResponse(dnsPayload) ?: return null
+            return wrapIpv4UdpPacket(dstIp, srcIp, dstPort, srcPort, emptyResp)
         }
 
-        // 2. Return empty NOERROR for AAAA queries ONLY when IPv4-only legacy tunnel is active
+        // 2. Local DNS Sinkhole for Ads/Trackers, DoH Bypass, and Silent Auto-Updates
+        if (domain != null) {
+            val isAd = sinkholeEnabled && matchesDomainSet(domain, blockedAdDomains)
+            val isUpdate = blockAppUpdates && matchesDomainSet(domain, blockedUpdateDomains)
+            val isDoh = blockDohDot && matchesDomainSet(domain, blockedDohDomains)
+            if (isAd || isUpdate || isDoh) {
+                blockedRequestsCount.incrementAndGet()
+                if (isUpdate) blockedUpdateQueriesCount.incrementAndGet()
+                val sinkholeDns = buildSinkholeResponse(dnsPayload, qType) ?: return null
+                return wrapIpv4UdpPacket(dstIp, srcIp, dstPort, srcPort, sinkholeDns)
+            }
+        }
+
+        // 3. Return empty NOERROR for AAAA queries when IPv4-only TUN forwarding is active (prevents IPv6 bypass)
         if (stripAaaa && qType == 28) {
             val emptyResp = buildEmptyNoErrorResponse(dnsPayload) ?: return null
             return wrapIpv4UdpPacket(dstIp, srcIp, dstPort, srcPort, emptyResp)
@@ -125,7 +289,7 @@ class DnsPacketHandler(private val vpnService: VpnService) {
             dnsCache.clear()
         }
 
-        // 3. DNS Cache (keyed by upstreamDnsIp + domain + qType; caches valid non-truncated NOERROR for 5 min)
+        // 4. 30-Minute DNS Cache (cuts redundant DNS radio wakeups)
         val cacheKey = "$upstreamDnsIp:${domain ?: ""}:$qType"
         val now = System.currentTimeMillis()
         if (cacheEnabled && domain != null) {
@@ -138,7 +302,7 @@ class DnsPacketHandler(private val vpnService: VpnService) {
             }
         }
 
-        // 4. Forward to upstream DNS via protected socket
+        // 5. Forward to upstream DNS via protected socket
         val upstreamResp = forwardDnsQuery(dnsPayload) ?: return null
         if (cacheEnabled && domain != null && upstreamResp.size >= 12) {
             val flagsHi = upstreamResp[2].toInt() and 0xFF
@@ -148,12 +312,12 @@ class DnsPacketHandler(private val vpnService: VpnService) {
             if (rcode == 0 && !isTruncated) {
                 dnsCache[cacheKey] = CachedDns(
                     responsePayload = upstreamResp.copyOf(),
-                    expiresAtMillis = now + 5L * 60L * 1000L
+                    expiresAtMillis = now + CACHE_TTL_MS
                 )
-                if (dnsCache.size > 500) {
+                if (dnsCache.size > MAX_CACHE_ENTRIES) {
                     val expiredKeys = dnsCache.entries.filter { it.value.expiresAtMillis <= now }.map { it.key }
                     expiredKeys.forEach { dnsCache.remove(it) }
-                    if (dnsCache.size > 500) dnsCache.clear()
+                    if (dnsCache.size > MAX_CACHE_ENTRIES) dnsCache.clear()
                 }
             }
         }
@@ -161,16 +325,6 @@ class DnsPacketHandler(private val vpnService: VpnService) {
         return wrapIpv4UdpPacket(dstIp, srcIp, dstPort, srcPort, upstreamResp)
     }
 
-    private fun isBlockedDomain(domain: String): Boolean {
-        return blockedDomainSuffixes.any { suffix ->
-            domain == suffix || domain.endsWith(".$suffix")
-        }
-    }
-
-    /**
-     * Walks a QNAME starting at [startPos], handling compression pointers safely without infinite loops.
-     * Returns the index immediately after the QNAME, or -1 if malformed.
-     */
     private fun findQNameEnd(dns: ByteArray, startPos: Int = 12): Int {
         var pos = startPos
         var steps = 0
@@ -180,10 +334,9 @@ class DnsPacketHandler(private val vpnService: VpnService) {
             if (len == 0) return pos + 1
             val typeBits = len and 0xC0
             if (typeBits == 0xC0) {
-                // Compression pointer consumes 2 bytes and terminates QNAME
                 return if (pos + 2 <= dns.size) pos + 2 else -1
             }
-            if (typeBits != 0) return -1 // Invalid label type
+            if (typeBits != 0) return -1
             pos += 1 + len
         }
         return -1
@@ -247,15 +400,14 @@ class DnsPacketHandler(private val vpnService: VpnService) {
         if (query.size < 12) return null
         val qNameEnd = findQNameEnd(query, 12)
         if (qNameEnd < 0) return null
-        val questionEnd = qNameEnd + 4 // QTYPE (2) + QCLASS (2)
+        val questionEnd = qNameEnd + 4
         if (questionEnd > query.size) return null
 
-        // For non-A/AAAA queries (e.g., HTTPS/65, TXT, SRV), return clean NXDOMAIN
         if (qType != 1 && qType != 28) {
             val out = ByteBuffer.allocate(questionEnd)
             out.put(query[0])
             out.put(query[1])
-            out.putShort(0x8183.toShort()) // Standard response, NXDOMAIN
+            out.putShort(0x8183.toShort())
             out.putShort(1)
             out.putShort(0)
             out.putShort(0)
@@ -276,10 +428,10 @@ class DnsPacketHandler(private val vpnService: VpnService) {
         out.put(query, 12, questionEnd - 12)
         out.putShort(0xC00C.toShort())
         out.putShort(qType.toShort())
-        out.putShort(1) // CLASS IN
-        out.putInt(300) // TTL 300s
+        out.putShort(1)
+        out.putInt(600) // TTL 600s so apps don't hammer blocked ad domains every few seconds
         out.putShort(rdataLen.toShort())
-        out.put(ByteArray(rdataLen)) // 0.0.0.0 or ::
+        out.put(ByteArray(rdataLen))
         return out.array()
     }
 
@@ -297,7 +449,7 @@ class DnsPacketHandler(private val vpnService: VpnService) {
                 if (!vpnService.protect(socket)) {
                     return null
                 }
-                socket.soTimeout = 3000
+                socket.soTimeout = 2000
                 val upstream = parseIpv4Address(upstreamDnsIp)
                 val outPacket = DatagramPacket(query, query.size, upstream, 53)
                 socket.send(outPacket)
@@ -306,7 +458,6 @@ class DnsPacketHandler(private val vpnService: VpnService) {
                 val inPacket = DatagramPacket(buf, buf.size)
                 socket.receive(inPacket)
                 if (inPacket.length > 1372) {
-                    // Signal TC=1 (Truncated) so client resolver retries cleanly over TCP instead of corrupting packet
                     buildTruncatedResponse(query)
                 } else {
                     buf.copyOf(inPacket.length)
@@ -326,7 +477,7 @@ class DnsPacketHandler(private val vpnService: VpnService) {
         val out = ByteBuffer.allocate(questionEnd)
         out.put(query[0])
         out.put(query[1])
-        out.putShort(0x8380.toShort()) // QR=1, TC=1, RD=1, RA=1, NOERROR
+        out.putShort(0x8380.toShort())
         out.putShort(1)
         out.putShort(0)
         out.putShort(0)
@@ -346,7 +497,6 @@ class DnsPacketHandler(private val vpnService: VpnService) {
         val pkt = ByteArray(totalLen)
         val buf = ByteBuffer.wrap(pkt)
 
-        // IPv4 Header
         buf.put(0x45.toByte())
         buf.put(0x00.toByte())
         buf.putShort(totalLen.toShort())
