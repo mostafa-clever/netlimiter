@@ -1,5 +1,16 @@
 package com.wifiguard.limiter.ui.screens
 
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.PowerManager
+import android.os.SystemClock
+import android.provider.Settings
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -27,26 +38,22 @@ import androidx.compose.material.icons.rounded.AddCircleOutline
 import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.BarChart
+import androidx.compose.material.icons.rounded.BatteryChargingFull
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Devices
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
+import androidx.compose.material.icons.rounded.HelpOutline
 import androidx.compose.material.icons.rounded.HourglassBottom
 import androidx.compose.material.icons.rounded.Lock
-import androidx.compose.material.icons.rounded.BatteryChargingFull
 import androidx.compose.material.icons.rounded.PauseCircle
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.PlayCircle
-import android.content.Intent
-import android.net.Uri
-import android.os.PowerManager
-import android.provider.Settings
-import androidx.compose.material.icons.rounded.HelpOutline
 import androidx.compose.material.icons.rounded.Refresh
-import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Speed
+import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.AlertDialog
@@ -55,12 +62,14 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -76,34 +85,36 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import android.Manifest
-import android.content.pm.PackageManager
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.LocalContext
-import androidx.core.content.ContextCompat
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextDirection
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.wifiguard.limiter.BuildConfig
 import com.wifiguard.limiter.admin.WifiGuardDeviceAdminReceiver
+import com.wifiguard.limiter.data.AppUsageStatsHelper
 import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.AppRole
 import com.wifiguard.limiter.model.ConnectionState
@@ -113,14 +124,16 @@ import com.wifiguard.limiter.model.SpeedPolicyConfig
 import com.wifiguard.limiter.model.TamperAlert
 import com.wifiguard.limiter.model.formatDataSizeArabic
 import com.wifiguard.limiter.model.formatSpeedArabic
-import com.wifiguard.limiter.network.NetworkScanner
+import com.wifiguard.limiter.model.isValidIpv4
+import com.wifiguard.limiter.model.normalizeArabicDigits
+import com.wifiguard.limiter.model.sanitizeFinite
 import com.wifiguard.limiter.network.LocalLanClient
+import com.wifiguard.limiter.network.NetworkScanner
 import com.wifiguard.limiter.network.SupervisorServerService
-import com.wifiguard.limiter.update.GitHubUpdater
+import com.wifiguard.limiter.ui.components.AppQuotaPercentsDialog
 import com.wifiguard.limiter.ui.components.GuideType
 import com.wifiguard.limiter.ui.components.SetupGuideDialog
 import com.wifiguard.limiter.ui.components.UsageRingCard
-import com.wifiguard.limiter.ui.components.AppQuotaPercentsDialog
 import com.wifiguard.limiter.ui.components.WhitelistPickerDialog
 import com.wifiguard.limiter.ui.theme.AlertRed
 import com.wifiguard.limiter.ui.theme.AlertRedBg
@@ -129,8 +142,17 @@ import com.wifiguard.limiter.ui.theme.SoftMint
 import com.wifiguard.limiter.ui.theme.SuccessGreen
 import com.wifiguard.limiter.ui.theme.TextMuted
 import com.wifiguard.limiter.ui.theme.WarnAmber
+import com.wifiguard.limiter.update.GitHubUpdater
 import com.wifiguard.limiter.vpn.WifiGuardVpnService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.DecimalFormat
+import java.text.DecimalFormatSymbols
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -147,18 +169,17 @@ fun SupervisorScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var selectedTab by remember { mutableIntStateOf(0) }
+    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
 
     val pairingCode by prefs.pairingCodeFlow.collectAsState(initial = "")
     val devices by prefs.managedDevicesFlow.collectAsState(initial = emptyList())
     val alerts by prefs.tamperAlertsFlow.collectAsState(initial = emptyList())
-    val supervisorPin by prefs.supervisorPinFlow.collectAsState(initial = "")
+    val hasSupervisorPin by prefs.hasSupervisorPinFlow.collectAsState(initial = false)
     val githubRepo by prefs.githubRepoFlow.collectAsState(initial = "")
     val globalSpeedCapMbps by prefs.globalSpeedCapMbpsFlow.collectAsState(initial = 0.0)
     val forceQuotaSaverAll by prefs.forceQuotaSaverAllFlow.collectAsState(initial = false)
     val targetNetworkOnly by prefs.targetNetworkOnlyFlow.collectAsState(initial = false)
     val targetNetworkSig by prefs.targetNetworkSigFlow.collectAsState(initial = "")
-    val blockedAds by WifiGuardVpnService.blockedAdsCount.collectAsState()
     val alwaysOnSystem by WifiGuardVpnService.isAlwaysOnActive.collectAsState()
     val alwaysOnConfirmed by prefs.alwaysOnConfirmedFlow.collectAsState(initial = false)
     val alwaysOnActive = alwaysOnSystem || alwaysOnConfirmed
@@ -181,7 +202,41 @@ fun SupervisorScreen(
     var showSelfWhitelistDialog by remember { mutableStateOf(false) }
     var showSelfLimitDialog by remember { mutableStateOf(false) }
     var pinGateAction by remember { mutableStateOf<(() -> Unit)?>(null) }
-    var showSupervisorGuide by remember { mutableStateOf(false) }
+    var showSupervisorGuide by rememberSaveable { mutableStateOf(false) }
+    var isRefreshing by remember { mutableStateOf(false) }
+
+    var resumeTick by remember { mutableIntStateOf(0) }
+    var adminActive by remember { mutableStateOf(WifiGuardDeviceAdminReceiver.isActive(context)) }
+    var hasUsageAccess by remember { mutableStateOf(AppUsageStatsHelper.hasUsageStatsPermission(context)) }
+    var showAlwaysOnGuide by rememberSaveable { mutableStateOf(false) }
+    var pinUnlockedUntilMs by rememberSaveable { mutableLongStateOf(0L) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                adminActive = WifiGuardDeviceAdminReceiver.isActive(context)
+                hasUsageAccess = AppUsageStatsHelper.hasUsageStatsPermission(context)
+                resumeTick++
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val localIp by produceState(initialValue = "جاري الفحص...", key1 = resumeTick) {
+        value = withContext(Dispatchers.IO) { SupervisorServerService.getLocalWifiIp(context) }
+    }
+
+    fun requirePinIfSet(action: () -> Unit) {
+        if (hasSupervisorPin && SystemClock.elapsedRealtime() > pinUnlockedUntilMs) {
+            pinGateAction = {
+                pinUnlockedUntilMs = SystemClock.elapsedRealtime() + 5 * 60_000L
+                action()
+            }
+        } else {
+            action()
+        }
+    }
 
     LaunchedEffect(Unit) {
         prefs.getOrCreatePairingCode()
@@ -192,30 +247,34 @@ fun SupervisorScreen(
         if (selectedTab == 2) {
             val now = System.currentTimeMillis()
             val todayKey = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-            devices.forEach { d ->
-                if (d.lastKnownIp.isNotBlank()) {
-                    val live = LocalLanClient.fetchClientStatus(d.lastKnownIp, fullAnalytics = true)
-                    if (live != null && live.optBoolean("ok", false)) {
-                        val newUsed = live.optLong("usedMb", d.usedMb)
-                        val newSaved = live.optLong("savedMbToday", d.savedMbToday)
-                        val appObj = live.optJSONObject("appUsageMb")
-                        val liveApps = mutableMapOf<String, Long>()
-                        appObj?.keys()?.forEach { k -> liveApps[k] = appObj.optLong(k, 0L) }
-                        val uHist = d.dailyUsageHistory.toMutableMap().apply { put(todayKey, newUsed) }
-                        val sHist = d.dailySavedHistory.toMutableMap().apply { put(todayKey, newSaved) }
-                        prefs.upsertManagedDevice(
-                            d.copy(
-                                usedMb = newUsed,
-                                savedMbToday = newSaved,
-                                appUsageMb = if (liveApps.isNotEmpty()) liveApps else d.appUsageMb,
-                                dailyUsageHistory = uHist,
-                                dailySavedHistory = sHist,
-                                lastSeenMillis = now,
-                                isOnline = true
-                            )
-                        )
+            val snapshot = devices
+            coroutineScope {
+                snapshot.filter { it.lastKnownIp.isNotBlank() }.map { d ->
+                    async {
+                        val live = LocalLanClient.fetchClientStatus(d.lastKnownIp, fullAnalytics = true, authToken = d.authToken)
+                        if (live != null && live.optBoolean("ok", false)) {
+                            val newUsed = live.optLong("usedMb", d.usedMb).coerceAtLeast(0L)
+                            val newUsedToday = if (live.has("usedMbToday")) live.optLong("usedMbToday", 0L).coerceAtLeast(0L) else if (d.limitPeriod == LimitPeriod.DAILY) newUsed else (d.dailyUsageHistory[todayKey] ?: 0L)
+                            val newSaved = live.optLong("savedMbToday", d.savedMbToday).coerceAtLeast(0L)
+                            val appObj = live.optJSONObject("appUsageMb")
+                            val liveApps = mutableMapOf<String, Long>()
+                            appObj?.keys()?.forEach { k -> liveApps[k] = appObj.optLong(k, 0L).coerceAtLeast(0L) }
+                            prefs.updateManagedDevice(d.deviceId) { cur ->
+                                val uHist = cur.dailyUsageHistory.toMutableMap().apply { put(todayKey, newUsedToday) }
+                                val sHist = cur.dailySavedHistory.toMutableMap().apply { put(todayKey, newSaved) }
+                                cur.copy(
+                                    usedMb = newUsed,
+                                    savedMbToday = newSaved,
+                                    appUsageMb = if (live.has("appUsageMb")) liveApps else cur.appUsageMb,
+                                    dailyUsageHistory = uHist,
+                                    dailySavedHistory = sHist,
+                                    lastSeenMillis = now,
+                                    isOnline = true
+                                )
+                            }
+                        }
                     }
-                }
+                }.awaitAll()
             }
         }
     }
@@ -240,46 +299,68 @@ fun SupervisorScreen(
                         Icon(Icons.Rounded.HelpOutline, contentDescription = "دليل المشرف", tint = Color.White)
                     }
                     if (selectedTab == 0 && devices.isNotEmpty()) {
-                        IconButton(onClick = {
-                            scope.launch {
-                                val now = System.currentTimeMillis()
-                                val todayKey = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-                                devices.forEach { d ->
-                                    if (d.lastKnownIp.isNotBlank()) {
-                                        val live = LocalLanClient.fetchClientStatus(d.lastKnownIp)
-                                        if (live != null && live.optBoolean("ok", false)) {
-                                            val newUsed = live.optLong("usedMb", d.usedMb)
-                                            val newSaved = live.optLong("savedMbToday", d.savedMbToday)
-                                            val newSpeed = live.optDouble("actualSpeedMbps", d.actualSpeedMbps)
-                                            val appObj = live.optJSONObject("appUsageMb")
-                                            val liveApps = mutableMapOf<String, Long>()
-                                            appObj?.keys()?.forEach { k -> liveApps[k] = appObj.optLong(k, 0L) }
-                                            val prot = live.optBoolean("protectionActive", d.protectionActive)
-                                            val st = runCatching {
-                                                ConnectionState.valueOf(live.optString("connectionState", d.connectionState.name))
-                                            }.getOrDefault(d.connectionState)
-                                            val uHist = d.dailyUsageHistory.toMutableMap().apply { put(todayKey, newUsed) }
-                                            val sHist = d.dailySavedHistory.toMutableMap().apply { put(todayKey, newSaved) }
-                                            prefs.upsertManagedDevice(
-                                                d.copy(
-                                                    usedMb = newUsed,
-                                                    savedMbToday = newSaved,
-                                                    actualSpeedMbps = newSpeed,
-                                                    appUsageMb = if (liveApps.isNotEmpty()) liveApps else d.appUsageMb,
-                                                    protectionActive = prot,
-                                                    connectionState = if (prot) st else ConnectionState.PROTECTION_OFF,
-                                                    dailyUsageHistory = uHist,
-                                                    dailySavedHistory = sHist,
-                                                    lastSeenMillis = now,
-                                                    isOnline = true
-                                                )
-                                            )
+                        IconButton(
+                            enabled = !isRefreshing,
+                            onClick = {
+                                if (isRefreshing) return@IconButton
+                                isRefreshing = true
+                                scope.launch {
+                                    try {
+                                        resumeTick++
+                                        val now = System.currentTimeMillis()
+                                        val todayKey = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+                                        val snapshot = devices
+                                        val results = coroutineScope {
+                                            snapshot.map { d ->
+                                                async {
+                                                    if (d.lastKnownIp.isBlank()) return@async false
+                                                    val live = LocalLanClient.fetchClientStatus(d.lastKnownIp, authToken = d.authToken)
+                                                    if (live != null && live.optBoolean("ok", false)) {
+                                                        val newUsed = live.optLong("usedMb", d.usedMb).coerceAtLeast(0L)
+                                                        val newUsedToday = if (live.has("usedMbToday")) live.optLong("usedMbToday", 0L).coerceAtLeast(0L) else if (d.limitPeriod == LimitPeriod.DAILY) newUsed else (d.dailyUsageHistory[todayKey] ?: 0L)
+                                                        val newSaved = live.optLong("savedMbToday", d.savedMbToday).coerceAtLeast(0L)
+                                                        val newSpeed = live.optDouble("actualSpeedMbps", d.actualSpeedMbps).sanitizeFinite(0.0)
+                                                        val appObj = live.optJSONObject("appUsageMb")
+                                                        val liveApps = mutableMapOf<String, Long>()
+                                                        appObj?.keys()?.forEach { k -> liveApps[k] = appObj.optLong(k, 0L).coerceAtLeast(0L) }
+                                                        val prot = live.optBoolean("protectionActive", d.protectionActive)
+                                                        val st = runCatching {
+                                                            ConnectionState.valueOf(live.optString("connectionState", d.connectionState.name))
+                                                        }.getOrDefault(d.connectionState)
+                                                        prefs.updateManagedDevice(d.deviceId) { cur ->
+                                                            val uHist = cur.dailyUsageHistory.toMutableMap().apply { put(todayKey, newUsedToday) }
+                                                            val sHist = cur.dailySavedHistory.toMutableMap().apply { put(todayKey, newSaved) }
+                                                            cur.copy(
+                                                                usedMb = newUsed,
+                                                                savedMbToday = newSaved,
+                                                                actualSpeedMbps = newSpeed,
+                                                                appUsageMb = if (live.has("appUsageMb")) liveApps else cur.appUsageMb,
+                                                                protectionActive = prot,
+                                                                connectionState = if (prot) st else ConnectionState.PROTECTION_OFF,
+                                                                dailyUsageHistory = uHist,
+                                                                dailySavedHistory = sHist,
+                                                                lastSeenMillis = now,
+                                                                isOnline = true
+                                                            )
+                                                        }
+                                                        true
+                                                    } else false
+                                                }
+                                            }.awaitAll()
                                         }
+                                        val okCount = results.count { it }
+                                        Toast.makeText(context, "تم تحديث $okCount من ${snapshot.size} أجهزة", Toast.LENGTH_SHORT).show()
+                                    } finally {
+                                        isRefreshing = false
                                     }
                                 }
                             }
-                        }) {
-                            Icon(Icons.Rounded.Refresh, contentDescription = "تحديث الآن", tint = Color.White)
+                        ) {
+                            if (isRefreshing) {
+                                CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Rounded.Refresh, contentDescription = "تحديث الآن", tint = Color.White)
+                            }
                         }
                     }
                 },
@@ -329,48 +410,64 @@ fun SupervisorScreen(
             when (selectedTab) {
                 0 -> DevicesTab(
                     pairingCode = pairingCode,
-                    localIp = SupervisorServerService.getLocalWifiIp(context),
+                    localIp = localIp,
                     devices = devices,
                     alerts = alerts,
                     globalSpeedCapMbps = globalSpeedCapMbps,
-                    forceQuotaSaverAll = forceQuotaSaverAll,
-                    onToggleForceQuotaSaverAll = { forced -> scope.launch { prefs.setForceQuotaSaverAll(forced) } },
-                    onClearAlerts = { scope.launch { prefs.clearTamperAlerts() } },
-                    onEditDevice = { editingDevice = it },
+                    onClearAlerts = {
+                        requirePinIfSet { scope.launch { prefs.clearTamperAlerts() } }
+                    },
+                    onEditDevice = { dev ->
+                        requirePinIfSet { editingDevice = dev }
+                    },
                     onTogglePauseDevice = { dev ->
-                        val toggled = dev.copy(isPaused = !dev.isPaused)
-                        scope.launch {
-                            prefs.upsertManagedDevice(toggled)
-                            val ok = LocalLanClient.pushConfigToClient(
-                                clientIp = toggled.lastKnownIp,
-                                dailyLimitMb = toggled.dailyLimitMb,
-                                limitPeriod = toggled.limitPeriod,
-                                speedPolicy = toggled.speedPolicy,
-                                whitelistedPackages = toggled.whitelistedPackages,
-                                globalSpeedCapMbps = globalSpeedCapMbps,
-                                forceQuotaSaver = forceQuotaSaverAll || toggled.forceQuotaSaver,
-                                targetNetworkOnly = targetNetworkOnly,
-                                targetNetworkSig = targetNetworkSig,
-                                isPaused = toggled.isPaused
-                            )
-                            if (!ok) prefs.upsertManagedDevice(toggled.copy(pendingConfigPush = true))
+                        requirePinIfSet {
+                            val newPaused = !dev.isPaused
+                            scope.launch {
+                                prefs.updateManagedDevice(dev.deviceId) { it.copy(isPaused = newPaused) }
+                                val ok = LocalLanClient.pushConfigToClient(
+                                    clientIp = dev.lastKnownIp,
+                                    dailyLimitMb = dev.dailyLimitMb,
+                                    limitPeriod = dev.limitPeriod,
+                                    speedPolicy = dev.speedPolicy,
+                                    whitelistedPackages = dev.whitelistedPackages,
+                                    globalSpeedCapMbps = globalSpeedCapMbps,
+                                    forceQuotaSaver = forceQuotaSaverAll || dev.forceQuotaSaver,
+                                    targetNetworkOnly = targetNetworkOnly,
+                                    targetNetworkSig = targetNetworkSig,
+                                    isPaused = newPaused,
+                                    authToken = dev.authToken
+                                )
+                                if (!ok) {
+                                    prefs.updateManagedDevice(dev.deviceId) { it.copy(pendingConfigPush = true) }
+                                    Toast.makeText(context, "الجهاز غير متصل — سيتم التطبيق فور عودته", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(context, if (newPaused) "تم إيقاف الإنترنت عن ${dev.deviceName}" else "تم استئناف الإنترنت لـ ${dev.deviceName}", Toast.LENGTH_SHORT).show()
+                                }
+                            }
                         }
                     },
                     onQuickGlobalCapChange = { cap ->
-                        scope.launch {
-                            prefs.setGlobalSpeedCapMbps(cap)
-                            devices.forEach { d ->
-                                LocalLanClient.pushConfigToClient(
-                                    clientIp = d.lastKnownIp,
-                                    dailyLimitMb = d.dailyLimitMb,
-                                    limitPeriod = d.limitPeriod,
-                                    speedPolicy = d.speedPolicy,
-                                    whitelistedPackages = d.whitelistedPackages,
-                                    globalSpeedCapMbps = cap,
-                                    forceQuotaSaver = forceQuotaSaverAll || d.forceQuotaSaver,
-                    targetNetworkOnly = targetNetworkOnly,
-                                    targetNetworkSig = targetNetworkSig
-                                )
+                        requirePinIfSet {
+                            scope.launch {
+                                prefs.setGlobalSpeedCapMbps(cap)
+                                WifiGuardVpnService.notifyConfigChanged()
+                                devices.forEach { d ->
+                                    val ok = LocalLanClient.pushConfigToClient(
+                                        clientIp = d.lastKnownIp,
+                                        dailyLimitMb = d.dailyLimitMb,
+                                        limitPeriod = d.limitPeriod,
+                                        speedPolicy = d.speedPolicy,
+                                        whitelistedPackages = d.whitelistedPackages,
+                                        globalSpeedCapMbps = cap,
+                                        forceQuotaSaver = forceQuotaSaverAll || d.forceQuotaSaver,
+                                        targetNetworkOnly = targetNetworkOnly,
+                                        targetNetworkSig = targetNetworkSig,
+                                        isPaused = d.isPaused,
+                                        authToken = d.authToken
+                                    )
+                                    if (!ok) prefs.updateManagedDevice(d.deviceId) { it.copy(pendingConfigPush = true) }
+                                }
                             }
                         }
                     }
@@ -386,38 +483,30 @@ fun SupervisorScreen(
                     connState = connState,
                     statusLabel = statusLabel,
                     alwaysOnActive = alwaysOnActive,
-                    adminActive = WifiGuardDeviceAdminReceiver.isActive(context),
+                    adminActive = adminActive,
                     onToggleSelfLimit = { enable ->
                         val action = {
                             scope.launch {
                                 prefs.setSelfLimitEnabled(enable)
-                                if (!enable) onStopVpn()
+                                if (!enable) onStopVpn() else onRequestStartVpn()
                             }
                         }
-                        if (!enable && supervisorPin.isNotBlank()) {
-                            pinGateAction = { action() }
-                        } else {
-                            action()
-                        }
+                        if (!enable) requirePinIfSet { action() } else action()
                     },
-                    onEditLimits = {
-                        if (supervisorPin.isNotBlank()) {
-                            pinGateAction = { showSelfLimitDialog = true }
-                        } else {
-                            showSelfLimitDialog = true
-                        }
-                    },
+                    onRequestStartVpn = onRequestStartVpn,
+                    onEditLimits = { requirePinIfSet { showSelfLimitDialog = true } },
                     onAddBonusQuota = { extraMb ->
-                        scope.launch { prefs.addBonusQuotaMb(extraMb) }
-                    },
-                    onEditWhitelist = {
-                        if (supervisorPin.isNotBlank()) {
-                            pinGateAction = { showSelfWhitelistDialog = true }
-                        } else {
-                            showSelfWhitelistDialog = true
+                        requirePinIfSet {
+                            scope.launch {
+                                prefs.addBonusQuotaMb(extraMb)
+                                WifiGuardVpnService.notifyConfigChanged()
+                                Toast.makeText(context, "تمت إضافة +$extraMb م.ب بنجاح", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     },
-                    onOpenAlwaysOn = onOpenAlwaysOnSettings,
+                    onEditWhitelist = { requirePinIfSet { showSelfWhitelistDialog = true } },
+                    hasUsageAccess = hasUsageAccess,
+                    onOpenAlwaysOn = { showAlwaysOnGuide = true },
                     onRequestAdmin = onRequestDeviceAdmin
                 )
                 2 -> AnalyticsSection(
@@ -425,38 +514,120 @@ fun SupervisorScreen(
                     localUsageHistory = localUsageHist,
                     localSavedHistory = localSavedHist,
                     localAppUsageMb = localAppUsageMb,
-                    includeSelf = selfLimitEnabled
+                    includeSelf = selfLimitEnabled,
+                    selfUsedMbToday = if (limitPeriod == LimitPeriod.DAILY) usedMb else 0L
                 )
                 else -> AdvancedSettingsTab(
                     globalSpeedCapMbps = globalSpeedCapMbps,
                     policy = speedPolicy,
-                    currentPin = supervisorPin,
+                    hasPin = hasSupervisorPin,
                     deviceCount = devices.size,
-                    onSaveGlobalCap = { cap -> scope.launch { prefs.setGlobalSpeedCapMbps(cap) } },
-                    onSavePolicy = { newPolicy ->
-                        scope.launch {
-                            prefs.updateLocalLimits(dailyLimitMb, limitPeriod, newPolicy, whitelist, globalSpeedCapMbps)
+                    onSavePolicyWithCap = { newPolicy, newGlobalCap ->
+                        requirePinIfSet {
+                            scope.launch {
+                                val effCap = newGlobalCap ?: globalSpeedCapMbps
+                                if (newGlobalCap != null && newGlobalCap != globalSpeedCapMbps) {
+                                    prefs.setGlobalSpeedCapMbps(newGlobalCap)
+                                }
+                                prefs.updateLocalLimits(dailyLimitMb, limitPeriod, newPolicy, whitelist, effCap)
+                                WifiGuardVpnService.notifyConfigChanged()
+                                Toast.makeText(context, "تم حفظ الإعدادات", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     },
-                    onApplyPolicyToAll = { newPolicy ->
-                        scope.launch {
-                            prefs.updateLocalLimits(dailyLimitMb, limitPeriod, newPolicy, whitelist, globalSpeedCapMbps)
-                            prefs.applyPolicyToAllDevices(newPolicy)
+                    onApplyPolicyToAllWithCap = { newPolicy, newGlobalCap ->
+                        requirePinIfSet {
+                            scope.launch {
+                                val effCap = newGlobalCap ?: globalSpeedCapMbps
+                                if (newGlobalCap != null && newGlobalCap != globalSpeedCapMbps) {
+                                    prefs.setGlobalSpeedCapMbps(newGlobalCap)
+                                }
+                                prefs.updateLocalLimits(dailyLimitMb, limitPeriod, newPolicy, whitelist, effCap)
+                                prefs.applyPolicyToAllDevices(newPolicy)
+                                WifiGuardVpnService.notifyConfigChanged()
+                                val pushedCount = coroutineScope {
+                                    devices.map { d ->
+                                        async {
+                                            val mergedPolicy = newPolicy.copy(appQuotaPercents = d.speedPolicy.appQuotaPercents)
+                                            val ok = LocalLanClient.pushConfigToClient(
+                                                clientIp = d.lastKnownIp,
+                                                dailyLimitMb = d.dailyLimitMb,
+                                                limitPeriod = d.limitPeriod,
+                                                speedPolicy = mergedPolicy,
+                                                whitelistedPackages = d.whitelistedPackages,
+                                                globalSpeedCapMbps = effCap,
+                                                forceQuotaSaver = forceQuotaSaverAll || d.forceQuotaSaver,
+                                                targetNetworkOnly = targetNetworkOnly,
+                                                targetNetworkSig = targetNetworkSig,
+                                                isPaused = d.isPaused,
+                                                authToken = d.authToken
+                                            )
+                                            if (ok) prefs.updateManagedDevice(d.deviceId) { it.copy(pendingConfigPush = false) }
+                                            ok
+                                        }
+                                    }.awaitAll().count { it }
+                                }
+                                Toast.makeText(context, "تم التطبيق ($pushedCount من ${devices.size} متصل)", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     },
                     githubRepo = githubRepo,
-                    onSaveGithubRepo = { repo -> scope.launch { prefs.setGithubRepo(repo) } },
                     targetNetworkOnly = targetNetworkOnly,
                     targetNetworkSig = targetNetworkSig,
-                    onSetTargetNetwork = { only, sig -> scope.launch { prefs.setTargetNetwork(only, sig) } },
-                    onSavePin = { newPin -> scope.launch { prefs.setSupervisorPin(newPin) } },
-                    onResetUsage = { scope.launch { prefs.resetUsageCounters() } },
+                    onSetTargetNetwork = { only, sig ->
+                        requirePinIfSet {
+                            scope.launch {
+                                prefs.setTargetNetwork(only, sig)
+                                WifiGuardVpnService.notifyConfigChanged()
+                                val finalSig = sig ?: targetNetworkSig
+                                devices.forEach { d ->
+                                    val ok = LocalLanClient.pushConfigToClient(
+                                        clientIp = d.lastKnownIp,
+                                        dailyLimitMb = d.dailyLimitMb,
+                                        limitPeriod = d.limitPeriod,
+                                        speedPolicy = d.speedPolicy,
+                                        whitelistedPackages = d.whitelistedPackages,
+                                        globalSpeedCapMbps = globalSpeedCapMbps,
+                                        forceQuotaSaver = forceQuotaSaverAll || d.forceQuotaSaver,
+                                        targetNetworkOnly = only,
+                                        targetNetworkSig = finalSig,
+                                        isPaused = d.isPaused,
+                                        authToken = d.authToken
+                                    )
+                                    if (!ok) prefs.updateManagedDevice(d.deviceId) { it.copy(pendingConfigPush = true) }
+                                }
+                            }
+                        }
+                    },
+                    onSavePin = { newPin ->
+                        requirePinIfSet {
+                            scope.launch {
+                                prefs.setSupervisorPin(newPin)
+                                Toast.makeText(
+                                    context,
+                                    if (newPin.isBlank()) "تم إلغاء الرمز السري" else "تم حفظ الرمز السري بنجاح",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+                    },
+                    onResetUsage = {
+                        requirePinIfSet {
+                            scope.launch {
+                                prefs.resetUsageCounters()
+                                WifiGuardVpnService.notifyConfigChanged()
+                                Toast.makeText(context, "تم تصفير عدادات الاستهلاك", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
                     onSwitchRole = {
-                        scope.launch {
-                            prefs.setRole(AppRole.UNSET)
-                            onStopVpn()
-                            SupervisorServerService.stop(context)
-                            onResetRole()
+                        requirePinIfSet {
+                            scope.launch {
+                                prefs.setRole(AppRole.UNSET)
+                                onStopVpn()
+                                SupervisorServerService.stop(context)
+                                onResetRole()
+                            }
                         }
                     }
                 )
@@ -470,7 +641,15 @@ fun SupervisorScreen(
             onDismiss = { editingDevice = null },
             onSave = { updated ->
                 scope.launch {
-                    prefs.upsertManagedDevice(updated)
+                    prefs.updateManagedDevice(updated.deviceId) { cur ->
+                        cur.copy(
+                            dailyLimitMb = updated.dailyLimitMb,
+                            limitPeriod = updated.limitPeriod,
+                            forceQuotaSaver = updated.forceQuotaSaver,
+                            speedPolicy = updated.speedPolicy,
+                            whitelistedPackages = updated.whitelistedPackages
+                        )
+                    }
                     var pushed = false
                     for (attempt in 0..2) {
                         pushed = LocalLanClient.pushConfigToClient(
@@ -481,14 +660,19 @@ fun SupervisorScreen(
                             whitelistedPackages = updated.whitelistedPackages,
                             globalSpeedCapMbps = globalSpeedCapMbps,
                             forceQuotaSaver = forceQuotaSaverAll || updated.forceQuotaSaver,
-                    targetNetworkOnly = targetNetworkOnly,
-                            targetNetworkSig = targetNetworkSig
+                            targetNetworkOnly = targetNetworkOnly,
+                            targetNetworkSig = targetNetworkSig,
+                            isPaused = updated.isPaused,
+                            authToken = updated.authToken
                         )
                         if (pushed) break
-                        kotlinx.coroutines.delay(1500L)
+                        delay(1500L)
                     }
                     if (!pushed) {
-                        prefs.upsertManagedDevice(updated.copy(pendingConfigPush = true))
+                        prefs.updateManagedDevice(updated.deviceId) { it.copy(pendingConfigPush = true) }
+                        Toast.makeText(context, "تم الحفظ — سيتم التطبيق عند اتصال ${updated.deviceName}", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, "تم حفظ وإرسال الإعدادات لـ ${updated.deviceName}", Toast.LENGTH_SHORT).show()
                     }
                 }
                 editingDevice = null
@@ -509,6 +693,7 @@ fun SupervisorScreen(
             onSave = { newLimit, newPeriod, newPolicy ->
                 scope.launch {
                     prefs.updateLocalLimits(newLimit, newPeriod, newPolicy, whitelist, globalSpeedCapMbps)
+                    WifiGuardVpnService.notifyConfigChanged()
                 }
                 showSelfLimitDialog = false
             }
@@ -522,6 +707,7 @@ fun SupervisorScreen(
             onConfirm = { newSet ->
                 scope.launch {
                     prefs.updateLocalLimits(dailyLimitMb, limitPeriod, speedPolicy, newSet, globalSpeedCapMbps)
+                    WifiGuardVpnService.notifyConfigChanged()
                 }
                 showSelfWhitelistDialog = false
             }
@@ -535,9 +721,20 @@ fun SupervisorScreen(
         )
     }
 
+    if (showAlwaysOnGuide) {
+        SetupGuideDialog(
+            guideType = GuideType.ALWAYS_ON_VPN,
+            onDismiss = { showAlwaysOnGuide = false },
+            onPrimaryAction = onOpenAlwaysOnSettings,
+            primaryActionLabel = "فتح إعدادات الحماية الآن",
+            onSecondaryAction = { scope.launch { prefs.setAlwaysOnConfirmed(true) } },
+            secondaryActionLabel = "تم التفعيل ✓"
+        )
+    }
+
     pinGateAction?.let { action ->
         PinCheckDialog(
-            expectedPin = supervisorPin,
+            onVerifyPin = { candidate -> prefs.verifySupervisorPin(candidate) },
             onDismiss = { pinGateAction = null },
             onSuccess = {
                 pinGateAction = null
@@ -555,8 +752,6 @@ private fun DevicesTab(
     devices: List<ManagedDevice>,
     alerts: List<TamperAlert>,
     globalSpeedCapMbps: Double,
-    forceQuotaSaverAll: Boolean,
-    onToggleForceQuotaSaverAll: (Boolean) -> Unit,
     onClearAlerts: () -> Unit,
     onEditDevice: (ManagedDevice) -> Unit,
     onTogglePauseDevice: (ManagedDevice) -> Unit,
@@ -589,8 +784,10 @@ private fun DevicesTab(
                     }
                 }
                 Spacer(modifier = Modifier.height(6.dp))
+                var showAllAlerts by remember { mutableStateOf(false) }
                 val fmt = remember { SimpleDateFormat("hh:mm a", Locale("ar")) }
-                alerts.take(5).forEach { alert ->
+                val visibleAlerts = if (showAllAlerts) alerts else alerts.take(5)
+                visibleAlerts.forEach { alert ->
                     Text(
                         text = "• ${alert.message} (${fmt.format(Date(alert.timestampMillis))})",
                         fontSize = 13.sp,
@@ -598,18 +795,25 @@ private fun DevicesTab(
                         modifier = Modifier.padding(vertical = 2.dp)
                     )
                 }
+                if (alerts.size > 5) {
+                    TextButton(onClick = { showAllAlerts = !showAllAlerts }) {
+                        Text(if (showAllAlerts) "عرض أقل" else "عرض الكل (${alerts.size})", color = AlertRed, fontSize = 12.sp)
+                    }
+                }
             }
         }
     }
 
     val supCtx = LocalContext.current
-    val supPm = remember { supCtx.getSystemService(android.content.Context.POWER_SERVICE) as PowerManager }
-    var supBatteryExempt by remember { mutableStateOf(supPm.isIgnoringBatteryOptimizations(supCtx.packageName)) }
+    val supPm = remember { supCtx.getSystemService(Context.POWER_SERVICE) as? PowerManager }
+    var supBatteryExempt by remember {
+        mutableStateOf(runCatching { supPm?.isIgnoringBatteryOptimizations(supCtx.packageName) == true }.getOrDefault(false))
+    }
     val supLifecycle = LocalLifecycleOwner.current
     DisposableEffect(supLifecycle) {
         val obs = LifecycleEventObserver { _, ev ->
             if (ev == Lifecycle.Event.ON_RESUME) {
-                supBatteryExempt = supPm.isIgnoringBatteryOptimizations(supCtx.packageName)
+                supBatteryExempt = runCatching { supPm?.isIgnoringBatteryOptimizations(supCtx.packageName) == true }.getOrDefault(false)
             }
         }
         supLifecycle.lifecycle.addObserver(obs)
@@ -632,19 +836,26 @@ private fun DevicesTab(
                     Text("استثنِ المشرف من توفير البطارية لضمان استقرار الاتصال", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 }
                 TextButton(onClick = {
-                    runCatching {
-                        val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                            data = Uri.parse("package:${supCtx.packageName}")
-                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                        }
-                        supCtx.startActivity(i)
+                    val opened = runCatching {
+                        supCtx.startActivity(
+                            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                data = Uri.parse("package:${supCtx.packageName}")
+                                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                            }
+                        )
+                    }.isSuccess || runCatching {
+                        supCtx.startActivity(
+                            Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }.isSuccess
+                    if (!opened) {
+                        Toast.makeText(supCtx, "يرجى استثناء التطبيق من تحسين البطارية عبر الإعدادات.", Toast.LENGTH_LONG).show()
                     }
                 }) { Text("تفعيل") }
             }
         }
     }
 
-    // Quick global speed cap bar for all devices
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
@@ -738,13 +949,13 @@ private fun DevicesTab(
         }
     } else {
         devices.forEach { device ->
-            DeviceMonitorCard(device = device, onClick = { onEditDevice(device) }, onTogglePause = { onTogglePauseDevice(device) })
+            DeviceMonitorCard(device = device, globalSpeedCapMbps = globalSpeedCapMbps, onClick = { onEditDevice(device) }, onTogglePause = { onTogglePauseDevice(device) })
         }
     }
 }
 
 @Composable
-private fun DeviceMonitorCard(device: ManagedDevice, onClick: () -> Unit, onTogglePause: () -> Unit) {
+private fun DeviceMonitorCard(device: ManagedDevice, globalSpeedCapMbps: Double, onClick: () -> Unit, onTogglePause: () -> Unit) {
     val progress = (device.usagePercent / 100f).coerceIn(0f, 1f)
     val barColor = when {
         !device.isOnline || !device.protectionActive -> AlertRed
@@ -767,7 +978,7 @@ private fun DeviceMonitorCard(device: ManagedDevice, onClick: () -> Unit, onTogg
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
                     Box(
                         modifier = Modifier
                             .size(10.dp)
@@ -835,14 +1046,39 @@ private fun DeviceMonitorCard(device: ManagedDevice, onClick: () -> Unit, onTogg
                 )
             }
 
-            val liveSpd = if (device.isOnline) String.format(Locale("ar"), "%.1f ميجابت/ث", device.actualSpeedMbps) else "0 ميجابت/ث"
-            val capText = formatSpeedArabic(device.speedPolicy.baseSpeedLimitMbPerSec)
+            val speedFmt = remember { DecimalFormat("0.#", DecimalFormatSymbols(Locale.US)) }
+            val safeSpeed = device.actualSpeedMbps.sanitizeFinite(0.0, 0.0, 10_000.0)
+            val liveSpd = if (device.isOnline) "${speedFmt.format(safeSpeed)} ميجابت/ث" else "0 ميجابت/ث"
+            val effBaseCap = when {
+                device.speedPolicy.baseSpeedLimitMbPerSec > 0.0 && globalSpeedCapMbps > 0.0 ->
+                    minOf(device.speedPolicy.baseSpeedLimitMbPerSec, globalSpeedCapMbps)
+                device.speedPolicy.baseSpeedLimitMbPerSec > 0.0 -> device.speedPolicy.baseSpeedLimitMbPerSec
+                globalSpeedCapMbps > 0.0 -> globalSpeedCapMbps
+                else -> 0.0
+            }
+            val capText = formatSpeedArabic(effBaseCap)
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = "السرعة الفعلية: $liveSpd (الحد: $capText) • المستثناة: ${device.whitelistedPackages.size}",
                 fontSize = 12.sp,
                 color = TextMuted
             )
+            if (device.pendingConfigPush) {
+                Text(
+                    text = "⏳ توجد تعديلات بانتظار اتصال الجهاز لتطبيقها",
+                    fontSize = 11.sp,
+                    color = WarnAmber,
+                    fontWeight = FontWeight.SemiBold
+                )
+            } else if (!device.isOnline && device.lastSeenMillis > 0L) {
+                val minsAgo = ((System.currentTimeMillis() - device.lastSeenMillis).coerceAtLeast(0L) / 60_000L)
+                val agoText = when {
+                    minsAgo < 1L -> "منذ لحظات"
+                    minsAgo < 60L -> "منذ $minsAgo دقيقة"
+                    else -> "منذ ${minsAgo / 60L} ساعة"
+                }
+                Text(text = "آخر ظهور: $agoText", fontSize = 11.sp, color = TextMuted)
+            }
 
             if (!device.tamperWarning.isNullOrBlank()) {
                 Spacer(modifier = Modifier.height(6.dp))
@@ -870,7 +1106,9 @@ private fun SelfLimitTab(
     statusLabel: String,
     alwaysOnActive: Boolean,
     adminActive: Boolean,
+    hasUsageAccess: Boolean,
     onToggleSelfLimit: (Boolean) -> Unit,
+    onRequestStartVpn: () -> Unit,
     onEditLimits: () -> Unit,
     onAddBonusQuota: (Long) -> Unit,
     onEditWhitelist: () -> Unit,
@@ -898,6 +1136,18 @@ private fun SelfLimitTab(
                 )
             }
             Switch(checked = selfLimitEnabled, onCheckedChange = onToggleSelfLimit)
+        }
+    }
+
+    if (selfLimitEnabled && !vpnRunning) {
+        Button(
+            onClick = onRequestStartVpn,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(14.dp)
+        ) {
+            Icon(Icons.Rounded.Shield, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("تفعيل حماية الاتصال الآن")
         }
     }
 
@@ -939,11 +1189,27 @@ private fun SelfLimitTab(
             ) {
                 Icon(Icons.Rounded.AddCircleOutline, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("إضافة رصيد إضافي سريع (+250 م.ب لليوم)")
+                Text("إضافة رصيد إضافي سريع (+250 م.ب للفترة الحالية)")
             }
             if (!alwaysOnActive) {
                 OutlinedButton(onClick = onOpenAlwaysOn, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
                     Text("تثبيت الحماية الدائمة من إعدادات الجهاز")
+                }
+            }
+            if (!hasUsageAccess && selfLimitEnabled) {
+                val slCtx = LocalContext.current
+                OutlinedButton(
+                    onClick = {
+                        runCatching {
+                            slCtx.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        }.onFailure {
+                            Toast.makeText(slCtx, "يرجى تفعيل صلاحية الوصول لبيانات الاستخدام من الإعدادات", Toast.LENGTH_LONG).show()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text("منح إذن إحصائيات التطبيقات")
                 }
             }
             if (!adminActive) {
@@ -960,13 +1226,11 @@ private fun SelfLimitTab(
 private fun AdvancedSettingsTab(
     globalSpeedCapMbps: Double,
     policy: SpeedPolicyConfig,
-    currentPin: String,
+    hasPin: Boolean,
     deviceCount: Int,
-    onSaveGlobalCap: (Double) -> Unit,
-    onSavePolicy: (SpeedPolicyConfig) -> Unit,
-    onApplyPolicyToAll: (SpeedPolicyConfig) -> Unit,
+    onSavePolicyWithCap: (SpeedPolicyConfig, Double?) -> Unit,
+    onApplyPolicyToAllWithCap: (SpeedPolicyConfig, Double?) -> Unit,
     githubRepo: String,
-    onSaveGithubRepo: (String) -> Unit,
     targetNetworkOnly: Boolean,
     targetNetworkSig: String,
     onSetTargetNetwork: (Boolean, String?) -> Unit,
@@ -975,20 +1239,28 @@ private fun AdvancedSettingsTab(
     onSwitchRole: () -> Unit
 ) {
     var draftPolicy by remember(policy) { mutableStateOf(policy) }
+    var presetSyncVersion by remember { mutableIntStateOf(0) }
+    LaunchedEffect(policy) {
+        draftPolicy = policy
+        presetSyncVersion++
+    }
     var globalCapText by remember(globalSpeedCapMbps) {
         mutableStateOf(if (globalSpeedCapMbps == 0.0) "0" else globalSpeedCapMbps.toString())
     }
+    var baseText by remember(presetSyncVersion) {
+        mutableStateOf(draftPolicy.baseSpeedLimitMbPerSec.toString())
+    }
+    var confirmResetUsage by remember { mutableStateOf(false) }
+    var confirmSwitchRole by remember { mutableStateOf(false) }
     val ctx = LocalContext.current
-    var pinInput by remember(currentPin) { mutableStateOf(currentPin) }
+    var pinInput by remember { mutableStateOf("") }
 
-    // Clean collapsible sections so everything is easy to find without clutter
-    var expandSpeed by remember { mutableStateOf(true) }
-    var expandPhases by remember { mutableStateOf(false) }
-    var expandGrace by remember { mutableStateOf(false) }
-    var expandAutomation by remember { mutableStateOf(false) }
-    var expandSecurity by remember { mutableStateOf(false) }
+    var expandSpeed by rememberSaveable { mutableStateOf(true) }
+    var expandPhases by rememberSaveable { mutableStateOf(false) }
+    var expandGrace by rememberSaveable { mutableStateOf(false) }
+    var expandAutomation by rememberSaveable { mutableStateOf(false) }
+    var expandSecurity by rememberSaveable { mutableStateOf(false) }
 
-    // 1-Tap Presets Card
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -997,27 +1269,30 @@ private fun AdvancedSettingsTab(
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("أوضاع جاهزة بضغطة واحدة", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = PrimaryTeal)
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val bal = SpeedPolicyConfig.presetBalanced()
+                val maxS = SpeedPolicyConfig.presetMaxSaver()
+                val rel = SpeedPolicyConfig.presetRelaxed()
                 FilterChip(
-                    selected = false,
+                    selected = draftPolicy.baseSpeedLimitMbPerSec == bal.baseSpeedLimitMbPerSec && draftPolicy.finalPhaseSpeedMbPerSec == bal.finalPhaseSpeedMbPerSec && draftPolicy.nightSaverEnabled == bal.nightSaverEnabled,
                     onClick = {
-                        draftPolicy = SpeedPolicyConfig.presetBalanced().copy(appQuotaPercents = draftPolicy.appQuotaPercents)
-                        onSavePolicy(draftPolicy)
+                        val next = bal.copy(appQuotaPercents = draftPolicy.appQuotaPercents)
+                        onSavePolicyWithCap(next, null)
                     },
                     label = { Text("متوازن") }
                 )
                 FilterChip(
-                    selected = false,
+                    selected = draftPolicy.baseSpeedLimitMbPerSec == maxS.baseSpeedLimitMbPerSec && draftPolicy.finalPhaseSpeedMbPerSec == maxS.finalPhaseSpeedMbPerSec && draftPolicy.nightSaverEnabled == maxS.nightSaverEnabled,
                     onClick = {
-                        draftPolicy = SpeedPolicyConfig.presetMaxSaver().copy(appQuotaPercents = draftPolicy.appQuotaPercents)
-                        onSavePolicy(draftPolicy)
+                        val next = maxS.copy(appQuotaPercents = draftPolicy.appQuotaPercents)
+                        onSavePolicyWithCap(next, null)
                     },
                     label = { Text("توفير أقصى") }
                 )
                 FilterChip(
-                    selected = false,
+                    selected = draftPolicy.baseSpeedLimitMbPerSec == rel.baseSpeedLimitMbPerSec && draftPolicy.finalPhaseSpeedMbPerSec == rel.finalPhaseSpeedMbPerSec && !draftPolicy.quotaSaverModeEnabled,
                     onClick = {
-                        draftPolicy = SpeedPolicyConfig.presetRelaxed().copy(appQuotaPercents = draftPolicy.appQuotaPercents)
-                        onSavePolicy(draftPolicy)
+                        val next = rel.copy(appQuotaPercents = draftPolicy.appQuotaPercents)
+                        onSavePolicyWithCap(next, null)
                     },
                     label = { Text("مرن (سرعة عالية)") }
                 )
@@ -1025,7 +1300,6 @@ private fun AdvancedSettingsTab(
         }
     }
 
-    // Section 1: Speed in MB/s (All devices & Default)
     AccordionCard(
         icon = Icons.Rounded.Speed,
         title = "1. السرعة القصوى (ميجابت/ث)",
@@ -1033,36 +1307,35 @@ private fun AdvancedSettingsTab(
         expanded = expandSpeed,
         onToggle = { expandSpeed = !expandSpeed }
     ) {
+        val parsedGlobal = normalizeArabicDigits(globalCapText).toDoubleOrNull()
+        val globalValid = parsedGlobal != null && parsedGlobal.isFinite() && parsedGlobal in 0.0..1000.0
         OutlinedTextField(
             value = globalCapText,
-            onValueChange = { txt ->
-                globalCapText = txt
-                txt.toDoubleOrNull()?.let { onSaveGlobalCap(it) }
-            },
+            onValueChange = { txt -> globalCapText = normalizeArabicDigits(txt) },
             label = { Text("الحد الأقصى للسرعة لجميع الأجهزة (ميجابت/ث، 0 = بدون حد)") },
+            isError = globalCapText.isNotBlank() && !globalValid,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
-        var baseText by remember(draftPolicy.baseSpeedLimitMbPerSec) {
-            mutableStateOf(draftPolicy.baseSpeedLimitMbPerSec.toString())
-        }
         OutlinedTextField(
             value = baseText,
             onValueChange = { txt ->
-                baseText = txt
-                txt.toDoubleOrNull()?.let { v ->
-                    draftPolicy = draftPolicy.copy(baseSpeedLimitMbPerSec = v.coerceAtLeast(0.0))
+                val norm = normalizeArabicDigits(txt)
+                baseText = norm
+                norm.toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.0..1000.0 }?.let { v ->
+                    draftPolicy = draftPolicy.copy(baseSpeedLimitMbPerSec = v)
                 }
             },
             label = { Text("السرعة الافتراضية قبل التهدئة (ميجابت/ث، 0 = سرعة كاملة)") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
     }
 
-    // Section 2: Phased Speed Rules
     AccordionCard(
         icon = Icons.Rounded.Tune,
         title = "2. السرعة النهائية قبل انتهاء الباقة",
@@ -1070,10 +1343,9 @@ private fun AdvancedSettingsTab(
         expanded = expandPhases,
         onToggle = { expandPhases = !expandPhases }
     ) {
-        PhasedRulesControls(policy = draftPolicy, onChange = { draftPolicy = it })
+        PhasedRulesControls(policy = draftPolicy, syncKey = presetSyncVersion, onChange = { draftPolicy = it })
     }
 
-    // Section 3: Extra Mile & Rollover
     AccordionCard(
         icon = Icons.Rounded.HourglassBottom,
         title = "3. الرصيد الإضافي وترحيل الباقة",
@@ -1081,10 +1353,9 @@ private fun AdvancedSettingsTab(
         expanded = expandGrace,
         onToggle = { expandGrace = !expandGrace }
     ) {
-        GraceAndRolloverControls(policy = draftPolicy, onChange = { draftPolicy = it })
+        GraceAndRolloverControls(policy = draftPolicy, syncKey = presetSyncVersion, onChange = { draftPolicy = it })
     }
 
-    // Section 4: Real Smart Automations
     AccordionCard(
         icon = Icons.Rounded.AutoAwesome,
         title = "4. التوفير الذكي التلقائي",
@@ -1092,13 +1363,15 @@ private fun AdvancedSettingsTab(
         expanded = expandAutomation,
         onToggle = { expandAutomation = !expandAutomation }
     ) {
-        SmartAutomationControls(policy = draftPolicy, onChange = { draftPolicy = it })
+        SmartAutomationControls(policy = draftPolicy, syncKey = presetSyncVersion, onChange = { draftPolicy = it })
     }
 
-    // Save / Apply to All buttons
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
         Button(
-            onClick = { onSavePolicy(draftPolicy) },
+            onClick = {
+                val parsedCap = normalizeArabicDigits(globalCapText).toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.0..1000.0 }
+                onSavePolicyWithCap(draftPolicy, parsedCap)
+            },
             modifier = Modifier.weight(1f),
             shape = RoundedCornerShape(14.dp)
         ) {
@@ -1106,7 +1379,10 @@ private fun AdvancedSettingsTab(
         }
         if (deviceCount > 0) {
             OutlinedButton(
-                onClick = { onApplyPolicyToAll(draftPolicy) },
+                onClick = {
+                    val parsedCap = normalizeArabicDigits(globalCapText).toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.0..1000.0 }
+                    onApplyPolicyToAllWithCap(draftPolicy, parsedCap)
+                },
                 modifier = Modifier.weight(1f),
                 shape = RoundedCornerShape(14.dp)
             ) {
@@ -1115,7 +1391,6 @@ private fun AdvancedSettingsTab(
         }
     }
 
-    // Section 4.5: Target Wi-Fi Network Only
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
@@ -1213,7 +1488,7 @@ private fun AdvancedSettingsTab(
                             )
                             OutlinedTextField(
                                 value = manualSsidText,
-                                onValueChange = { manualSsidText = it },
+                                onValueChange = { manualSsidText = it.replace("|", "") },
                                 label = { Text("اسم شبكة الواي فاي (SSID)") },
                                 singleLine = true,
                                 modifier = Modifier.fillMaxWidth()
@@ -1222,7 +1497,7 @@ private fun AdvancedSettingsTab(
                     },
                     confirmButton = {
                         TextButton(onClick = {
-                            val clean = manualSsidText.trim()
+                            val clean = manualSsidText.replace("|", "").trim()
                             if (clean.isNotBlank()) {
                                 val combined = if (detectedMacPart.isNotBlank()) "ssid=$clean|$detectedMacPart" else "ssid=$clean"
                                 onSetTargetNetwork(true, combined)
@@ -1259,101 +1534,144 @@ private fun AdvancedSettingsTab(
         }
     }
 
-    // Section 4.8: Auto-Update from GitHub Releases (GitHub flavor only)
     if (BuildConfig.ENABLE_GITHUB_UPDATER) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-    ) {
-        val updateScope = rememberCoroutineScope()
-        var updateMsg by remember { mutableStateOf<String?>(null) }
-        var isChecking by remember { mutableStateOf(false) }
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
+            val updateScope = rememberCoroutineScope()
+            var updateMsg by remember { mutableStateOf<String?>(null) }
+            var isChecking by remember { mutableStateOf(false) }
 
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Rounded.SystemUpdate, contentDescription = null, tint = PrimaryTeal)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("تحديثات التطبيق", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-            }
-            Text(
-                "الإصدار الحالي: 1.0.${GitHubUpdater.getInstalledVersionCode(ctx)}",
-                fontSize = 12.sp,
-                color = TextMuted
-            )
-            if (updateMsg != null) {
-                Text(updateMsg!!, fontSize = 12.sp, color = PrimaryTeal, fontWeight = FontWeight.Medium)
-            }
-            Button(
-                onClick = {
-                    isChecking = true
-                    updateMsg = "جاري التحقق من آخر إصدار..."
-                    updateScope.launch {
-                        val res = GitHubUpdater.checkLatestRelease(ctx, GitHubUpdater.DEFAULT_REPO)
-                        res.onSuccess { info ->
-                            if (!info.hasUpdate) {
-                                updateMsg = "لديك أحدث إصدار بالفعل (1.0.${info.localBuildNumber})"
-                            } else {
-                                updateMsg = "يتوفر إصدار جديد (${info.versionTag}) — جاري التحميل..."
-                                val dl = GitHubUpdater.downloadAndInstallApk(ctx, info.downloadUrl)
-                                dl.onSuccess {
-                                    updateMsg = "تم تحميل التحديث — أكمل التثبيت من الشاشة."
-                                }.onFailure { e ->
-                                    updateMsg = "فشل التحميل: ${e.message}"
+            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Rounded.SystemUpdate, contentDescription = null, tint = PrimaryTeal)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("تحديثات التطبيق", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                }
+                Text(
+                    "الإصدار الحالي: 1.0.${GitHubUpdater.getInstalledVersionCode(ctx)}",
+                    fontSize = 12.sp,
+                    color = TextMuted
+                )
+                if (updateMsg != null) {
+                    Text(updateMsg!!, fontSize = 12.sp, color = PrimaryTeal, fontWeight = FontWeight.Medium)
+                }
+                Button(
+                    onClick = {
+                        isChecking = true
+                        updateMsg = "جاري التحقق من آخر إصدار..."
+                        updateScope.launch {
+                            val targetRepo = githubRepo.ifBlank { GitHubUpdater.DEFAULT_REPO }
+                            val res = GitHubUpdater.checkLatestRelease(ctx, targetRepo)
+                            res.onSuccess { info ->
+                                if (!info.hasUpdate) {
+                                    updateMsg = "لديك أحدث إصدار بالفعل (1.0.${info.localBuildNumber})"
+                                } else {
+                                    updateMsg = "يتوفر إصدار جديد (${info.versionTag}) — جاري التحميل..."
+                                    val dl = GitHubUpdater.downloadAndInstallApk(ctx, info.downloadUrl)
+                                    dl.onSuccess {
+                                        updateMsg = "تم تحميل التحديث — أكمل التثبيت من الشاشة."
+                                    }.onFailure { e ->
+                                        updateMsg = "فشل التحميل: ${e.message}"
+                                    }
                                 }
+                            }.onFailure { e ->
+                                updateMsg = e.message ?: "تعذر التحقق من التحديث"
                             }
-                        }.onFailure { e ->
-                            updateMsg = e.message ?: "تعذر التحقق من التحديث"
+                            isChecking = false
                         }
-                        isChecking = false
-                    }
-                },
-                enabled = !isChecking,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp)
-            ) {
-                Text(if (isChecking) "جاري التحقق..." else "التحقق من التحديثات")
+                    },
+                    enabled = !isChecking,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(if (isChecking) "جاري التحقق..." else "التحقق من التحديثات")
+                }
             }
         }
     }
 
-    }
-
-    // Section 5: Security & Role
     AccordionCard(
         icon = Icons.Rounded.Lock,
         title = "5. الأمان وإدارة التطبيق",
-        subtitle = "الرمز السري، تصفير العدادات، تبديل وضع الجهاز",
+        subtitle = if (hasPin) "الرمز السري مفعّل • تصفير العدادات • تبديل الوضع" else "الرمز السري، تصفير العدادات، تبديل وضع الجهاز",
         expanded = expandSecurity,
         onToggle = { expandSecurity = !expandSecurity }
     ) {
         OutlinedTextField(
             value = pinInput,
-            onValueChange = { if (it.length <= 6) pinInput = it },
-            label = { Text("الرمز السري لقفل الإعدادات (اختياري)") },
+            onValueChange = { raw ->
+                val clean = normalizeArabicDigits(raw).filter { it in '0'..'9' }
+                if (clean.length <= 6) pinInput = clean
+            },
+            label = {
+                Text(if (hasPin) "رمز سري جديد (اتركه فارغاً لإلغاء القفل)" else "الرمز السري لقفل الإعدادات (اختياري)")
+            },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
             visualTransformation = PasswordVisualTransformation(),
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
         Button(
-            onClick = { onSavePin(pinInput) },
+            enabled = hasPin || pinInput.length >= 4,
+            onClick = {
+                val targetPin = pinInput
+                onSavePin(targetPin)
+                pinInput = ""
+            },
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp)
         ) {
-            Text("حفظ الرمز السري")
+            Text(if (pinInput.isBlank() && hasPin) "إلغاء الرمز السري" else "حفظ الرمز السري")
         }
-        OutlinedButton(onClick = onResetUsage, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
+        OutlinedButton(onClick = { confirmResetUsage = true }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
             Text("تصفير عدادات الاستهلاك لهذا الجهاز")
         }
         OutlinedButton(
-            onClick = onSwitchRole,
+            onClick = { confirmSwitchRole = true },
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.outlinedButtonColors(contentColor = AlertRed)
         ) {
             Text("تغيير نوع الجهاز (مشرف / عضو)")
         }
+    }
+
+    if (confirmResetUsage) {
+        AlertDialog(
+            onDismissRequest = { confirmResetUsage = false },
+            title = { Text("تأكيد تصفير العدادات", fontWeight = FontWeight.Bold) },
+            text = { Text("سيتم تصفير عدادات الاستهلاك اليومي والأسبوعي والشهري لهذا الجهاز فقط. هل تريد المتابعة؟") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmResetUsage = false
+                    onResetUsage()
+                }) { Text("تصفير", color = AlertRed) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmResetUsage = false }) { Text("إلغاء") }
+            }
+        )
+    }
+
+    if (confirmSwitchRole) {
+        AlertDialog(
+            onDismissRequest = { confirmSwitchRole = false },
+            title = { Text("تأكيد تغيير وضع الجهاز", fontWeight = FontWeight.Bold) },
+            text = { Text("سيتم إيقاف خدمة المشرف والعودة لشاشة الإعداد الأولي. هل تريد المتابعة؟") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmSwitchRole = false
+                    onSwitchRole()
+                }) { Text("تغيير الوضع", color = AlertRed) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmSwitchRole = false }) { Text("إلغاء") }
+            }
+        )
     }
 }
 
@@ -1407,10 +1725,14 @@ private fun AccordionCard(
 @Composable
 private fun PhasedRulesControls(
     policy: SpeedPolicyConfig,
+    syncKey: Int = 0,
     onChange: (SpeedPolicyConfig) -> Unit
 ) {
-    var finalSpeedText by remember(policy.finalPhaseSpeedMbPerSec) {
+    var finalSpeedText by remember(syncKey) {
         mutableStateOf(policy.finalPhaseSpeedMbPerSec.toString())
+    }
+    var winSpeedText by remember(syncKey) {
+        mutableStateOf(policy.windowSlowSpeedMbps.toString())
     }
 
     Text("المرحلة الأخيرة عند تبقي: ${policy.finalPhaseRemainingPercent}% من الباقة", fontSize = 12.sp)
@@ -1423,13 +1745,15 @@ private fun PhasedRulesControls(
     OutlinedTextField(
         value = finalSpeedText,
         onValueChange = { txt ->
-            finalSpeedText = txt
-            txt.toDoubleOrNull()?.let { v ->
-                if (v >= 0.1) onChange(policy.copy(finalPhaseSpeedMbPerSec = v))
+            val norm = normalizeArabicDigits(txt)
+            finalSpeedText = norm
+            norm.toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.1..1000.0 }?.let { v ->
+                onChange(policy.copy(finalPhaseSpeedMbPerSec = v))
             }
         },
         label = { Text("سرعة المرحلة الأخيرة (ميجابت/ث)") },
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+        textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
         singleLine = true,
         modifier = Modifier.fillMaxWidth()
     )
@@ -1463,19 +1787,18 @@ private fun PhasedRulesControls(
             onValueChange = { onChange(policy.copy(windowHours = it.toInt())) },
             valueRange = 1f..12f
         )
-        var winSpeedText by remember(policy.windowSlowSpeedMbps) {
-            mutableStateOf(policy.windowSlowSpeedMbps.toString())
-        }
         OutlinedTextField(
             value = winSpeedText,
             onValueChange = { txt ->
-                winSpeedText = txt
-                txt.toDoubleOrNull()?.let { v ->
-                    if (v >= 0.1) onChange(policy.copy(windowSlowSpeedMbps = v))
+                val norm = normalizeArabicDigits(txt)
+                winSpeedText = norm
+                norm.toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.1..1000.0 }?.let { v ->
+                    onChange(policy.copy(windowSlowSpeedMbps = v))
                 }
             },
             label = { Text("السرعة عند الوصول لحد الفترة (ميجابت/ث)") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
@@ -1485,9 +1808,10 @@ private fun PhasedRulesControls(
 @Composable
 private fun GraceAndRolloverControls(
     policy: SpeedPolicyConfig,
+    syncKey: Int = 0,
     onChange: (SpeedPolicyConfig) -> Unit
 ) {
-    var graceSpeedText by remember(policy.graceSpeedMbPerSec) {
+    var graceSpeedText by remember(syncKey) {
         mutableStateOf(policy.graceSpeedMbPerSec.toString())
     }
     Text(
@@ -1504,13 +1828,15 @@ private fun GraceAndRolloverControls(
     OutlinedTextField(
         value = graceSpeedText,
         onValueChange = { txt ->
-            graceSpeedText = txt
-            txt.toDoubleOrNull()?.let { v ->
-                if (v >= 0.05) onChange(policy.copy(graceSpeedMbPerSec = v))
+            val norm = normalizeArabicDigits(txt)
+            graceSpeedText = norm
+            norm.toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.05..1000.0 }?.let { v ->
+                onChange(policy.copy(graceSpeedMbPerSec = v))
             }
         },
         label = { Text("سرعة الرصيد الإضافي (ميجابت/ث)") },
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+        textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
         singleLine = true,
         modifier = Modifier.fillMaxWidth()
     )
@@ -1528,8 +1854,15 @@ private fun GraceAndRolloverControls(
 @Composable
 private fun SmartAutomationControls(
     policy: SpeedPolicyConfig,
+    syncKey: Int = 0,
     onChange: (SpeedPolicyConfig) -> Unit
 ) {
+    var mediaSpeedText by remember(syncKey) { mutableStateOf(policy.mediaCdnSpeedMbps.toString()) }
+    var burstCapText by remember(syncKey) { mutableStateOf(policy.burstCapSpeedMbPerSec.toString()) }
+    var peakSpeedText by remember(syncKey) { mutableStateOf(policy.peakHoursSpeedMbPerSec.toString()) }
+    var nightSpeedText by remember(syncKey) { mutableStateOf(policy.nightSaverSpeedMbPerSec.toString()) }
+    var customDnsText by remember(syncKey) { mutableStateOf(policy.upstreamDnsIp) }
+
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Checkbox(
             checked = policy.quotaSaverModeEnabled,
@@ -1547,34 +1880,34 @@ private fun SmartAutomationControls(
     Text("تخصيص مكونات وضع التوفير:", fontWeight = FontWeight.Bold, fontSize = 13.sp)
 
     if (BuildConfig.ENABLE_DNS_ADBLOCK) {
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-        Checkbox(
-            checked = policy.dnsSinkholeEnabled,
-            onCheckedChange = { onChange(policy.copy(dnsSinkholeEnabled = it)) }
-        )
-        Column {
-            Text("حجب الإعلانات والتتبع قبل التحميل", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-            Text("يمنع تحميل الإعلانات وملفات التتبع (صفر بايت)", fontSize = 11.sp, color = TextMuted)
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Checkbox(
+                checked = policy.dnsSinkholeEnabled,
+                onCheckedChange = { onChange(policy.copy(dnsSinkholeEnabled = it)) }
+            )
+            Column {
+                Text("حجب الإعلانات والتتبع قبل التحميل", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Text("يمنع تحميل الإعلانات وملفات التتبع (صفر بايت)", fontSize = 11.sp, color = TextMuted)
+            }
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Checkbox(
+                checked = policy.dnsCacheEnabled,
+                onCheckedChange = { onChange(policy.copy(dnsCacheEnabled = it)) }
+            )
+            Text("تخزين مؤقت ذكي للعناوين (5 دقائق)", fontSize = 12.sp)
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Checkbox(
+                checked = policy.blockDohDotEnabled,
+                onCheckedChange = { onChange(policy.copy(blockDohDotEnabled = it)) }
+            )
+            Text("منع التطبيقات من تجاوز حجب الإعلانات", fontSize = 12.sp)
         }
     }
 
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-        Checkbox(
-            checked = policy.dnsCacheEnabled,
-            onCheckedChange = { onChange(policy.copy(dnsCacheEnabled = it)) }
-        )
-        Text("تخزين مؤقت ذكي للعناوين (30 دقيقة)", fontSize = 12.sp)
-    }
-
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-        Checkbox(
-            checked = policy.blockDohDotEnabled,
-            onCheckedChange = { onChange(policy.copy(blockDohDotEnabled = it)) }
-        )
-        Text("منع التطبيقات من تجاوز حجب الإعلانات", fontSize = 12.sp)
-    }
-
-    }
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Checkbox(
             checked = policy.blockQuicUdp443Enabled,
@@ -1605,19 +1938,18 @@ private fun SmartAutomationControls(
         }
     }
     if (policy.mediaCdnSaverEnabled) {
-        var mediaSpeedText by remember(policy.mediaCdnSpeedMbps) {
-            mutableStateOf(policy.mediaCdnSpeedMbps.toString())
-        }
         OutlinedTextField(
             value = mediaSpeedText,
             onValueChange = { txt ->
-                mediaSpeedText = txt
-                txt.toDoubleOrNull()?.let { v ->
-                    if (v >= 0.25) onChange(policy.copy(mediaCdnSpeedMbps = v))
+                val norm = normalizeArabicDigits(txt)
+                mediaSpeedText = norm
+                norm.toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.25..1000.0 }?.let { v ->
+                    onChange(policy.copy(mediaCdnSpeedMbps = v))
                 }
             },
             label = { Text("سرعة خوادم الفيديو والريلز (ميجابت/ث)") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
@@ -1659,19 +1991,18 @@ private fun SmartAutomationControls(
             onValueChange = { onChange(policy.copy(burstThresholdMbPerMin = it.toInt())) },
             valueRange = 20f..150f
         )
-        var burstCapText by remember(policy.burstCapSpeedMbPerSec) {
-            mutableStateOf(policy.burstCapSpeedMbPerSec.toString())
-        }
         OutlinedTextField(
             value = burstCapText,
             onValueChange = { txt ->
-                burstCapText = txt
-                txt.toDoubleOrNull()?.let { v ->
-                    if (v >= 0.1) onChange(policy.copy(burstCapSpeedMbPerSec = v))
+                val norm = normalizeArabicDigits(txt)
+                burstCapText = norm
+                norm.toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.1..1000.0 }?.let { v ->
+                    onChange(policy.copy(burstCapSpeedMbPerSec = v))
                 }
             },
             label = { Text("السرعة للتطبيق عند السحب المفاجئ (ميجابت/ث)") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
@@ -1684,37 +2015,62 @@ private fun SmartAutomationControls(
         )
         Text("تخفيف ساعات الذروة (6م – 12ص ← ${policy.peakHoursSpeedMbPerSec} ميجابت/ث)", fontSize = 12.sp)
     }
+    if (policy.peakHoursSaverEnabled) {
+        OutlinedTextField(
+            value = peakSpeedText,
+            onValueChange = { txt ->
+                val norm = normalizeArabicDigits(txt)
+                peakSpeedText = norm
+                norm.toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.1..1000.0 }?.let { v ->
+                    onChange(policy.copy(peakHoursSpeedMbPerSec = v))
+                }
+            },
+            label = { Text("سرعة ساعات الذروة (ميجابت/ث)") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
 
     if (BuildConfig.ENABLE_DNS_ADBLOCK) {
-    HorizontalDivider()
-    Text("مزود تصفية الإعلانات (DNS):", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        listOf(
-            "94.140.14.14" to "AdGuard (حجب الإعلانات)",
-            "1.1.1.1" to "Cloudflare",
-            "8.8.8.8" to "Google"
-        ).forEach { (ip, label) ->
-            FilterChip(
-                selected = policy.upstreamDnsIp == ip,
-                onClick = { onChange(policy.copy(upstreamDnsIp = ip)) },
-                label = { Text(label, fontSize = 11.sp) }
-            )
-        }
-    }
-    var customDnsText by remember(policy.upstreamDnsIp) { mutableStateOf(policy.upstreamDnsIp) }
-    OutlinedTextField(
-        value = customDnsText,
-        onValueChange = { txt ->
-            customDnsText = txt
-            if (txt.trim().count { it == '.' } == 3) {
-                onChange(policy.copy(upstreamDnsIp = txt.trim()))
+        HorizontalDivider()
+        Text("مزود تصفية الإعلانات (DNS):", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf(
+                "94.140.14.14" to "AdGuard (حجب الإعلانات)",
+                "1.1.1.1" to "Cloudflare",
+                "8.8.8.8" to "Google"
+            ).forEach { (ip, label) ->
+                FilterChip(
+                    selected = policy.upstreamDnsIp == ip,
+                    onClick = {
+                        customDnsText = ip
+                        onChange(policy.copy(upstreamDnsIp = ip))
+                    },
+                    label = { Text(label, fontSize = 11.sp) }
+                )
             }
-        },
-        label = { Text("عنوان DNS مخصص") },
-        singleLine = true,
-        modifier = Modifier.fillMaxWidth()
-    )
-
+        }
+        val dnsValid = isValidIpv4(customDnsText)
+        OutlinedTextField(
+            value = customDnsText,
+            onValueChange = { txt ->
+                val norm = normalizeArabicDigits(txt)
+                customDnsText = norm
+                if (isValidIpv4(norm)) {
+                    onChange(policy.copy(upstreamDnsIp = norm.trim()))
+                }
+            },
+            label = { Text("عنوان DNS مخصص (IPv4)") },
+            isError = customDnsText.isNotBlank() && !dnsValid,
+            supportingText = if (customDnsText.isNotBlank() && !dnsValid) {
+                { Text("أدخل عنوان IPv4 صالحاً مثل 94.140.14.14") }
+            } else null,
+            textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -1722,7 +2078,24 @@ private fun SmartAutomationControls(
             checked = policy.nightSaverEnabled,
             onCheckedChange = { onChange(policy.copy(nightSaverEnabled = it)) }
         )
-        Text("توفير ليلي (1ص – 7ص ← ${policy.nightSaverSpeedMbPerSec} ميجابت/ث)", fontSize = 12.sp)
+        Text("توفير ليلي (12ص – 7ص ← ${policy.nightSaverSpeedMbPerSec} ميجابت/ث)", fontSize = 12.sp)
+    }
+    if (policy.nightSaverEnabled) {
+        OutlinedTextField(
+            value = nightSpeedText,
+            onValueChange = { txt ->
+                val norm = normalizeArabicDigits(txt)
+                nightSpeedText = norm
+                norm.toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.1..1000.0 }?.let { v ->
+                    onChange(policy.copy(nightSaverSpeedMbPerSec = v))
+                }
+            },
+            label = { Text("سرعة التوفير الليلي (ميجابت/ث)") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
 
@@ -1755,15 +2128,16 @@ private fun EditDeviceDialog(
     onSave: (ManagedDevice) -> Unit,
     onDelete: () -> Unit
 ) {
-    var limitMbText by remember { mutableStateOf(device.dailyLimitMb.toString()) }
-    var period by remember { mutableStateOf(device.limitPeriod) }
-    var policy by remember { mutableStateOf(device.speedPolicy) }
-    var forceSaverForDevice by remember { mutableStateOf(device.forceQuotaSaver) }
-    var baseSpeedText by remember { mutableStateOf(device.speedPolicy.baseSpeedLimitMbPerSec.toString()) }
-    var whitelist by remember { mutableStateOf(device.whitelistedPackages.toSet()) }
-    var showWhitelist by remember { mutableStateOf(false) }
-    var showAppQuotas by remember { mutableStateOf(false) }
-    var showAdvancedInDialog by remember { mutableStateOf(false) }
+    var limitMbText by remember(device.deviceId) { mutableStateOf(device.dailyLimitMb.toString()) }
+    var period by remember(device.deviceId) { mutableStateOf(device.limitPeriod) }
+    var policy by remember(device.deviceId) { mutableStateOf(device.speedPolicy) }
+    var forceSaverForDevice by remember(device.deviceId) { mutableStateOf(device.forceQuotaSaver) }
+    var baseSpeedText by remember(device.deviceId) { mutableStateOf(device.speedPolicy.baseSpeedLimitMbPerSec.toString()) }
+    var whitelist by remember(device.deviceId) { mutableStateOf(device.whitelistedPackages.toSet()) }
+    var showWhitelist by remember(device.deviceId) { mutableStateOf(false) }
+    var showAppQuotas by remember(device.deviceId) { mutableStateOf(false) }
+    var showAdvancedInDialog by remember(device.deviceId) { mutableStateOf(false) }
+    var confirmDelete by remember(device.deviceId) { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1773,8 +2147,8 @@ private fun EditDeviceDialog(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("إعدادات ${device.deviceName}", fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                IconButton(onClick = onDelete) {
+                Text("إعدادات ${device.deviceName}", fontWeight = FontWeight.Bold, fontSize = 17.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                IconButton(onClick = { confirmDelete = true }) {
                     Icon(Icons.Rounded.Delete, contentDescription = "حذف", tint = AlertRed)
                 }
             }
@@ -1800,9 +2174,12 @@ private fun EditDeviceDialog(
                 }
                 OutlinedTextField(
                     value = limitMbText,
-                    onValueChange = { limitMbText = it.filter { ch -> ch.isDigit() } },
+                    onValueChange = { raw ->
+                        limitMbText = normalizeArabicDigits(raw).filter { ch -> ch in '0'..'9' }
+                    },
                     label = { Text("أو أدخل الرقم بالميجابايت") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -1819,13 +2196,15 @@ private fun EditDeviceDialog(
                 OutlinedTextField(
                     value = baseSpeedText,
                     onValueChange = { txt ->
-                        baseSpeedText = txt
-                        txt.toDoubleOrNull()?.let { v ->
-                            policy = policy.copy(baseSpeedLimitMbPerSec = v.coerceAtLeast(0.0))
+                        val norm = normalizeArabicDigits(txt)
+                        baseSpeedText = norm
+                        norm.toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.0..1000.0 }?.let { v ->
+                            policy = policy.copy(baseSpeedLimitMbPerSec = v)
                         }
                     },
                     label = { Text("السرعة القصوى لهذا الجهاز (ميجابت/ث، 0 = سرعة كاملة)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -1866,7 +2245,7 @@ private fun EditDeviceDialog(
         },
         confirmButton = {
             TextButton(onClick = {
-                val mb = limitMbText.toLongOrNull()?.coerceAtLeast(10L) ?: device.dailyLimitMb
+                val mb = normalizeArabicDigits(limitMbText).toLongOrNull()?.coerceIn(10L, 10_485_760L) ?: device.dailyLimitMb
                 onSave(
                     device.copy(
                         dailyLimitMb = mb,
@@ -1884,6 +2263,25 @@ private fun EditDeviceDialog(
             TextButton(onClick = onDismiss) { Text("إلغاء") }
         }
     )
+
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("تأكيد حذف الجهاز", fontWeight = FontWeight.Bold) },
+            text = { Text("هل أنت متأكد من إزالة (${device.deviceName}) من قائمة الأجهزة المرتبطة؟") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDelete = false
+                    onDelete()
+                }) {
+                    Text("حذف", color = AlertRed)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("إلغاء") }
+            }
+        )
+    }
 
     if (showWhitelist) {
         WhitelistPickerDialog(
@@ -1919,10 +2317,10 @@ private fun EditSelfLimitDialog(
     onDismiss: () -> Unit,
     onSave: (Long, LimitPeriod, SpeedPolicyConfig) -> Unit
 ) {
-    var limitMbText by remember { mutableStateOf(currentLimitMb.toString()) }
-    var period by remember { mutableStateOf(currentPeriod) }
+    var limitMbText by rememberSaveable { mutableStateOf(currentLimitMb.toString()) }
+    var period by rememberSaveable { mutableStateOf(currentPeriod) }
     var policy by remember { mutableStateOf(currentPolicy) }
-    var baseSpeedText by remember { mutableStateOf(currentPolicy.baseSpeedLimitMbPerSec.toString()) }
+    var baseSpeedText by rememberSaveable { mutableStateOf(currentPolicy.baseSpeedLimitMbPerSec.toString()) }
     var showSelfAppQuotas by remember { mutableStateOf(false) }
 
     AlertDialog(
@@ -1948,22 +2346,27 @@ private fun EditSelfLimitDialog(
                 }
                 OutlinedTextField(
                     value = limitMbText,
-                    onValueChange = { limitMbText = it.filter { ch -> ch.isDigit() } },
+                    onValueChange = { raw ->
+                        limitMbText = normalizeArabicDigits(raw).filter { ch -> ch in '0'..'9' }
+                    },
                     label = { Text("الحد (${period.arabicLabel}) بالميجابايت") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
                     value = baseSpeedText,
                     onValueChange = { txt ->
-                        baseSpeedText = txt
-                        txt.toDoubleOrNull()?.let { v ->
-                            policy = policy.copy(baseSpeedLimitMbPerSec = v.coerceAtLeast(0.0))
+                        val norm = normalizeArabicDigits(txt)
+                        baseSpeedText = norm
+                        norm.toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.0..1000.0 }?.let { v ->
+                            policy = policy.copy(baseSpeedLimitMbPerSec = v)
                         }
                     },
                     label = { Text("السرعة القصوى (ميجابت/ث، 0 = سرعة كاملة)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -1980,7 +2383,7 @@ private fun EditSelfLimitDialog(
         },
         confirmButton = {
             TextButton(onClick = {
-                val mb = limitMbText.toLongOrNull()?.coerceAtLeast(10L) ?: currentLimitMb
+                val mb = normalizeArabicDigits(limitMbText).toLongOrNull()?.coerceIn(10L, 10_485_760L) ?: currentLimitMb
                 onSave(mb, period, policy)
             }) { Text("حفظ") }
         },
@@ -2004,12 +2407,14 @@ private fun EditSelfLimitDialog(
 
 @Composable
 private fun PinCheckDialog(
-    expectedPin: String,
+    onVerifyPin: suspend (String) -> Boolean,
     onDismiss: () -> Unit,
     onSuccess: () -> Unit
 ) {
+    val scope = rememberCoroutineScope()
     var input by remember { mutableStateOf("") }
     var error by remember { mutableStateOf(false) }
+    var checking by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -2018,12 +2423,16 @@ private fun PinCheckDialog(
             Column {
                 OutlinedTextField(
                     value = input,
-                    onValueChange = {
-                        input = it
-                        error = false
+                    onValueChange = { raw ->
+                        val clean = normalizeArabicDigits(raw).filter { it in '0'..'9' }
+                        if (clean.length <= 6) {
+                            input = clean
+                            error = false
+                        }
                     },
                     label = { Text("الرمز السري") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
                     visualTransformation = PasswordVisualTransformation(),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
@@ -2035,9 +2444,17 @@ private fun PinCheckDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = {
-                if (input == expectedPin) onSuccess() else error = true
-            }) { Text("تأكيد") }
+            TextButton(
+                enabled = !checking && input.isNotBlank(),
+                onClick = {
+                    checking = true
+                    scope.launch {
+                        val ok = withContext(Dispatchers.Default) { onVerifyPin(input) }
+                        checking = false
+                        if (ok) onSuccess() else error = true
+                    }
+                }
+            ) { Text("تأكيد") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("إلغاء") }

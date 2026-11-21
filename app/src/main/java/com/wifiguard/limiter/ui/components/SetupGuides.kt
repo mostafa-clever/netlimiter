@@ -55,15 +55,16 @@ fun SetupGuideDialog(
 
     val steps = when (guideType) {
         GuideType.ALWAYS_ON_VPN -> listOf(
-            "اضغط على زر (فتح الإعدادات) بالأسفل للانتقال مباشرة إلى صفحة الحماية في هاتفك.",
+            "اضغط على زر (${primaryActionLabel ?: "فتح إعدادات الحماية الآن"}) بالأسفل للانتقال مباشرة إلى صفحة الحماية في هاتفك.",
             "ابحث عن تطبيق (No Quota) واضغط على علامة الترس (الإعدادات) بجانبه.",
             "فعّل خيار (التشغيل الدائم / Always-on) فقط — واترك (حظر الاتصالات بدون VPN) مغلقاً حتى تعمل التطبيقات المستثناة والمزامنة المحلية بشكل سليم.",
-            "ارجع للتطبيق — ستختفي هذه الخطوة تلقائياً فور التفعيل."
+            "ارجع للتطبيق واضغط (تم التفعيل ✓) إذا لم تختفِ هذه الخطوة تلقائياً على جهازك."
         )
         GuideType.CLIENT_FULL_SETUP -> listOf(
             "تفعيل الحماية اليومية: اضغط (تفعيل) ثم وافق على رسالة النظام لبدء تنظيم الواي فاي.",
             "تثبيت الحماية الدائمة: افتح الإعدادات ← اضغط الترس بجانب No Quota ← فعّل (التشغيل الدائم / Always-on) فقط (اترك حظر الاتصالات بدون VPN مغلقاً).",
             "الحماية ضد الحذف: اضغط (تفعيل) ثم (تفعيل تطبيق مسؤول الجهاز) لمنع إزالة التطبيق بسهولة.",
+            "إذن إحصائيات التطبيقات: اضغط (تفعيل) وامنح صلاحية الوصول لاستخدام التطبيقات لحساب استهلاك كل تطبيق بدقة.",
             "استثناء البطارية: اضغط (تفعيل) ثم (سماح) حتى لا يغلق النظام التطبيق أثناء إغلاق الشاشة.",
             "توفير إضافي لأندرويد 9 وأقل: افتح إعدادات الواي فاي ← اضغط على شبكتك ← متقدم ← فعّل (شبكة محدودة / Metered) لتقليل استهلاك التطبيقات مثل بيانات الهاتف."
         )
@@ -80,46 +81,50 @@ fun SetupGuideDialog(
         onDismissRequest = onDismiss,
         title = { Text(title, fontWeight = FontWeight.Bold, fontSize = 18.sp) },
         text = {
-            Column(
-                modifier = Modifier
-                    .heightIn(max = 380.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                steps.forEachIndexed { idx, stepText ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(SoftMint.copy(alpha = 0.55f))
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.Top
-                    ) {
-                        Box(
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .heightIn(max = 340.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    steps.forEachIndexed { idx, stepText ->
+                        Row(
                             modifier = Modifier
-                                .size(24.dp)
-                                .clip(CircleShape)
-                                .background(PrimaryTeal),
-                            contentAlignment = Alignment.Center
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(SoftMint.copy(alpha = 0.55f))
+                                .padding(12.dp),
+                            verticalAlignment = Alignment.Top
                         ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(24.dp)
+                                    .clip(CircleShape)
+                                    .background(PrimaryTeal),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "${idx + 1}",
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 12.sp
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(10.dp))
                             Text(
-                                text = "${idx + 1}",
-                                color = Color.White,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 12.sp
+                                text = stepText,
+                                fontSize = 13.sp,
+                                lineHeight = 19.sp,
+                                color = TextMuted
                             )
                         }
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text(
-                            text = stepText,
-                            fontSize = 13.sp,
-                            lineHeight = 19.sp,
-                            color = TextMuted
-                        )
                     }
                 }
+                // Keep primary action button pinned below the scroll container so it is always visible
                 if (onPrimaryAction != null && primaryActionLabel != null) {
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
                     Button(
                         onClick = {
                             onDismiss()

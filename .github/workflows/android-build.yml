@@ -7,6 +7,10 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -38,8 +42,10 @@ jobs:
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
             echo "$KEYSTORE_BASE64" | base64 --decode > app/wifiguard-release.jks
-          elif [ ! -f app/wifiguard-release.jks ]; then
-            echo "KEYSTORE_BASE64 secret not set; generating fallback release keystore..."
+          elif [ -f app/wifiguard-release.jks ]; then
+            echo "Using repository release keystore."
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "PR build without keystore secret; generating ephemeral test keystore..."
             keytool -genkeypair -v \
               -keystore app/wifiguard-release.jks \
               -alias "${KEY_ALIAS:-wifiguard}" \
@@ -47,6 +53,9 @@ jobs:
               -storepass "${KEYSTORE_PASSWORD:-wifiguard2026}" \
               -keypass "${KEY_PASSWORD:-wifiguard2026}" \
               -dname "CN=NoQuota, OU=App, O=NoQuota, L=Cairo, S=Egypt, C=EG"
+          else
+            echo "::error::Missing KEYSTORE_BASE64 secret and app/wifiguard-release.jks; refusing to publish with an ephemeral signing key."
+            exit 1
           fi
 
       - name: Build GitHub Release APK & Play Store Release AAB
@@ -71,5 +80,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete latest --yes || true
-          gh release create latest WifiGuard.apk --title "No Quota v1.0.${{ github.run_number }}" --notes "build:${{ github.run_number }} — Signed Release APK."
+          TITLE="No Quota v1.0.${{ github.run_number }}"
+          NOTES="build:${{ github.run_number }} — Signed Release APK."
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest WifiGuard.apk --clobber
+            gh release edit latest --title "$TITLE" --notes "$NOTES" --target "${{ github.sha }}"
+          else
+            gh release create latest WifiGuard.apk --title "$TITLE" --notes "$NOTES" --target "${{ github.sha }}"
+          fi

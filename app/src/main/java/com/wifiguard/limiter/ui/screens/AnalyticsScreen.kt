@@ -1,5 +1,6 @@
 package com.wifiguard.limiter.ui.screens
 
+import android.app.DatePickerDialog
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -30,15 +31,19 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
-import android.app.DatePickerDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -59,8 +64,11 @@ import com.wifiguard.limiter.ui.theme.SoftMint
 import com.wifiguard.limiter.ui.theme.SuccessGreen
 import com.wifiguard.limiter.ui.theme.SuccessGreenBg
 import com.wifiguard.limiter.ui.theme.TextMuted
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Date
 import java.util.Locale
 
 enum class AnalyticsRange(val arabicLabel: String) {
@@ -85,23 +93,41 @@ fun AnalyticsSection(
     localUsageHistory: Map<String, Long>,
     localSavedHistory: Map<String, Long>,
     localAppUsageMb: Map<String, Long> = emptyMap(),
-    includeSelf: Boolean
+    includeSelf: Boolean,
+    selfUsedMbToday: Long = 0L
 ) {
     val context = LocalContext.current
-    var selectedDeviceId by remember { mutableStateOf<String?>(null) }
-    var selectedRange by remember { mutableStateOf(AnalyticsRange.LAST_7_DAYS) }
-    var monthOffset by remember { mutableIntStateOf(0) }
-    var customStartMillis by remember {
-        mutableStateOf(Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -6) }.timeInMillis)
+    var selectedDeviceId by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedRange by rememberSaveable { mutableStateOf(AnalyticsRange.LAST_7_DAYS) }
+    var monthOffset by rememberSaveable { mutableIntStateOf(0) }
+    var customStartMillis by rememberSaveable {
+        mutableLongStateOf(Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -6) }.timeInMillis)
     }
-    var customEndMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+    var customEndMillis by rememberSaveable { mutableLongStateOf(System.currentTimeMillis()) }
+    var activeDateDialog by remember { mutableStateOf<DatePickerDialog?>(null) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            runCatching { activeDateDialog?.dismiss() }
+            activeDateDialog = null
+        }
+    }
+
+    LaunchedEffect(devices, includeSelf) {
+        if (selectedDeviceId != null && selectedDeviceId != "__SELF__" && devices.none { it.deviceId == selectedDeviceId }) {
+            selectedDeviceId = null
+        }
+        if (selectedDeviceId == "__SELF__" && !includeSelf) {
+            selectedDeviceId = null
+        }
+    }
 
     val dayFormat = remember { SimpleDateFormat("yyyy-MM-dd", Locale.US) }
+    val todayKey = dayFormat.format(Date())
 
-    // Build date keys for the chosen range
-    val dateKeys: List<String> = remember(selectedRange, monthOffset, customStartMillis, customEndMillis) {
+    val dateKeys: List<String> = remember(selectedRange, monthOffset, customStartMillis, customEndMillis, todayKey) {
         when (selectedRange) {
-            AnalyticsRange.TODAY -> listOf(dayFormat.format(Calendar.getInstance().time))
+            AnalyticsRange.TODAY -> listOf(todayKey)
             AnalyticsRange.LAST_7_DAYS -> {
                 (6 downTo 0).map { offset ->
                     val c = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -offset) }
@@ -138,7 +164,7 @@ fun AnalyticsSection(
                     cur.add(Calendar.DAY_OF_YEAR, 1)
                     guard++
                 }
-                if (list.isEmpty()) listOf(dayFormat.format(Calendar.getInstance().time)) else list
+                if (list.isEmpty()) listOf(todayKey) else list
             }
         }
     }
@@ -147,82 +173,106 @@ fun AnalyticsSection(
         if (selectedRange == AnalyticsRange.FULL_MONTH) {
             val c = Calendar.getInstance().apply { add(Calendar.MONTH, monthOffset) }
             SimpleDateFormat("MMMM yyyy", Locale("ar")).format(c.time)
-        } else if (dateKeys.size == 1) {
-            dateKeys.first()
+        } else if (dateKeys.size <= 1) {
+            dateKeys.firstOrNull() ?: todayKey
         } else {
             "${dateKeys.first()}  ←  ${dateKeys.last()}"
         }
     }
 
-    var selectedIdx by remember(dateKeys) { mutableIntStateOf((dateKeys.size - 1).coerceAtLeast(0)) }
+    var selectedIdx by remember(dateKeys, todayKey) {
+        val todayIdx = dateKeys.indexOf(todayKey)
+        mutableIntStateOf(if (todayIdx >= 0) todayIdx else (dateKeys.size - 1).coerceAtLeast(0))
+    }
 
-    val metrics: List<DailyMetric> = remember(selectedDeviceId, dateKeys, devices, localUsageHistory, localSavedHistory, includeSelf) {
+    val metrics: List<DailyMetric> = remember(selectedDeviceId, dateKeys, devices, localUsageHistory, localSavedHistory, includeSelf, selfUsedMbToday, todayKey) {
         dateKeys.mapIndexed { idx, dayStr ->
             var used = 0L
             var saved = 0L
-            if (selectedDeviceId == null) {
-                devices.forEach { d ->
-                    used += d.dailyUsageHistory[dayStr] ?: 0L
-                    saved += d.dailySavedHistory[dayStr] ?: 0L
+            when (selectedDeviceId) {
+                null -> {
+                    devices.forEach { d ->
+                        val histUsed = d.dailyUsageHistory[dayStr] ?: 0L
+                        val liveDay = if (dayStr == todayKey && d.limitPeriod == com.wifiguard.limiter.model.LimitPeriod.DAILY) d.usedMb else 0L
+                        used += maxOf(histUsed, liveDay)
+                        saved += maxOf(d.dailySavedHistory[dayStr] ?: 0L, if (dayStr == todayKey) d.savedMbToday else 0L)
+                    }
+                    if (includeSelf) {
+                        val selfHist = localUsageHistory[dayStr] ?: 0L
+                        used += if (dayStr == todayKey) maxOf(selfHist, selfUsedMbToday) else selfHist
+                        saved += localSavedHistory[dayStr] ?: 0L
+                    }
                 }
-                if (includeSelf) {
-                    used += localUsageHistory[dayStr] ?: 0L
-                    saved += localSavedHistory[dayStr] ?: 0L
+                "__SELF__" -> {
+                    val selfHist = localUsageHistory[dayStr] ?: 0L
+                    used = if (dayStr == todayKey) maxOf(selfHist, selfUsedMbToday) else selfHist
+                    saved = localSavedHistory[dayStr] ?: 0L
                 }
-            } else {
-                val dev = devices.firstOrNull { it.deviceId == selectedDeviceId }
-                used = dev?.dailyUsageHistory?.get(dayStr) ?: 0L
-                saved = dev?.dailySavedHistory?.get(dayStr) ?: 0L
+                else -> {
+                    val dev = devices.firstOrNull { it.deviceId == selectedDeviceId }
+                    val histUsed = dev?.dailyUsageHistory?.get(dayStr) ?: 0L
+                    val liveDay = if (dev != null && dayStr == todayKey && dev.limitPeriod == com.wifiguard.limiter.model.LimitPeriod.DAILY) dev.usedMb else 0L
+                    used = maxOf(histUsed, liveDay)
+                    saved = maxOf(dev?.dailySavedHistory?.get(dayStr) ?: 0L, if (dev != null && dayStr == todayKey) dev.savedMbToday else 0L)
+                }
             }
-            DailyMetric(index = idx, dateKey = dayStr, usedMb = used, savedMb = saved)
+            DailyMetric(index = idx, dateKey = dayStr, usedMb = used.coerceAtLeast(0L), savedMb = saved.coerceAtLeast(0L))
         }
     }
 
-    // Aggregate per-app usage breakdown
-    val appBreakdown: List<Pair<String, Long>> = remember(selectedDeviceId, devices, localAppUsageMb, includeSelf) {
-        val merged = mutableMapOf<String, Long>()
-        val nameLookup = mutableMapOf<String, String>()
-        devices.forEach { d ->
-            d.installedApps.forEach { a -> nameLookup[a.packageName] = a.appName }
-        }
-        if (selectedDeviceId == null) {
+    // Resolve per-app usage labels asynchronously off the Main thread
+    val appBreakdown by produceState<List<Pair<String, Long>>>(
+        initialValue = emptyList(),
+        selectedDeviceId, devices, localAppUsageMb, includeSelf
+    ) {
+        value = withContext(Dispatchers.IO) {
+            val merged = mutableMapOf<String, Long>()
+            val nameLookup = mutableMapOf<String, String>()
             devices.forEach { d ->
-                d.appUsageMb.forEach { (pkg, mb) ->
-                    if (mb > 0L) merged[pkg] = (merged[pkg] ?: 0L) + mb
-                }
+                d.installedApps.forEach { a -> nameLookup[a.packageName] = a.appName }
             }
-            if (includeSelf) {
+            if (selectedDeviceId == null) {
+                devices.forEach { d ->
+                    d.appUsageMb.forEach { (pkg, mb) ->
+                        if (mb > 0L) merged[pkg] = (merged[pkg] ?: 0L) + mb
+                    }
+                }
+                if (includeSelf) {
+                    localAppUsageMb.forEach { (pkg, mb) ->
+                        if (mb > 0L) merged[pkg] = (merged[pkg] ?: 0L) + mb
+                    }
+                }
+            } else if (selectedDeviceId == "__SELF__") {
                 localAppUsageMb.forEach { (pkg, mb) ->
-                    if (mb > 0L) merged[pkg] = (merged[pkg] ?: 0L) + mb
+                    if (mb > 0L) merged[pkg] = mb
+                }
+            } else {
+                val dev = devices.firstOrNull { it.deviceId == selectedDeviceId }
+                dev?.appUsageMb?.forEach { (pkg, mb) ->
+                    if (mb > 0L) merged[pkg] = mb
                 }
             }
-        } else {
-            val dev = devices.firstOrNull { it.deviceId == selectedDeviceId }
-            dev?.appUsageMb?.forEach { (pkg, mb) ->
-                if (mb > 0L) merged[pkg] = mb
-            }
+            val pm = context.packageManager
+            merged.entries
+                .sortedByDescending { it.value }
+                .take(10)
+                .map { (pkg, mb) ->
+                    val label = nameLookup[pkg] ?: runCatching {
+                        pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+                    }.getOrDefault(pkg.substringAfterLast('.'))
+                    label to mb
+                }
         }
-        val pm = context.packageManager
-        merged.entries
-            .sortedByDescending { it.value }
-            .take(10)
-            .map { (pkg, mb) ->
-                val label = nameLookup[pkg] ?: runCatching {
-                    pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
-                }.getOrDefault(pkg.substringAfterLast('.'))
-                label to mb
-            }
     }
 
     val totalUsedRange = metrics.sumOf { it.usedMb }
     val totalSavedRange = metrics.sumOf { it.savedMb }
     val savingsPercent = if (totalUsedRange + totalSavedRange > 0L) {
-        ((totalSavedRange * 100) / (totalUsedRange + totalSavedRange)).toInt()
+        ((totalSavedRange * 100.0) / (totalUsedRange + totalSavedRange).toDouble()).coerceIn(0.0, 100.0).toInt()
     } else 0
 
-    val selectedMetric = metrics.getOrNull(selectedIdx) ?: metrics.last()
+    val selectedMetric = metrics.getOrNull(selectedIdx) ?: metrics.lastOrNull()
 
-    // Scope Chips: Entire Network vs Each Client
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
@@ -240,6 +290,13 @@ fun AnalyticsSection(
                     onClick = { selectedDeviceId = null },
                     label = { Text("الشبكة بالكامل") }
                 )
+                if (includeSelf) {
+                    FilterChip(
+                        selected = selectedDeviceId == "__SELF__",
+                        onClick = { selectedDeviceId = "__SELF__" },
+                        label = { Text("جهازي (المشرف)") }
+                    )
+                }
                 devices.forEach { dev ->
                     FilterChip(
                         selected = selectedDeviceId == dev.deviceId,
@@ -271,47 +328,58 @@ fun AnalyticsSection(
                     OutlinedButton(
                         onClick = {
                             val c = Calendar.getInstance().apply { timeInMillis = customStartMillis }
-                            DatePickerDialog(
+                            runCatching { activeDateDialog?.dismiss() }
+                            val dlg = DatePickerDialog(
                                 context,
                                 { _, y, m, d ->
-                                    val picked = Calendar.getInstance().apply { set(y, m, d, 0, 0, 0) }
-                                    customStartMillis = picked.timeInMillis
+                                    val picked = Calendar.getInstance().apply { set(y, m, d, 0, 0, 0) }.timeInMillis
+                                    customStartMillis = picked
+                                    if (customStartMillis > customEndMillis) customEndMillis = picked
                                 },
                                 c.get(Calendar.YEAR),
                                 c.get(Calendar.MONTH),
                                 c.get(Calendar.DAY_OF_MONTH)
-                            ).show()
+                            ).apply {
+                                datePicker.maxDate = System.currentTimeMillis()
+                            }
+                            activeDateDialog = dlg
+                            runCatching { dlg.show() }
                         },
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(10.dp)
                     ) {
-                        Text("من: ${dayFormat.format(java.util.Date(customStartMillis))}", fontSize = 12.sp)
+                        Text("من: ${dayFormat.format(Date(customStartMillis))}", fontSize = 12.sp)
                     }
                     OutlinedButton(
                         onClick = {
                             val c = Calendar.getInstance().apply { timeInMillis = customEndMillis }
-                            DatePickerDialog(
+                            runCatching { activeDateDialog?.dismiss() }
+                            val dlg = DatePickerDialog(
                                 context,
                                 { _, y, m, d ->
-                                    val picked = Calendar.getInstance().apply { set(y, m, d, 23, 59, 59) }
-                                    customEndMillis = picked.timeInMillis
+                                    val picked = Calendar.getInstance().apply { set(y, m, d, 23, 59, 59) }.timeInMillis
+                                    customEndMillis = picked
+                                    if (customEndMillis < customStartMillis) customStartMillis = picked
                                 },
                                 c.get(Calendar.YEAR),
                                 c.get(Calendar.MONTH),
                                 c.get(Calendar.DAY_OF_MONTH)
-                            ).show()
+                            ).apply {
+                                datePicker.maxDate = System.currentTimeMillis()
+                            }
+                            activeDateDialog = dlg
+                            runCatching { dlg.show() }
                         },
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(10.dp)
                     ) {
-                        Text("إلى: ${dayFormat.format(java.util.Date(customEndMillis))}", fontSize = 12.sp)
+                        Text("إلى: ${dayFormat.format(Date(customEndMillis))}", fontSize = 12.sp)
                     }
                 }
             }
         }
     }
 
-    // KPI Summary Cards
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -355,7 +423,6 @@ fun AnalyticsSection(
         }
     }
 
-    // Bar Chart Card
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -386,7 +453,16 @@ fun AnalyticsSection(
 
             Spacer(modifier = Modifier.height(8.dp))
 
+            val hasAnyData = metrics.any { it.usedMb > 0L || it.savedMb > 0L }
             val maxVal = (metrics.maxOfOrNull { it.usedMb + it.savedMb } ?: 100L).coerceAtLeast(10L)
+            if (!hasAnyData) {
+                Text(
+                    "لا توجد بيانات استهلاك مسجلة لهذه الفترة حتى الآن.",
+                    fontSize = 12.sp,
+                    color = TextMuted,
+                    modifier = Modifier.padding(vertical = 8.dp)
+                )
+            }
 
             Canvas(
                 modifier = Modifier
@@ -394,26 +470,31 @@ fun AnalyticsSection(
                     .height(170.dp)
                     .pointerInput(metrics) {
                         detectTapGestures { offset ->
+                            if (metrics.isEmpty() || size.width <= 0) return@detectTapGestures
                             val barSlot = size.width.toFloat() / metrics.size.toFloat()
-                            val idx = (offset.x / barSlot).toInt().coerceIn(0, metrics.lastIndex)
-                            selectedIdx = idx
+                            if (barSlot <= 0f) return@detectTapGestures
+                            val visualIdx = (offset.x / barSlot).toInt().coerceIn(0, metrics.lastIndex)
+                            // Match RTL plotting order (right = oldest, left = newest)
+                            selectedIdx = (metrics.lastIndex - visualIdx).coerceIn(0, metrics.lastIndex)
                         }
                     }
             ) {
+                if (metrics.isEmpty() || size.width <= 0f || size.height <= 12f) return@Canvas
                 val slotW = size.width / metrics.size.toFloat()
-                val barW = (slotW * 0.58f).coerceIn(6f, 44f)
+                val barW = (slotW * 0.58f).coerceIn(1f, minOf(44f, slotW))
                 val chartH = size.height - 10f
 
                 metrics.forEachIndexed { idx, item ->
-                    val x = idx * slotW + (slotW - barW) / 2f
-                    val usedH = (item.usedMb.toFloat() / maxVal.toFloat()) * chartH
-                    val savedH = (item.savedMb.toFloat() / maxVal.toFloat()) * chartH
+                    val visualIdx = metrics.lastIndex - idx
+                    val x = visualIdx * slotW + (slotW - barW) / 2f
+                    val usedH = ((item.usedMb.toFloat() / maxVal.toFloat()) * chartH).coerceIn(0f, chartH)
+                    val savedH = ((item.savedMb.toFloat() / maxVal.toFloat()) * chartH).coerceIn(0f, chartH - usedH)
                     val isSel = idx == selectedIdx
 
                     if (isSel) {
                         drawRoundRect(
                             color = SoftMint,
-                            topLeft = Offset(idx * slotW, 0f),
+                            topLeft = Offset(visualIdx * slotW, 0f),
                             size = Size(slotW, size.height),
                             cornerRadius = CornerRadius(6f, 6f)
                         )
@@ -456,28 +537,28 @@ fun AnalyticsSection(
         }
     }
 
-    // Selected Day Detail Card
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = SoftMint)
-    ) {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(
-                text = "تفاصيل يوم ${selectedMetric.dateKey} (اضغط أي عمود للتبديل)",
-                fontWeight = FontWeight.Bold,
-                fontSize = 14.sp,
-                color = PrimaryTeal
-            )
-            Text(
-                text = "الاستهلاك الفعلي: ${formatDataSizeArabic(selectedMetric.usedMb)}  •  البيانات الموفّرة: ${formatDataSizeArabic(selectedMetric.savedMb)}",
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold
-            )
+    if (selectedMetric != null) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = SoftMint)
+        ) {
+            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = "تفاصيل يوم ${selectedMetric.dateKey} (اضغط أي عمود للتبديل)",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    color = PrimaryTeal
+                )
+                Text(
+                    text = "الاستهلاك الفعلي: ${formatDataSizeArabic(selectedMetric.usedMb)}  •  البيانات الموفّرة: ${formatDataSizeArabic(selectedMetric.savedMb)}",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
         }
     }
 
-    // Per-App Usage Breakdown Card
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
@@ -487,7 +568,7 @@ fun AnalyticsSection(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Rounded.Apps, contentDescription = null, tint = PrimaryTeal)
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("توزيع الاستهلاك حسب التطبيقات", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                Text("توزيع الاستهلاك حسب التطبيقات (الفترة الحالية)", fontWeight = FontWeight.Bold, fontSize = 15.sp)
             }
             if (appBreakdown.isEmpty()) {
                 Text(
@@ -498,7 +579,7 @@ fun AnalyticsSection(
             } else {
                 val totalAppMb = appBreakdown.sumOf { it.second }.coerceAtLeast(1L)
                 appBreakdown.forEach { (appName, mb) ->
-                    val pct = ((mb * 100) / totalAppMb).toInt().coerceIn(1, 100)
+                    val pct = ((mb * 100.0) / totalAppMb.toDouble()).toInt().coerceIn(1, 100)
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),

@@ -2,13 +2,14 @@ package com.wifiguard.limiter.network
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
-import android.net.LinkProperties
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import com.wifiguard.limiter.vpn.WifiGuardVpnService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -21,6 +22,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.util.concurrent.TimeUnit
 
 data class LanPeer(
     val ip: String,
@@ -29,50 +31,117 @@ data class LanPeer(
 
 object NetworkScanner {
 
+    private val trackerLock = Any()
+    @Volatile private var cachedSsid: String = ""
+    @Volatile private var cachedBssid: String = ""
+    @Volatile private var activeWifiNetwork: Network? = null
+    @Volatile private var trackerRegistered: Boolean = false
+
+    private fun findWifiNetwork(cm: ConnectivityManager): Network? {
+        activeWifiNetwork?.let { tracked ->
+            val caps = runCatching { cm.getNetworkCapabilities(tracked) }.getOrNull()
+            if (caps != null &&
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            ) {
+                return tracked
+            }
+        }
+        @Suppress("DEPRECATION")
+        val wifiNet = runCatching {
+            cm.allNetworks.firstOrNull { net ->
+                val caps = cm.getNetworkCapabilities(net) ?: return@firstOrNull false
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                    !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            }
+        }.getOrNull()
+        if (wifiNet != null) return wifiNet
+
+        val active = cm.activeNetwork ?: return null
+        val caps = runCatching { cm.getNetworkCapabilities(active) }.getOrNull() ?: return null
+        return if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+            !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        ) active else null
+    }
+
     fun getLocalWifiIp(context: Context): String {
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val network = cm.activeNetwork ?: return ""
-        val lp: LinkProperties = cm.getLinkProperties(network) ?: return ""
-        val ipv4 = lp.linkAddresses.firstOrNull { it.address is Inet4Address && !it.address.isLoopbackAddress }
-        return ipv4?.address?.hostAddress ?: ""
+        return runCatching {
+            val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return ""
+            val network = findWifiNetwork(cm) ?: return ""
+            val lp: LinkProperties = cm.getLinkProperties(network) ?: return ""
+            val ipv4 = lp.linkAddresses.firstOrNull { it.address is Inet4Address && !it.address.isLoopbackAddress }
+            ipv4?.address?.hostAddress ?: ""
+        }.getOrDefault("")
     }
 
     fun getGatewayIp(context: Context): String {
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val network = cm.activeNetwork ?: return ""
-        val lp: LinkProperties = cm.getLinkProperties(network) ?: return ""
-        val gw = lp.routes.firstOrNull { it.isDefaultRoute && it.gateway is Inet4Address }?.gateway
-        return gw?.hostAddress ?: ""
+        return runCatching {
+            val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return ""
+            val network = findWifiNetwork(cm) ?: return ""
+            val lp: LinkProperties = cm.getLinkProperties(network) ?: return ""
+            val gw = lp.routes.firstOrNull { it.isDefaultRoute && it.gateway is Inet4Address }?.gateway
+            gw?.hostAddress ?: ""
+        }.getOrDefault("")
     }
-
-    @Volatile private var cachedSsid: String = ""
-    @Volatile private var cachedBssid: String = ""
-    @Volatile private var trackerRegistered: Boolean = false
 
     fun ensureWifiInfoTracker(context: Context) {
         if (trackerRegistered) return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        synchronized(trackerLock) {
+            if (trackerRegistered) return
             runCatching {
-                val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                    ?: return
                 val req = NetworkRequest.Builder()
                     .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                     .build()
-                val cb = object : ConnectivityManager.NetworkCallback(FLAG_INCLUDE_LOCATION_INFO) {
-                    override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                        val info = caps.transportInfo as? WifiInfo ?: return
-                        val rawSsid = info.ssid?.trim('"') ?: ""
-                        if (rawSsid.isNotBlank() && !rawSsid.equals("<unknown ssid>", ignoreCase = true)) {
-                            cachedSsid = rawSsid
+                val cb = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    object : ConnectivityManager.NetworkCallback(FLAG_INCLUDE_LOCATION_INFO) {
+                        override fun onAvailable(network: Network) {
+                            activeWifiNetwork = network
+                            WifiGuardVpnService.notifyConfigChanged()
                         }
-                        val rawBssid = info.bssid?.lowercase() ?: ""
-                        if (rawBssid.isNotBlank() && rawBssid != "02:00:00:00:00:00" && rawBssid != "00:00:00:00:00:00") {
-                            cachedBssid = rawBssid
+
+                        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                            if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                                activeWifiNetwork = network
+                            }
+                            val info = caps.transportInfo as? WifiInfo ?: return
+                            val rawSsid = info.ssid?.trim('"') ?: ""
+                            if (rawSsid.isNotBlank() && !rawSsid.equals("<unknown ssid>", ignoreCase = true)) {
+                                cachedSsid = rawSsid
+                            }
+                            val rawBssid = info.bssid?.lowercase() ?: ""
+                            if (rawBssid.isNotBlank() && rawBssid != "02:00:00:00:00:00" && rawBssid != "00:00:00:00:00:00") {
+                                cachedBssid = rawBssid
+                            }
+                        }
+
+                        override fun onLost(network: Network) {
+                            if (activeWifiNetwork == network) {
+                                activeWifiNetwork = null
+                                cachedSsid = ""
+                                cachedBssid = ""
+                                WifiGuardVpnService.notifyConfigChanged()
+                            }
                         }
                     }
+                } else {
+                    object : ConnectivityManager.NetworkCallback() {
+                        override fun onAvailable(network: Network) {
+                            activeWifiNetwork = network
+                            WifiGuardVpnService.notifyConfigChanged()
+                        }
 
-                    override fun onLost(network: Network) {
-                        cachedSsid = ""
-                        cachedBssid = ""
+                        override fun onLost(network: Network) {
+                            if (activeWifiNetwork == network) {
+                                activeWifiNetwork = null
+                                cachedSsid = ""
+                                cachedBssid = ""
+                                WifiGuardVpnService.notifyConfigChanged()
+                            }
+                        }
                     }
                 }
                 cm.registerNetworkCallback(req, cb)
@@ -84,15 +153,13 @@ object NetworkScanner {
     private fun getWifiSsidAndBssid(context: Context): Pair<String, String> {
         ensureWifiInfoTracker(context)
         return runCatching {
-            // 1. Try cached Android 12+ FLAG_INCLUDE_LOCATION_INFO result
             var ssid = cachedSsid
             var bssid = cachedBssid
 
-            // 2. Always check WifiManager.connectionInfo (works even while VPN is active!)
             if (ssid.isBlank() || bssid.isBlank()) {
-                val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
                 @Suppress("DEPRECATION")
-                val info = wm.connectionInfo
+                val info = wm?.connectionInfo
                 val rawSsid = info?.ssid?.trim('"') ?: ""
                 if (ssid.isBlank() && rawSsid.isNotBlank() && !rawSsid.equals("<unknown ssid>", ignoreCase = true)) {
                     ssid = rawSsid
@@ -107,9 +174,8 @@ object NetworkScanner {
     }
 
     /**
-     * Returns a unique hardware fingerprint for the current Wi-Fi network:
+     * Returns a hardware fingerprint for the current Wi-Fi network:
      * format: "ssid=<SSID>|bssid=<AP_MAC>|gwmac=<ROUTER_MAC>"
-     * Never relies on common router IP (192.168.1.1) alone.
      */
     fun getCurrentWifiSignature(context: Context): String {
         val (ssid, bssid) = getWifiSsidAndBssid(context)
@@ -119,8 +185,9 @@ object NetworkScanner {
             val peers = readArpAndNeighTable()
             gwMac = peers.firstOrNull { it.ip == gwIp }?.mac ?: ""
         }
+        val cleanSsid = ssid.replace("|", "").trim()
         val parts = mutableListOf<String>()
-        if (ssid.isNotBlank()) parts.add("ssid=$ssid")
+        if (cleanSsid.isNotBlank()) parts.add("ssid=$cleanSsid")
         if (bssid.isNotBlank()) parts.add("bssid=$bssid")
         if (gwMac.isNotBlank()) parts.add("gwmac=$gwMac")
         return parts.joinToString("|")
@@ -151,21 +218,21 @@ object NetworkScanner {
         val cur = parseSig(current)
         val tgt = parseSig(target)
 
-        // 1. Exact Router BSSID match (strongest, globally unique)
+        // 1. Exact Router BSSID match
         val curBssid = cur["bssid"]
         val tgtBssid = tgt["bssid"]
-        if (!curBssid.isNullOrBlank() && !tgtBssid.isNullOrBlank()) {
-            return curBssid.equals(tgtBssid, ignoreCase = true)
+        if (!curBssid.isNullOrBlank() && !tgtBssid.isNullOrBlank() && curBssid.equals(tgtBssid, ignoreCase = true)) {
+            return true
         }
 
-        // 2. Exact Router Gateway MAC match (globally unique)
+        // 2. Exact Router Gateway MAC match (supports dual-band 2.4GHz/5GHz and mesh APs on the same router)
         val curGwMac = cur["gwmac"]
         val tgtGwMac = tgt["gwmac"]
         if (!curGwMac.isNullOrBlank() && !tgtGwMac.isNullOrBlank()) {
             return curGwMac.equals(tgtGwMac, ignoreCase = true)
         }
 
-        // 3. Fallback to SSID match if hardware MAC unavailable
+        // 3. If both have BSSIDs and neither matched nor had gwmac, allow matching if SSID matches on dual-band APs
         val curSsid = cur["ssid"]
         val tgtSsid = tgt["ssid"]
         if (!curSsid.isNullOrBlank() && !tgtSsid.isNullOrBlank()) {
@@ -186,24 +253,19 @@ object NetworkScanner {
         return map
     }
 
-    /**
-     * Reliably detects if a host IP is physically alive on the Wi-Fi LAN on Android 11-15 (even when /proc/net/arp is restricted).
-     * Both a successful ICMP echo OR a TCP Connection Refused (ECONNREFUSED / TCP RST) prove the device kernel is active on Wi-Fi.
-     */
     suspend fun isHostAliveOnLan(ip: String): Boolean = withContext(Dispatchers.IO) {
         if (ip.isBlank()) return@withContext false
         val icmpOk = runCatching { InetAddress.getByName(ip).isReachable(450) }.getOrDefault(false)
         if (icmpOk) return@withContext true
 
-        // TCP connect probe: Connection Refused (ConnectException) means the phone actively sent TCP RST -> definitely on Wi-Fi!
         for (port in listOf(LocalLanClient.CLIENT_PORT, 5353, 80)) {
             val alive = try {
                 java.net.Socket().use { s ->
                     s.connect(java.net.InetSocketAddress(ip, port), 400)
                 }
                 true
-            } catch (e: java.net.ConnectException) {
-                true // TCP RST received -> host is physically online on Wi-Fi!
+            } catch (_: java.net.ConnectException) {
+                true // TCP RST received -> host is physically online on Wi-Fi
             } catch (_: Throwable) {
                 false
             }
@@ -249,22 +311,29 @@ object NetworkScanner {
         val map = linkedMapOf<String, String>()
 
         runCatching {
-            val proc = ProcessBuilder("ip", "neigh").start()
-            BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
-                reader.forEachLine { line ->
-                    val parts = line.trim().split(Regex("\\s+"))
-                    if (parts.size >= 5) {
-                        val ip = parts[0]
-                        val llIdx = parts.indexOf("lladdr")
-                        if (llIdx != -1 && llIdx + 1 < parts.size) {
-                            val mac = parts[llIdx + 1].lowercase()
-                            val state = parts.last().uppercase()
-                            if (mac != "00:00:00:00:00:00" && state != "FAILED") {
-                                map[ip] = mac
+            val proc = ProcessBuilder("ip", "neigh")
+                .redirectErrorStream(true)
+                .start()
+            try {
+                BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
+                    reader.forEachLine { line ->
+                        val parts = line.trim().split(Regex("\\s+"))
+                        if (parts.size >= 5) {
+                            val ip = parts[0]
+                            val llIdx = parts.indexOf("lladdr")
+                            if (llIdx != -1 && llIdx + 1 < parts.size) {
+                                val mac = parts[llIdx + 1].lowercase()
+                                val state = parts.last().uppercase()
+                                if (mac != "00:00:00:00:00:00" && state != "FAILED") {
+                                    map[ip] = mac
+                                }
                             }
                         }
                     }
                 }
+                proc.waitFor(2, TimeUnit.SECONDS)
+            } finally {
+                runCatching { proc.destroy() }
             }
         }
 

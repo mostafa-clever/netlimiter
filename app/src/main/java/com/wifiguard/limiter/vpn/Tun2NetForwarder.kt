@@ -35,7 +35,7 @@ class Tun2NetForwarder(
     @Volatile
     var flags: PacketPolicyFlags = PacketPolicyFlags()
 
-    private val connManager = vpnService.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private val connManager = vpnService.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
     private val uidBytesWindow = ConcurrentHashMap<Int, Long>()
     private val burstThrottledUntil = ConcurrentHashMap<Int, Long>()
     private val burstBucket = TokenBucket()
@@ -46,10 +46,11 @@ class Tun2NetForwarder(
 
     private fun resolveOwnerUid(protocol: Int, srcIp: ByteArray, srcPort: Int, dstIp: ByteArray, dstPort: Int): Int {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return -1
+        val cm = connManager ?: return -1
         return runCatching {
             val local = InetSocketAddress(InetAddress.getByAddress(srcIp), srcPort)
             val remote = InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort)
-            connManager.getConnectionOwnerUid(protocol, local, remote)
+            cm.getConnectionOwnerUid(protocol, local, remote)
         }.getOrDefault(-1)
     }
 
@@ -86,7 +87,7 @@ class Tun2NetForwarder(
         val dstPort: Int
     )
 
-    private enum class TcpState { SYN_SENT, ESTABLISHED, CLOSED }
+    private enum class TcpState { SYN_SENT, ESTABLISHED, CLIENT_FIN, SERVER_FIN, CLOSED }
 
     private class TcpSession(
         val key: FlowKey,
@@ -113,7 +114,7 @@ class Tun2NetForwarder(
     private val selector: Selector = Selector.open()
     private val tcpSessions = ConcurrentHashMap<FlowKey, TcpSession>()
     private val udpSessions = ConcurrentHashMap<FlowKey, UdpSession>()
-    private val pendingRegistrations = ConcurrentLinkedQueue<() -> Unit>()
+    private val pendingTasks = ConcurrentLinkedQueue<() -> Unit>()
     private val writeLock = Any()
     private val dnsExecutor = Executors.newFixedThreadPool(4)
 
@@ -137,15 +138,23 @@ class Tun2NetForwarder(
         udpSessions.values.forEach { runCatching { it.channel.close() } }
         tcpSessions.clear()
         udpSessions.clear()
+        pendingTasks.clear()
     }
 
     fun processTunPacket(packet: ByteArray, length: Int) {
-        if (!running || length < 20) return
+        if (!running || length < 20 || length > packet.size) return
         val version = (packet[0].toInt() ushr 4) and 0xF
         if (version != 4) return
 
         val ihl = (packet[0].toInt() and 0xF) * 4
         if (ihl < 20 || length < ihl) return
+
+        val ipTotalLen = ((packet[2].toInt() and 0xFF) shl 8) or (packet[3].toInt() and 0xFF)
+        if (ipTotalLen < ihl || ipTotalLen > length) return
+
+        // Drop fragmented IPv4 packets
+        val fragField = ((packet[6].toInt() and 0x3F) shl 8) or (packet[7].toInt() and 0xFF)
+        if (fragField != 0) return
 
         val protocol = packet[9].toInt() and 0xFF
         val srcIp = packet.copyOfRange(12, 16)
@@ -156,14 +165,14 @@ class Tun2NetForwarder(
         val currentFlags = flags
 
         when (protocol) {
-            17 -> handleUdpFromTun(packet, length, ihl, srcIp, dstIp, srcIpInt, dstIpInt, currentFlags)
-            6 -> handleTcpFromTun(packet, length, ihl, srcIp, dstIp, srcIpInt, dstIpInt, currentFlags)
+            17 -> handleUdpFromTun(packet, ipTotalLen, ihl, srcIp, dstIp, srcIpInt, dstIpInt, currentFlags)
+            6 -> handleTcpFromTun(packet, ipTotalLen, ihl, srcIp, dstIp, srcIpInt, dstIpInt, currentFlags)
         }
     }
 
     private fun handleUdpFromTun(
         packet: ByteArray,
-        length: Int,
+        ipTotalLen: Int,
         ihl: Int,
         srcIp: ByteArray,
         dstIp: ByteArray,
@@ -171,25 +180,30 @@ class Tun2NetForwarder(
         dstIpInt: Int,
         currentFlags: PacketPolicyFlags
     ) {
-        if (length < ihl + 8) return
+        if (ipTotalLen < ihl + 8) return
         val srcPort = ((packet[ihl].toInt() and 0xFF) shl 8) or (packet[ihl + 1].toInt() and 0xFF)
         val dstPort = ((packet[ihl + 2].toInt() and 0xFF) shl 8) or (packet[ihl + 3].toInt() and 0xFF)
+        val udpLen = ((packet[ihl + 4].toInt() and 0xFF) shl 8) or (packet[ihl + 5].toInt() and 0xFF)
+        if (udpLen < 8 || ihl + udpLen > ipTotalLen) return
 
         if (dstPort == 53) {
             if (currentFlags.blockAll) return
-            val pktCopy = packet.copyOf(length)
-            dnsExecutor.execute {
-                val resp = runCatching {
-                    dnsHandler.handlePacket(
-                        packet = pktCopy,
-                        length = length,
-                        sinkholeEnabled = currentFlags.sinkholeEnabled,
-                        cacheEnabled = currentFlags.cacheEnabled,
-                        blockDohDot = currentFlags.blockDohDot,
-                        blockQuicUdp443 = currentFlags.blockQuicUdp443
-                    )
-                }.getOrNull()
-                if (resp != null) writeToTun(resp)
+            val pktCopy = packet.copyOf(ipTotalLen)
+            runCatching {
+                dnsExecutor.execute {
+                    val resp = runCatching {
+                        dnsHandler.handlePacket(
+                            packet = pktCopy,
+                            length = ipTotalLen,
+                            sinkholeEnabled = currentFlags.sinkholeEnabled,
+                            cacheEnabled = currentFlags.cacheEnabled,
+                            blockDohDot = currentFlags.blockDohDot,
+                            blockQuicUdp443 = currentFlags.blockQuicUdp443,
+                            stripAaaa = true
+                        )
+                    }.getOrNull()
+                    if (resp != null) writeToTun(resp)
+                }
             }
             return
         }
@@ -199,42 +213,44 @@ class Tun2NetForwarder(
         if (dstPort == 853 && currentFlags.blockDohDot) return
 
         val payloadOffset = ihl + 8
-        val payloadLen = length - payloadOffset
-        if (payloadLen <= 0) return
-        val payload = packet.copyOfRange(payloadOffset, length)
+        val payloadEnd = ihl + udpLen
+        if (payloadEnd <= payloadOffset) return
+        val payload = packet.copyOfRange(payloadOffset, payloadEnd)
 
         val key = FlowKey(17, srcIpInt, srcPort, dstIpInt, dstPort)
-        val existing = udpSessions[key]
-        if (existing != null) {
-            existing.lastActivityMs = System.currentTimeMillis()
-            pendingRegistrations.add {
+        pendingTasks.add {
+            val existing = udpSessions[key]
+            if (existing != null) {
+                existing.lastActivityMs = System.currentTimeMillis()
                 runCatching { existing.channel.write(ByteBuffer.wrap(payload)) }
+                return@add
             }
-            selector.wakeup()
-            return
-        }
 
-        runCatching {
-            val dc = DatagramChannel.open()
-            vpnService.protect(dc.socket())
-            dc.configureBlocking(false)
-            dc.connect(InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort))
-            val uid = resolveOwnerUid(17, srcIp, srcPort, dstIp, dstPort)
-            val session = UdpSession(key, uid, srcIp, dstIp, dc)
-            udpSessions[key] = session
-            pendingRegistrations.add {
-                runCatching {
-                    dc.register(selector, SelectionKey.OP_READ, session)
-                    dc.write(ByteBuffer.wrap(payload))
+            var dc: DatagramChannel? = null
+            try {
+                dc = DatagramChannel.open()
+                if (!vpnService.protect(dc.socket())) {
+                    dc.close()
+                    return@add
                 }
+                dc.configureBlocking(false)
+                dc.connect(InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort))
+                val uid = resolveOwnerUid(17, srcIp, srcPort, dstIp, dstPort)
+                val session = UdpSession(key, uid, srcIp, dstIp, dc)
+                dc.register(selector, SelectionKey.OP_READ, session)
+                udpSessions[key] = session
+                dc.write(ByteBuffer.wrap(payload))
+            } catch (_: Throwable) {
+                udpSessions.remove(key)
+                runCatching { dc?.close() }
             }
-            selector.wakeup()
         }
+        selector.wakeup()
     }
 
     private fun handleTcpFromTun(
         packet: ByteArray,
-        length: Int,
+        ipTotalLen: Int,
         ihl: Int,
         srcIp: ByteArray,
         dstIp: ByteArray,
@@ -242,12 +258,12 @@ class Tun2NetForwarder(
         dstIpInt: Int,
         currentFlags: PacketPolicyFlags
     ) {
-        if (length < ihl + 20) return
+        if (ipTotalLen < ihl + 20) return
         val srcPort = ((packet[ihl].toInt() and 0xFF) shl 8) or (packet[ihl + 1].toInt() and 0xFF)
         val dstPort = ((packet[ihl + 2].toInt() and 0xFF) shl 8) or (packet[ihl + 3].toInt() and 0xFF)
         val seqNum = readUInt32(packet, ihl + 4)
         val dataOffset = ((packet[ihl + 12].toInt() ushr 4) and 0xF) * 4
-        if (length < ihl + dataOffset) return
+        if (dataOffset < 20 || ipTotalLen < ihl + dataOffset) return
 
         val tcpFlags = packet[ihl + 13].toInt() and 0xFF
         val isSyn = (tcpFlags and 0x02) != 0
@@ -256,32 +272,61 @@ class Tun2NetForwarder(
         val isRst = (tcpFlags and 0x04) != 0
 
         val payloadOffset = ihl + dataOffset
-        val payloadLen = length - payloadOffset
+        val payloadLen = ipTotalLen - payloadOffset
         val key = FlowKey(6, srcIpInt, srcPort, dstIpInt, dstPort)
 
         if (currentFlags.blockAll) {
-            if (isSyn || payloadLen > 0) {
-                val rstPkt = buildTcpPacket(dstIp, srcIp, dstPort, srcPort, 0L, seqNum + 1, 0x14, ByteArray(0))
+            if (!isRst && (isSyn || payloadLen > 0)) {
+                val rstAck = (seqNum + if (isSyn) 1L else payloadLen.toLong()) and 0xFFFFFFFFL
+                val rstPkt = buildTcpPacket(dstIp, srcIp, dstPort, srcPort, 0L, rstAck, 0x14, ByteArray(0))
                 writeToTun(rstPkt)
             }
             return
         }
 
         if (currentFlags.blockDohDot && (dstPort == 853 || (dstPort == 443 && isPublicDnsIp(dstIp)))) {
-            val rstPkt = buildTcpPacket(dstIp, srcIp, dstPort, srcPort, 0L, seqNum + 1, 0x14, ByteArray(0))
-            writeToTun(rstPkt)
+            if (!isRst) {
+                val rstAck = (seqNum + if (isSyn) 1L else payloadLen.coerceAtLeast(1).toLong()) and 0xFFFFFFFFL
+                val rstPkt = buildTcpPacket(dstIp, srcIp, dstPort, srcPort, 0L, rstAck, 0x14, ByteArray(0))
+                writeToTun(rstPkt)
+            }
             return
         }
 
+        val payload = if (payloadLen > 0) packet.copyOfRange(payloadOffset, ipTotalLen) else ByteArray(0)
+
+        // Confine all TcpSession state mutations to the selector thread to eliminate data races
+        pendingTasks.add {
+            handleTcpOnSelector(key, srcIp, dstIp, srcPort, dstPort, seqNum, isSyn, isAck, isFin, isRst, payload)
+        }
+        selector.wakeup()
+    }
+
+    private fun handleTcpOnSelector(
+        key: FlowKey,
+        srcIp: ByteArray,
+        dstIp: ByteArray,
+        srcPort: Int,
+        dstPort: Int,
+        seqNum: Long,
+        isSyn: Boolean,
+        isAck: Boolean,
+        isFin: Boolean,
+        isRst: Boolean,
+        payload: ByteArray
+    ) {
         if (isSyn && !isAck) {
             val existingSyn = tcpSessions[key]
-            if (existingSyn != null && existingSyn.state == TcpState.SYN_SENT) {
-                return
-            }
-            tcpSessions.remove(key)?.let { old -> runCatching { old.channel.close() } }
-            runCatching {
-                val sc = SocketChannel.open()
-                vpnService.protect(sc.socket())
+            if (existingSyn != null && existingSyn.state == TcpState.SYN_SENT) return
+            if (existingSyn != null) closeTcpSession(existingSyn)
+
+            var sc: SocketChannel? = null
+            try {
+                sc = SocketChannel.open()
+                if (!vpnService.protect(sc.socket())) {
+                    sc.close()
+                    return
+                }
                 sc.configureBlocking(false)
                 sc.socket().tcpNoDelay = true
                 val connected = sc.connect(InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort))
@@ -297,23 +342,34 @@ class Tun2NetForwarder(
                     mySeq = initialMySeq,
                     state = if (connected) TcpState.ESTABLISHED else TcpState.SYN_SENT
                 )
-                tcpSessions[key] = session
-                pendingRegistrations.add {
-                    runCatching {
-                        if (connected) {
-                            sendSynAck(session)
-                            sc.register(selector, SelectionKey.OP_READ, session)
-                        } else {
-                            sc.register(selector, SelectionKey.OP_CONNECT, session)
-                        }
-                    }
+                if (connected) {
+                    sc.register(selector, SelectionKey.OP_READ, session)
+                    tcpSessions[key] = session
+                    sendSynAck(session)
+                } else {
+                    sc.register(selector, SelectionKey.OP_CONNECT, session)
+                    tcpSessions[key] = session
                 }
-                selector.wakeup()
+            } catch (_: Throwable) {
+                tcpSessions.remove(key)
+                runCatching { sc?.close() }
+                val rstPkt = buildTcpPacket(dstIp, srcIp, dstPort, srcPort, 0L, (seqNum + 1) and 0xFFFFFFFFL, 0x14, ByteArray(0))
+                writeToTun(rstPkt)
             }
             return
         }
 
-        val session = tcpSessions[key] ?: return
+        val session = tcpSessions[key]
+        if (session == null) {
+            // Send RST for unknown non-RST packets so evicted/stale flows fail fast instead of hanging
+            if (!isRst) {
+                val rstAck = (seqNum + payload.size.coerceAtLeast(if (isFin) 1 else 0).toLong()) and 0xFFFFFFFFL
+                val rstPkt = buildTcpPacket(dstIp, srcIp, dstPort, srcPort, 0L, rstAck, 0x14, ByteArray(0))
+                writeToTun(rstPkt)
+            }
+            return
+        }
+
         session.lastActivityMs = System.currentTimeMillis()
 
         if (isRst) {
@@ -321,11 +377,9 @@ class Tun2NetForwarder(
             return
         }
 
-        if (payloadLen > 0) {
-            val payload = packet.copyOfRange(payloadOffset, length)
-            val expected = session.clientSeq
-            if (seqNum == expected) {
-                session.clientSeq = (seqNum + payloadLen) and 0xFFFFFFFFL
+        if (payload.isNotEmpty()) {
+            if (seqNum == session.clientSeq) {
+                session.clientSeq = (seqNum + payload.size) and 0xFFFFFFFFL
                 session.writeQueue.add(ByteBuffer.wrap(payload))
                 val ackPkt = buildTcpPacket(
                     session.dstIp, session.srcIp,
@@ -334,15 +388,10 @@ class Tun2NetForwarder(
                     0x10, ByteArray(0)
                 )
                 writeToTun(ackPkt)
-                pendingRegistrations.add {
-                    runCatching {
-                        val selKey = session.channel.keyFor(selector)
-                        if (selKey != null && selKey.isValid && session.state == TcpState.ESTABLISHED) {
-                            selKey.interestOps(selKey.interestOps() or SelectionKey.OP_WRITE)
-                        }
-                    }
+                val selKey = runCatching { session.channel.keyFor(selector) }.getOrNull()
+                if (selKey != null && selKey.isValid && session.state == TcpState.ESTABLISHED) {
+                    runCatching { selKey.interestOps(selKey.interestOps() or SelectionKey.OP_WRITE) }
                 }
-                selector.wakeup()
             } else {
                 val ackPkt = buildTcpPacket(
                     session.dstIp, session.srcIp,
@@ -354,79 +403,112 @@ class Tun2NetForwarder(
             }
         }
 
-        if (isFin) {
+        if (isFin && seqNum + payload.size == session.clientSeq) {
             session.clientSeq = (session.clientSeq + 1) and 0xFFFFFFFFL
-            val finAck = buildTcpPacket(
+            val ackPkt = buildTcpPacket(
                 session.dstIp, session.srcIp,
                 key.dstPort, key.srcPort,
                 session.mySeq, session.clientSeq,
-                0x11, ByteArray(0)
+                0x10, ByteArray(0)
             )
-            session.mySeq = (session.mySeq + 1) and 0xFFFFFFFFL
-            writeToTun(finAck)
-            closeTcpSession(session)
+            writeToTun(ackPkt)
+            // Half-close: shut down outbound write side while allowing remaining remote response bytes to finish
+            session.state = TcpState.CLIENT_FIN
+            if (session.writeQueue.isEmpty()) {
+                runCatching { session.channel.shutdownOutput() }
+            }
         }
     }
 
     private fun runSelectorLoop() {
         val readBuf = ByteBuffer.allocate(1360)
-        val udpBuf = ByteBuffer.allocate(1450)
+        val udpBuf = ByteBuffer.allocate(1372) // Fits 1400B MTU (1400 - 20 IP - 8 UDP)
         var lastCleanupMs = System.currentTimeMillis()
 
         try {
             while (running && selector.isOpen) {
                 while (true) {
-                    val task = pendingRegistrations.poll() ?: break
+                    val task = pendingTasks.poll() ?: break
                     runCatching { task() }
                 }
 
-                val budget = tokenBucket.availableBytes()
-                if (budget >= 256) {
-                    for (session in tcpSessions.values) {
-                        if (session.state == TcpState.ESTABLISHED) {
-                            val k = runCatching { session.channel.keyFor(selector) }.getOrNull()
-                            if (k != null && k.isValid && (k.interestOps() and SelectionKey.OP_READ) == 0) {
+                var anyThrottled = false
+                for (session in tcpSessions.values) {
+                    if (session.state == TcpState.ESTABLISHED || session.state == TcpState.CLIENT_FIN) {
+                        val activeBucket = if (isUidBurstThrottled(session.ownerUid)) burstBucket else tokenBucket
+                        val k = runCatching { session.channel.keyFor(selector) }.getOrNull()
+                        if (k != null && k.isValid) {
+                            if (activeBucket.availableBytes() >= 256) {
+                                if ((k.interestOps() and SelectionKey.OP_READ) == 0) {
+                                    runCatching { k.interestOps(k.interestOps() or SelectionKey.OP_READ) }
+                                }
+                            } else {
+                                anyThrottled = true
+                                if ((k.interestOps() and SelectionKey.OP_READ) != 0) {
+                                    runCatching { k.interestOps(k.interestOps() and SelectionKey.OP_READ.inv()) }
+                                }
+                            }
+                        }
+                    }
+                }
+                for (session in udpSessions.values) {
+                    val activeBucket = if (isUidBurstThrottled(session.ownerUid)) burstBucket else tokenBucket
+                    val k = runCatching { session.channel.keyFor(selector) }.getOrNull()
+                    if (k != null && k.isValid) {
+                        if (activeBucket.availableBytes() >= 256) {
+                            if ((k.interestOps() and SelectionKey.OP_READ) == 0) {
                                 runCatching { k.interestOps(k.interestOps() or SelectionKey.OP_READ) }
+                            }
+                        } else {
+                            anyThrottled = true
+                            if ((k.interestOps() and SelectionKey.OP_READ) != 0) {
+                                runCatching { k.interestOps(k.interestOps() and SelectionKey.OP_READ.inv()) }
                             }
                         }
                     }
                 }
 
                 if (!running || !selector.isOpen) break
-                if (budget < 256) Thread.sleep(5L)
-                runCatching { selector.select(10L) }
+                val selectTimeout = when {
+                    anyThrottled -> tokenBucket.millisUntilBytes(256).coerceIn(10L, 50L)
+                    tcpSessions.isEmpty() && udpSessions.isEmpty() -> 5_000L
+                    else -> 250L
+                }
+                runCatching { selector.select(selectTimeout) }
                 if (!running || !selector.isOpen) break
-                val keys = selector.selectedKeys().iterator()
-            while (keys.hasNext()) {
-                val key = keys.next()
-                keys.remove()
-                if (!key.isValid) continue
 
-                when (val att = key.attachment()) {
-                    is TcpSession -> runCatching { handleTcpKey(key, att, readBuf) }.onFailure { closeTcpSession(att) }
-                    is UdpSession -> runCatching { handleUdpKey(key, att, udpBuf) }.onFailure {
-                        udpSessions.remove(att.key)
-                        runCatching { att.channel.close() }
+                val keys = selector.selectedKeys().iterator()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    keys.remove()
+                    if (!key.isValid) continue
+
+                    when (val att = key.attachment()) {
+                        is TcpSession -> runCatching { handleTcpKey(key, att, readBuf) }.onFailure { closeTcpSession(att) }
+                        is UdpSession -> runCatching { handleUdpKey(key, att, udpBuf) }.onFailure {
+                            udpSessions.remove(att.key)
+                            runCatching { att.channel.close() }
+                        }
+                    }
+                }
+
+                val now = System.currentTimeMillis()
+                if (now - lastCleanupMs > 5_000L) {
+                    lastCleanupMs = now
+                    tcpSessions.values.filter {
+                        (it.state == TcpState.SYN_SENT && now - it.lastActivityMs > 8_000L) ||
+                            ((it.state == TcpState.CLIENT_FIN || it.state == TcpState.SERVER_FIN) && now - it.lastActivityMs > 6_000L) ||
+                            (now - it.lastActivityMs > 60_000L)
+                    }.forEach { closeTcpSession(it) }
+                    if (tcpSessions.size > 120) {
+                        tcpSessions.values.sortedBy { it.lastActivityMs }.take(tcpSessions.size - 100).forEach { closeTcpSession(it) }
+                    }
+                    udpSessions.values.filter { now - it.lastActivityMs > 20_000L }.forEach {
+                        udpSessions.remove(it.key)
+                        runCatching { it.channel.close() }
                     }
                 }
             }
-
-            val now = System.currentTimeMillis()
-            if (now - lastCleanupMs > 5_000L) {
-                lastCleanupMs = now
-                tcpSessions.values.filter {
-                    (it.state == TcpState.SYN_SENT && now - it.lastActivityMs > 8_000L) ||
-                    (now - it.lastActivityMs > 35_000L)
-                }.forEach { closeTcpSession(it) }
-                if (tcpSessions.size > 120) {
-                    tcpSessions.values.sortedBy { it.lastActivityMs }.take(tcpSessions.size - 100).forEach { closeTcpSession(it) }
-                }
-                udpSessions.values.filter { now - it.lastActivityMs > 20_000L }.forEach {
-                    udpSessions.remove(it.key)
-                    runCatching { it.channel.close() }
-                }
-            }
-        }
         } catch (_: Throwable) {
         } finally {
             runCatching { selector.close() }
@@ -456,7 +538,6 @@ class Tun2NetForwarder(
                     return
                 }
                 if (buf.hasRemaining()) {
-                    // Socket send buffer full, keep remaining ByteBuffer at head of queue
                     break
                 } else {
                     session.writeQueue.poll()
@@ -464,6 +545,9 @@ class Tun2NetForwarder(
             }
             if (session.writeQueue.isEmpty() && key.isValid) {
                 key.interestOps(key.interestOps() and SelectionKey.OP_WRITE.inv())
+                if (session.state == TcpState.CLIENT_FIN) {
+                    runCatching { session.channel.shutdownOutput() }
+                }
             }
         }
 
@@ -488,8 +572,12 @@ class Tun2NetForwarder(
                     session.mySeq, session.clientSeq,
                     0x11, ByteArray(0)
                 )
+                session.mySeq = (session.mySeq + 1) and 0xFFFFFFFFL
                 writeToTun(finPkt)
-                closeTcpSession(session)
+                // Linger briefly in SERVER_FIN so the client's ACK/FIN doesn't trigger a spurious RST
+                session.state = TcpState.SERVER_FIN
+                session.lastActivityMs = System.currentTimeMillis()
+                runCatching { key.interestOps(key.interestOps() and SelectionKey.OP_READ.inv()) }
                 return
             }
             if (bytesRead > 0) {
@@ -517,7 +605,10 @@ class Tun2NetForwarder(
         if (!key.isReadable) return
         val uidThrottled = isUidBurstThrottled(session.ownerUid)
         val avail = (if (uidThrottled) burstBucket else tokenBucket).availableBytes()
-        if (avail < 256) return
+        if (avail < 256) {
+            key.interestOps(key.interestOps() and SelectionKey.OP_READ.inv())
+            return
+        }
 
         udpBuf.clear()
         val read = runCatching { session.channel.read(udpBuf) }.getOrElse { -1 }

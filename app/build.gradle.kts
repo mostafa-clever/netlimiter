@@ -5,12 +5,12 @@ plugins {
 
 android {
     namespace = "com.wifiguard.limiter"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.wifiguard.limiter"
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 35
         val buildNum = (project.findProperty("buildNumber") as? String)?.toIntOrNull() ?: 1
         versionCode = buildNum
         versionName = "1.0.$buildNum"
@@ -23,9 +23,15 @@ android {
     signingConfigs {
         create("release") {
             storeFile = file("wifiguard-release.jks")
-            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "wifiguard2026"
-            keyAlias = System.getenv("KEY_ALIAS") ?: "wifiguard"
-            keyPassword = System.getenv("KEY_PASSWORD") ?: "wifiguard2026"
+            storePassword = System.getenv("KEYSTORE_PASSWORD")
+                ?: (project.findProperty("KEYSTORE_PASSWORD") as? String)
+                ?: "wifiguard2026"
+            keyAlias = System.getenv("KEY_ALIAS")
+                ?: (project.findProperty("KEY_ALIAS") as? String)
+                ?: "wifiguard"
+            keyPassword = System.getenv("KEY_PASSWORD")
+                ?: (project.findProperty("KEY_PASSWORD") as? String)
+                ?: "wifiguard2026"
         }
     }
 

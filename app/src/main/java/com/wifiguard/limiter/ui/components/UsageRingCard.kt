@@ -1,7 +1,5 @@
 package com.wifiguard.limiter.ui.components
 
-import android.content.pm.ApplicationInfo
-import android.content.pm.PackageManager
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
@@ -23,9 +21,9 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
-import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Eco
 import androidx.compose.material.icons.rounded.HourglassBottom
 import androidx.compose.material.icons.rounded.Search
@@ -36,25 +34,27 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
-import androidx.compose.material3.FilterChip
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Text
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -65,6 +65,7 @@ import androidx.compose.ui.unit.sp
 import com.wifiguard.limiter.model.ConnectionState
 import com.wifiguard.limiter.model.InstalledAppItem
 import com.wifiguard.limiter.model.formatDataSizeArabic
+import com.wifiguard.limiter.model.getInstalledLaunchableApps
 import com.wifiguard.limiter.ui.theme.AlertRed
 import com.wifiguard.limiter.ui.theme.AlertRedBg
 import com.wifiguard.limiter.ui.theme.PrimaryTeal
@@ -74,6 +75,9 @@ import com.wifiguard.limiter.ui.theme.SuccessGreenBg
 import com.wifiguard.limiter.ui.theme.TextMuted
 import com.wifiguard.limiter.ui.theme.WarnAmber
 import com.wifiguard.limiter.ui.theme.WarnAmberBg
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.util.Locale
 
 @Composable
 fun UsageRingCard(
@@ -84,13 +88,22 @@ fun UsageRingCard(
     protectionActive: Boolean,
     statusLabelOverride: String? = null
 ) {
-    val ratio = if (dailyLimitMb <= 0L) 1f else (usedMb.toFloat() / dailyLimitMb.toFloat()).coerceIn(0f, 1f)
+    val safeUsed = usedMb.coerceAtLeast(0L)
+    val safeLimit = dailyLimitMb.coerceAtLeast(0L)
+    val ratio = when {
+        safeLimit <= 0L -> if (safeUsed > 0L) 1f else 0f
+        else -> (safeUsed.toFloat() / safeLimit.toFloat()).coerceIn(0f, 1f)
+    }
+    val pctInt = when {
+        safeLimit <= 0L -> if (safeUsed > 0L) 100 else 0
+        else -> ((safeUsed * 100.0) / safeLimit.toDouble()).coerceIn(0.0, 999.0).toInt()
+    }
     val animatedProgress by animateFloatAsState(
         targetValue = ratio,
         animationSpec = tween(durationMillis = 700),
         label = "usage_ring"
     )
-    val remainingMb = (dailyLimitMb - usedMb).coerceAtLeast(0L)
+    val remainingMb = (safeLimit - safeUsed).coerceAtLeast(0L)
 
     val ringColor = when {
         !protectionActive -> TextMuted
@@ -124,31 +137,43 @@ fun UsageRingCard(
             ) {
                 Canvas(modifier = Modifier.size(170.dp)) {
                     val strokeWidth = 16.dp.toPx()
+                    val halfStroke = strokeWidth / 2f
+                    val arcSize = Size(
+                        (size.width - strokeWidth).coerceAtLeast(1f),
+                        (size.height - strokeWidth).coerceAtLeast(1f)
+                    )
+                    val topLeft = Offset(halfStroke, halfStroke)
                     drawArc(
                         color = Color(0xFFE5ECEE),
                         startAngle = 0f,
                         sweepAngle = 360f,
                         useCenter = false,
+                        topLeft = topLeft,
+                        size = arcSize,
                         style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
                     )
-                    drawArc(
-                        color = ringColor,
-                        startAngle = -90f,
-                        sweepAngle = 360f * animatedProgress,
-                        useCenter = false,
-                        style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
-                    )
+                    if (animatedProgress > 0.001f) {
+                        drawArc(
+                            color = ringColor,
+                            startAngle = -90f,
+                            sweepAngle = 360f * animatedProgress,
+                            useCenter = false,
+                            topLeft = topLeft,
+                            size = arcSize,
+                            style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+                        )
+                    }
                 }
 
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
-                        text = formatDataSizeArabic(usedMb),
+                        text = formatDataSizeArabic(safeUsed),
                         fontSize = 22.sp,
                         fontWeight = FontWeight.ExtraBold,
                         color = ringColor
                     )
                     Text(
-                        text = "من ${formatDataSizeArabic(dailyLimitMb)}",
+                        text = "من ${formatDataSizeArabic(safeLimit)}",
                         fontSize = 13.sp,
                         color = TextMuted
                     )
@@ -170,7 +195,7 @@ fun UsageRingCard(
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
                 StatChip(label = "المتبقي", value = formatDataSizeArabic(remainingMb))
-                StatChip(label = "نسبة الاستهلاك", value = "${if (dailyLimitMb <= 0L) 100 else ((usedMb * 100) / dailyLimitMb)}%")
+                StatChip(label = "نسبة الاستهلاك", value = "$pctInt%")
             }
         }
     }
@@ -206,7 +231,7 @@ fun StatusPill(
             WarnAmberBg,
             WarnAmber,
             Icons.Rounded.HourglassBottom,
-            "رصيد إضافي • سرعة 0.25 ميجابت/ث"
+            "رصيد إضافي نشط"
         )
         connectionState == ConnectionState.SLOWED -> Quad(
             WarnAmberBg,
@@ -234,7 +259,7 @@ fun StatusPill(
         )
     }
 
-    val text = if (!protectionActive) defaultText else (labelOverride ?: defaultText)
+    val text = if (!protectionActive) defaultText else (labelOverride?.takeIf { it.isNotBlank() } ?: defaultText)
 
     Row(
         modifier = Modifier
@@ -267,26 +292,17 @@ fun WhitelistPickerDialog(
     onConfirm: (Set<String>) -> Unit
 ) {
     val context = LocalContext.current
-    val installedApps = remember(remoteApps) {
-        if (remoteApps != null) {
-            remoteApps.sortedBy { it.appName }
+    val appsState by produceState<List<InstalledAppItem>?>(initialValue = null, key1 = remoteApps) {
+        value = if (remoteApps != null) {
+            remoteApps.distinctBy { it.packageName }.sortedBy { it.appName.lowercase(Locale.getDefault()) }
         } else {
-            val pm = context.packageManager
-            pm.getInstalledApplications(PackageManager.GET_META_DATA)
-                .filter { (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 || pm.getLaunchIntentForPackage(it.packageName) != null }
-                .filter { it.packageName != context.packageName }
-                .map {
-                    InstalledAppItem(
-                        packageName = it.packageName,
-                        appName = pm.getApplicationLabel(it).toString()
-                    )
-                }
-                .sortedBy { it.appName }
+            withContext(Dispatchers.IO) { getInstalledLaunchableApps(context) }
         }
     }
+    val installedApps = appsState ?: emptyList()
 
-    var searchQuery by remember { mutableStateOf("") }
-    var selected by remember { mutableStateOf(initialSelected) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var selected by remember(initialSelected) { mutableStateOf(initialSelected) }
 
     val filtered = remember(searchQuery, installedApps) {
         if (searchQuery.isBlank()) installedApps
@@ -313,26 +329,46 @@ fun WhitelistPickerDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(modifier = Modifier.height(8.dp))
-                LazyColumn(modifier = Modifier.heightIn(max = 280.dp)) {
-                    items(filtered, key = { it.packageName }) { app ->
-                        val isChecked = selected.contains(app.packageName)
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    selected = if (isChecked) selected - app.packageName else selected + app.packageName
-                                }
-                                .padding(vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Checkbox(
-                                checked = isChecked,
-                                onCheckedChange = { checked ->
-                                    selected = if (checked) selected + app.packageName else selected - app.packageName
-                                }
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(text = app.appName, fontSize = 14.sp)
+                if (appsState == null) {
+                    Box(
+                        modifier = Modifier.fillMaxWidth().height(120.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator(color = PrimaryTeal, modifier = Modifier.size(28.dp))
+                    }
+                } else if (filtered.isEmpty()) {
+                    Text(
+                        text = if (installedApps.isEmpty() && remoteApps != null) {
+                            "لم يرسل جهاز العضو قائمة تطبيقاته بعد — تأكد من اتصاله بالواي فاي ثم اضغط تحديث."
+                        } else {
+                            "لا توجد تطبيقات مطابقة للبحث."
+                        },
+                        fontSize = 13.sp,
+                        color = TextMuted,
+                        modifier = Modifier.padding(vertical = 16.dp)
+                    )
+                } else {
+                    LazyColumn(modifier = Modifier.heightIn(max = 280.dp)) {
+                        items(filtered, key = { it.packageName }) { app ->
+                            val isChecked = selected.contains(app.packageName)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        selected = if (isChecked) selected - app.packageName else selected + app.packageName
+                                    }
+                                    .padding(vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = isChecked,
+                                    onCheckedChange = { checked ->
+                                        selected = if (checked) selected + app.packageName else selected - app.packageName
+                                    }
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(text = app.appName, fontSize = 14.sp)
+                            }
                         }
                     }
                 }
@@ -351,7 +387,6 @@ fun WhitelistPickerDialog(
     )
 }
 
-
 @Composable
 fun AppQuotaPercentsDialog(
     initialMap: Map<String, Int>,
@@ -360,25 +395,23 @@ fun AppQuotaPercentsDialog(
     onConfirm: (Map<String, Int>) -> Unit
 ) {
     val context = LocalContext.current
-    val installedApps = remember(remoteApps) {
-        if (remoteApps != null) {
-            remoteApps.sortedBy { it.appName }
+    val appsState by produceState<List<InstalledAppItem>?>(initialValue = null, key1 = remoteApps) {
+        value = if (remoteApps != null) {
+            remoteApps.distinctBy { it.packageName }.sortedBy { it.appName.lowercase(Locale.getDefault()) }
         } else {
-            val pm = context.packageManager
-            pm.getInstalledApplications(PackageManager.GET_META_DATA)
-                .filter { (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 || pm.getLaunchIntentForPackage(it.packageName) != null }
-                .filter { it.packageName != context.packageName }
-                .map { InstalledAppItem(it.packageName, pm.getApplicationLabel(it).toString()) }
-                .sortedBy { it.appName }
+            withContext(Dispatchers.IO) { getInstalledLaunchableApps(context) }
         }
     }
+    val installedApps = appsState ?: emptyList()
     val appNameMap = remember(installedApps) {
         installedApps.associate { it.packageName to it.appName }
     }
 
-    var quotaMap by remember { mutableStateOf(initialMap) }
-    var pickingApp by remember { mutableStateOf(false) }
-    var searchQuery by remember { mutableStateOf("") }
+    var quotaMap by remember(initialMap) {
+        mutableStateOf(initialMap.mapValues { it.value.coerceIn(5, 100) })
+    }
+    var pickingApp by rememberSaveable { mutableStateOf(false) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -405,21 +438,41 @@ fun AppQuotaPercentsDialog(
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(modifier = Modifier.height(8.dp))
-                    LazyColumn(modifier = Modifier.heightIn(max = 280.dp)) {
-                        items(available, key = { it.packageName }) { app ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        quotaMap = quotaMap + (app.packageName to 20)
-                                        searchQuery = ""
-                                        pickingApp = false
-                                    }
-                                    .padding(vertical = 10.dp, horizontal = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(text = app.appName, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                                Icon(Icons.Rounded.Add, contentDescription = null, tint = PrimaryTeal)
+                    if (appsState == null) {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().height(120.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(color = PrimaryTeal, modifier = Modifier.size(28.dp))
+                        }
+                    } else if (available.isEmpty()) {
+                        Text(
+                            text = if (installedApps.isEmpty() && remoteApps != null) {
+                                "لم يرسل جهاز العضو قائمة تطبيقاته بعد — تأكد من اتصاله بالواي فاي ثم اضغط تحديث."
+                            } else {
+                                "لا توجد تطبيقات متاحة مطابقة للبحث."
+                            },
+                            fontSize = 13.sp,
+                            color = TextMuted,
+                            modifier = Modifier.padding(vertical = 16.dp)
+                        )
+                    } else {
+                        LazyColumn(modifier = Modifier.heightIn(max = 280.dp)) {
+                            items(available, key = { it.packageName }) { app ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            quotaMap = quotaMap + (app.packageName to 20)
+                                            searchQuery = ""
+                                            pickingApp = false
+                                        }
+                                        .padding(vertical = 10.dp, horizontal = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(text = app.appName, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                                    Icon(Icons.Rounded.Add, contentDescription = null, tint = PrimaryTeal)
+                                }
                             }
                         }
                     }
@@ -437,7 +490,8 @@ fun AppQuotaPercentsDialog(
                             modifier = Modifier.heightIn(max = 280.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            items(quotaMap.entries.toList(), key = { it.key }) { (pkg, pct) ->
+                            items(quotaMap.entries.toList(), key = { it.key }) { (pkg, rawPct) ->
+                                val pct = rawPct.coerceIn(5, 100)
                                 val label = appNameMap[pkg] ?: pkg
                                 Column(
                                     modifier = Modifier
@@ -491,7 +545,10 @@ fun AppQuotaPercentsDialog(
         },
         confirmButton = {
             if (pickingApp) {
-                TextButton(onClick = { pickingApp = false }) { Text("رجوع") }
+                TextButton(onClick = {
+                    searchQuery = ""
+                    pickingApp = false
+                }) { Text("رجوع") }
             } else {
                 TextButton(onClick = { onConfirm(quotaMap) }) {
                     Text("حفظ (${quotaMap.size})")

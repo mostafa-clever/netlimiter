@@ -1,6 +1,7 @@
 package com.wifiguard.limiter.ui.screens
 
 import android.os.Build
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -27,6 +28,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -34,9 +36,11 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,17 +50,25 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wifiguard.limiter.data.PreferencesManager
 import com.wifiguard.limiter.model.AppRole
 import com.wifiguard.limiter.model.getInstalledLaunchableApps
+import com.wifiguard.limiter.model.normalizeArabicDigits
 import com.wifiguard.limiter.network.LocalLanClient
 import com.wifiguard.limiter.ui.theme.AlertRed
 import com.wifiguard.limiter.ui.theme.PrimaryTeal
 import com.wifiguard.limiter.ui.theme.SoftMint
 import com.wifiguard.limiter.ui.theme.TextMuted
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.flowOf
+import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun OnboardingScreen(
@@ -65,14 +77,40 @@ fun OnboardingScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var step by remember { mutableStateOf(0) }
-    var deviceName by remember { mutableStateOf(Build.MODEL) }
-    var pairingCode by remember { mutableStateOf("") }
-    var manualHost by remember { mutableStateOf("") }
+    var step by rememberSaveable { mutableIntStateOf(0) }
+    var deviceName by rememberSaveable { mutableStateOf(Build.MODEL) }
+    var pairingCode by rememberSaveable { mutableStateOf("") }
+    var manualHost by rememberSaveable { mutableStateOf("") }
     var isConnecting by remember { mutableStateOf(false) }
-    var errorMsg by remember { mutableStateOf<String?>(null) }
+    var pairingJob by remember { mutableStateOf<Job?>(null) }
+    var showManualTip by remember { mutableStateOf(false) }
+    var isSelectingSupervisor by remember { mutableStateOf(false) }
+    var errorMsg by rememberSaveable { mutableStateOf<String?>(null) }
 
-    val discovered by LocalLanClient.discoverSupervisors(context).collectAsState(initial = emptyList())
+    LaunchedEffect(step) {
+        showManualTip = false
+        if (step == 1) {
+            delay(6_000L)
+            showManualTip = true
+        }
+    }
+
+    BackHandler(enabled = step == 1) {
+        if (isConnecting) {
+            pairingJob?.cancel()
+            pairingJob = null
+            isConnecting = false
+        } else {
+            step = 0
+            errorMsg = null
+        }
+    }
+
+    // Memoize NSD discovery flow and only run when on the Client pairing step (prevents NSD listener leak)
+    val discoveryFlow = remember(context, step) {
+        if (step == 1) LocalLanClient.discoverSupervisors(context) else flowOf(emptyList())
+    }
+    val discovered by discoveryFlow.collectAsState(initial = emptyList())
 
     Column(
         modifier = Modifier
@@ -116,7 +154,10 @@ fun OnboardingScreen(
                 icon = Icons.Rounded.AdminPanelSettings,
                 title = "جهاز المشرف",
                 description = "لمتابعة الأجهزة المرتبطة، تحديد الحدود (يومي/أسبوعي/شهري)، وفرض توفير الباقة — ويمكنك أيضاً تحديد حد لجهازك الشخصي.",
+                enabled = !isSelectingSupervisor,
                 onClick = {
+                    if (isSelectingSupervisor) return@RoleOptionCard
+                    isSelectingSupervisor = true
                     scope.launch {
                         prefs.setRole(AppRole.SUPERVISOR)
                         onSetupComplete(AppRole.SUPERVISOR)
@@ -128,6 +169,7 @@ fun OnboardingScreen(
                 icon = Icons.Rounded.PhoneAndroid,
                 title = "جهاز عضو (مُدار)",
                 description = "يرتبط بجهاز المشرف على نفس شبكة الواي فاي لتطبيق الحد وتهدئة السرعة تدريجياً.",
+                enabled = !isSelectingSupervisor,
                 onClick = { step = 1 }
             )
         } else {
@@ -155,9 +197,13 @@ fun OnboardingScreen(
 
                     OutlinedTextField(
                         value = pairingCode,
-                        onValueChange = { if (it.length <= 6) pairingCode = it },
+                        onValueChange = { raw ->
+                            val normalized = normalizeArabicDigits(raw).filter { it in '0'..'9' }
+                            if (normalized.length <= 6) pairingCode = normalized
+                        },
                         label = { Text("رمز الربط (6 أرقام من جهاز المشرف)") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -171,15 +217,15 @@ fun OnboardingScreen(
                             color = PrimaryTeal
                         )
                         Spacer(modifier = Modifier.height(6.dp))
-                        discovered.forEach { sup ->
-                            val selected = manualHost.isBlank() || manualHost == sup.host
+                        discovered.forEachIndexed { idx, sup ->
+                            val selected = manualHost.trim() == sup.host || (manualHost.isBlank() && idx == 0)
                             Card(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(vertical = 4.dp)
                                     .clickable { manualHost = sup.host },
                                 colors = CardDefaults.cardColors(
-                                    containerColor = if (selected) SoftMint else Color(0xFFF3F6F7)
+                                    containerColor = if (selected) SoftMint else MaterialTheme.colorScheme.surfaceVariant
                                 )
                             ) {
                                 Text(
@@ -192,19 +238,28 @@ fun OnboardingScreen(
                         }
                         Spacer(modifier = Modifier.height(8.dp))
                     } else {
-                        Text(
-                            text = "جاري البحث عن جهاز المشرف على نفس الواي فاي...",
-                            fontSize = 12.sp,
-                            color = TextMuted
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = PrimaryTeal)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = if (showManualTip) {
+                                    "لم يظهر المشرف تلقائياً — أدخل عنوان IP الظاهر على شاشة المشرف بالأسفل"
+                                } else {
+                                    "جاري البحث عن جهاز المشرف على نفس الواي فاي..."
+                                },
+                                fontSize = 12.sp,
+                                color = TextMuted
+                            )
+                        }
                         Spacer(modifier = Modifier.height(8.dp))
                     }
 
                     OutlinedTextField(
                         value = manualHost,
-                        onValueChange = { manualHost = it },
+                        onValueChange = { manualHost = normalizeArabicDigits(it) },
                         label = { Text("عنوان المشرف (اختياري إذا لم يظهر تلقائياً)") },
                         placeholder = { Text("مثال: 192.168.1.10") },
+                        textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -218,32 +273,44 @@ fun OnboardingScreen(
 
                     Button(
                         onClick = {
-                            val targetHost = manualHost.trim().ifBlank { discovered.firstOrNull()?.host ?: "" }
-                            val targetPort = discovered.firstOrNull()?.port ?: LocalLanClient.DEFAULT_PORT
-                            if (targetHost.isBlank()) {
-                                errorMsg = "تأكد أن جهاز المشرف مفتوح على نفس شبكة الواي فاي أو أدخل عنوانه."
+                            val rawManual = manualHost.trim()
+                                .removePrefix("http://")
+                                .removePrefix("https://")
+                                .substringBefore("/")
+                                .trim()
+                            val cleanManual = when {
+                                rawManual.startsWith("[") -> rawManual.substringAfter("[").substringBefore("]")
+                                rawManual.count { it == ':' } == 1 -> rawManual.substringBefore(":")
+                                else -> rawManual
+                            }.trim()
+                            val targetHost = cleanManual.ifBlank { discovered.firstOrNull()?.host ?: "" }
+                            val targetPort = discovered.firstOrNull { it.host == targetHost }?.port
+                                ?: LocalLanClient.DEFAULT_PORT
+
+                            if (targetHost.isBlank() || targetHost.contains(" ")) {
+                                errorMsg = "تأكد أن جهاز المشرف مفتوح على نفس شبكة الواي فاي أو أدخل عنوان IP صحيحاً."
                                 return@Button
                             }
-                            if (pairingCode.length < 4) {
+                            if (pairingCode.length != 6) {
                                 errorMsg = "أدخل رمز الربط المكون من 6 أرقام."
                                 return@Button
                             }
                             isConnecting = true
                             errorMsg = null
-                            scope.launch {
+                            pairingJob = scope.launch {
                                 val devId = prefs.getOrCreateDeviceId()
                                 val cleanName = deviceName.trim().ifBlank { Build.MODEL }
+                                val apps = withContext(Dispatchers.IO) { getInstalledLaunchableApps(context) }
                                 val result = LocalLanClient.pairWithSupervisor(
                                     host = targetHost,
                                     port = targetPort,
-                                    pairingCode = pairingCode.trim(),
+                                    pairingCode = pairingCode,
                                     deviceId = devId,
                                     deviceName = cleanName,
-                                    installedApps = getInstalledLaunchableApps(context)
+                                    installedApps = apps
                                 )
                                 result.onSuccess { cfg ->
-                                    // MUST save connection & limits BEFORE setRole, because setRole triggers recomposition and cancels this scope!
-                                    prefs.setSupervisorConnection(targetHost, targetPort, pairingCode.trim())
+                                    prefs.setSupervisorConnection(targetHost, targetPort, pairingCode, cfg.authToken)
                                     prefs.updateLocalLimits(
                                         limitMb = cfg.dailyLimitMb,
                                         limitPeriod = cfg.limitPeriod,
@@ -252,7 +319,8 @@ fun OnboardingScreen(
                                         globalSpeedCapMbps = cfg.globalSpeedCapMbps,
                                         forceQuotaSaver = cfg.forceQuotaSaver,
                                         targetNetworkOnly = cfg.targetNetworkOnly,
-                                        targetNetworkSig = cfg.targetNetworkSig
+                                        targetNetworkSig = cfg.targetNetworkSig,
+                                        isPaused = cfg.isPaused
                                     )
                                     prefs.setRole(AppRole.CLIENT, cleanName)
                                     isConnecting = false
@@ -276,11 +344,20 @@ fun OnboardingScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedButton(
-                        onClick = { step = 0 },
+                        onClick = {
+                            if (isConnecting) {
+                                pairingJob?.cancel()
+                                pairingJob = null
+                                isConnecting = false
+                            } else {
+                                step = 0
+                                errorMsg = null
+                            }
+                        },
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(14.dp)
                     ) {
-                        Text("رجوع")
+                        Text(if (isConnecting) "إلغاء الاتصال" else "رجوع")
                     }
                 }
             }
@@ -293,12 +370,13 @@ private fun RoleOptionCard(
     icon: ImageVector,
     title: String,
     description: String,
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick),
+            .clickable(enabled = enabled, onClick = onClick),
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)

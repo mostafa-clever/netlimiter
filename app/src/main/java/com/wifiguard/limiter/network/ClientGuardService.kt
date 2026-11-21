@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
@@ -14,8 +15,10 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.wifiguard.limiter.MainActivity
 import com.wifiguard.limiter.admin.WifiGuardDeviceAdminReceiver
 import com.wifiguard.limiter.data.AppUsageStatsHelper
@@ -25,12 +28,18 @@ import com.wifiguard.limiter.model.ConnectionState
 import com.wifiguard.limiter.model.LimitPeriod
 import com.wifiguard.limiter.model.SpeedPolicyConfig
 import com.wifiguard.limiter.model.getInstalledLaunchableApps
+import com.wifiguard.limiter.model.optCleanString
+import com.wifiguard.limiter.model.sanitizeFinite
 import com.wifiguard.limiter.vpn.WifiGuardVpnService
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -38,37 +47,54 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.security.MessageDigest
 
 class ClientGuardService : Service() {
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val exceptionHandler = CoroutineExceptionHandler { _, _ -> }
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + exceptionHandler)
     private lateinit var prefs: PreferencesManager
-    private var controlSocket: ServerSocket? = null
+    @Volatile private var controlSocket: ServerSocket? = null
     private var wifiCallback: ConnectivityManager.NetworkCallback? = null
     private var screenOnReceiver: android.content.BroadcastReceiver? = null
     private var wasVpnRunning: Boolean = false
-    private var sentAppsOnce: Boolean = false
+    private var lastAppsSentMs: Long = 0L
 
     companion object {
         const val CHANNEL_ID = "wifiguard_client_guard_channel"
         const val NOTIF_ID = 2002
+        private const val MAX_HEADER_LINE_BYTES = 8192
+        private const val MAX_HEADERS = 64
+        private const val MAX_BODY_BYTES = 512 * 1024
+
         @Volatile var isSupervisorReachable: Boolean = false
+
+        private val _isSupervisorReachableFlow = MutableStateFlow(false)
+        val isSupervisorReachableFlow: StateFlow<Boolean> = _isSupervisorReachableFlow
+
+        private val _isUnpairedFlow = MutableStateFlow(false)
+        val isUnpairedFlow: StateFlow<Boolean> = _isUnpairedFlow
+
+        private val _lastSyncMillisFlow = MutableStateFlow(0L)
+        val lastSyncMillisFlow: StateFlow<Long> = _lastSyncMillisFlow
 
         fun start(context: Context) {
             runCatching {
-                val intent = Intent(context, ClientGuardService::class.java)
+                val appContext = context.applicationContext
+                val intent = Intent(appContext, ClientGuardService::class.java)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
+                    appContext.startForegroundService(intent)
                 } else {
-                    context.startService(intent)
+                    appContext.startService(intent)
                 }
             }
         }
 
         fun stop(context: Context) {
-            runCatching { context.stopService(Intent(context, ClientGuardService::class.java)) }
+            runCatching { context.applicationContext.stopService(Intent(context.applicationContext, ClientGuardService::class.java)) }
         }
     }
 
@@ -93,7 +119,12 @@ class ClientGuardService : Service() {
                 }
             }
             screenOnReceiver = rx
-            registerReceiver(rx, android.content.IntentFilter(Intent.ACTION_SCREEN_ON))
+            ContextCompat.registerReceiver(
+                this,
+                rx,
+                IntentFilter(Intent.ACTION_SCREEN_ON),
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
         }
         startPersistentHeartbeatAndVpnWatchdog()
     }
@@ -104,54 +135,103 @@ class ClientGuardService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        isSupervisorReachable = false
+        _isSupervisorReachableFlow.value = false
         runCatching {
             wifiCallback?.let {
-                (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(it)
+                (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)?.unregisterNetworkCallback(it)
             }
         }
+        wifiCallback = null
         runCatching { screenOnReceiver?.let { unregisterReceiver(it) } }
+        screenOnReceiver = null
         runCatching { controlSocket?.close() }
+        controlSocket = null
         serviceScope.cancel()
     }
 
     private fun startControlServer() {
         serviceScope.launch {
-            runCatching {
-                controlSocket = ServerSocket(LocalLanClient.CLIENT_PORT)
-                while (isActive) {
-                    val sock = controlSocket?.accept() ?: break
-                    launch { handleSupervisorCommand(sock) }
+            while (isActive) {
+                try {
+                    val server = ServerSocket().apply {
+                        reuseAddress = true
+                        bind(InetSocketAddress(LocalLanClient.CLIENT_PORT))
+                    }
+                    controlSocket = server
+                    try {
+                        while (isActive && !server.isClosed) {
+                            val sock = runCatching { server.accept() }.getOrNull() ?: break
+                            launch { handleSupervisorCommand(sock) }
+                        }
+                    } finally {
+                        runCatching { server.close() }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Throwable) {
+                    delay(5_000L)
                 }
             }
         }
     }
 
+    private fun isTokenAuthorized(expectedToken: String, authHeader: String?): Boolean {
+        if (expectedToken.isBlank()) return true
+        if (authHeader.isNullOrBlank()) return false
+        val provided = authHeader.removePrefix("Bearer ").trim()
+        return MessageDigest.isEqual(
+            expectedToken.toByteArray(Charsets.UTF_8),
+            provided.toByteArray(Charsets.UTF_8)
+        )
+    }
+
     private suspend fun handleSupervisorCommand(sock: Socket) {
         sock.use { s ->
             runCatching {
-                s.soTimeout = 4000
+                s.soTimeout = 5000
                 val rawIn = s.getInputStream()
                 fun readLine(): String? {
                     val lb = ByteArrayOutputStream()
-                    while (true) {
+                    while (lb.size() < MAX_HEADER_LINE_BYTES) {
                         val b = rawIn.read()
                         if (b == -1) return if (lb.size() == 0) null else lb.toString("UTF-8")
-                        if (b == '\n'.code) break
+                        if (b == '\n'.code) return lb.toString("UTF-8")
                         if (b != '\r'.code) lb.write(b)
                     }
-                    return lb.toString("UTF-8")
+                    return null
                 }
 
                 val reqLine = readLine() ?: return
                 val parts = reqLine.split(" ")
                 val path = parts.getOrNull(1) ?: "/"
                 var contentLen = 0
-                while (true) {
+                var authHeader: String? = null
+                var headerCount = 0
+                while (headerCount < MAX_HEADERS) {
                     val h = readLine() ?: break
                     if (h.isEmpty()) break
-                    if (h.lowercase().startsWith("content-length:")) {
-                        contentLen = h.substringAfter(":").trim().toIntOrNull() ?: 0
+                    headerCount++
+                    val lower = h.lowercase()
+                    when {
+                        lower.startsWith("content-length:") -> {
+                            contentLen = h.substringAfter(":").trim().toIntOrNull() ?: -1
+                        }
+                        lower.startsWith("authorization:") -> {
+                            authHeader = h.substringAfter(":").trim()
+                        }
                     }
+                }
+
+                if (contentLen < 0 || contentLen > MAX_BODY_BYTES) {
+                    sendHttpJson(s, 413, "Payload Too Large", JSONObject().put("ok", false).put("error", "Payload too large"))
+                    return
+                }
+
+                val expectedToken = prefs.getClientAuthToken()
+                if (!isTokenAuthorized(expectedToken, authHeader)) {
+                    sendHttpJson(s, 401, "Unauthorized", JSONObject().put("ok", false).put("error", "غير مصرح"))
+                    return
                 }
 
                 val respJson = if (path == "/config" && contentLen > 0) {
@@ -166,21 +246,23 @@ class ClientGuardService : Service() {
                     val arr = obj.optJSONArray("whitelistedPackages") ?: JSONArray()
                     val pkgs = mutableSetOf<String>()
                     for (i in 0 until arr.length()) {
-                        val p = arr.optString(i)
-                        if (p.isNotBlank()) pkgs.add(p)
+                        if (!arr.isNull(i)) {
+                            val p = arr.optString(i, "").trim()
+                            if (p.isNotBlank() && p != "null") pkgs.add(p)
+                        }
                     }
                     val period = runCatching {
-                        LimitPeriod.valueOf(obj.optString("limitPeriod", "DAILY"))
+                        LimitPeriod.valueOf(obj.optCleanString("limitPeriod", "DAILY"))
                     }.getOrDefault(LimitPeriod.DAILY)
                     prefs.updateLocalLimits(
-                        limitMb = obj.optLong("dailyLimitMb", 1024L),
+                        limitMb = obj.optLong("dailyLimitMb", 1024L).coerceAtLeast(10L),
                         limitPeriod = period,
                         speedPolicy = SpeedPolicyConfig.fromJson(obj.optJSONObject("speedPolicy")),
                         whitelist = pkgs,
-                        globalSpeedCapMbps = obj.optDouble("globalSpeedCapMbps", 0.0),
+                        globalSpeedCapMbps = obj.optDouble("globalSpeedCapMbps", 0.0).sanitizeFinite(0.0, 0.0, 1000.0),
                         forceQuotaSaver = obj.optBoolean("forceQuotaSaver", false),
                         targetNetworkOnly = obj.optBoolean("targetNetworkOnly", false),
-                        targetNetworkSig = obj.optString("targetNetworkSig", ""),
+                        targetNetworkSig = obj.optCleanString("targetNetworkSig", ""),
                         isPaused = obj.optBoolean("isPaused", false)
                     )
                     WifiGuardVpnService.notifyConfigChanged()
@@ -190,8 +272,9 @@ class ClientGuardService : Service() {
                     JSONObject().apply {
                         put("ok", true)
                         put("usedMb", prefs.getUsedMbActivePeriod())
+                        put("usedMbToday", prefs.getUsedMbToday())
                         put("savedMbToday", prefs.getSavedMbToday())
-                        put("actualSpeedMbps", WifiGuardVpnService.liveSpeedMbps.value)
+                        put("actualSpeedMbps", WifiGuardVpnService.liveSpeedMbps.value.sanitizeFinite(0.0, 0.0, 10_000.0))
                         val curPeriod = prefs.limitPeriodFlow.first()
                         val appMap = if (path.contains("full=1")) {
                             val allPkgs = getInstalledLaunchableApps(applicationContext).map { it.packageName }
@@ -210,20 +293,27 @@ class ClientGuardService : Service() {
                     }
                 }
 
-                val respBytes = respJson.toString().toByteArray(Charsets.UTF_8)
-                val hdr = ("HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: ${respBytes.size}\r\nConnection: close\r\n\r\n").toByteArray(Charsets.US_ASCII)
-                s.getOutputStream().apply {
-                    write(hdr)
-                    write(respBytes)
-                    flush()
-                }
+                sendHttpJson(s, 200, "OK", respJson)
             }
+        }
+    }
+
+    private fun sendHttpJson(socket: Socket, code: Int, reason: String, json: JSONObject) {
+        val respBytes = json.toString().toByteArray(Charsets.UTF_8)
+        val hdr = ("HTTP/1.1 $code $reason\r\n" +
+            "Content-Type: application/json; charset=UTF-8\r\n" +
+            "Content-Length: ${respBytes.size}\r\n" +
+            "Connection: close\r\n\r\n").toByteArray(Charsets.US_ASCII)
+        socket.getOutputStream().apply {
+            write(hdr)
+            write(respBytes)
+            flush()
         }
     }
 
     private fun registerWifiReconnectCallback() {
         runCatching {
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
             val req = NetworkRequest.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                 .build()
@@ -236,6 +326,11 @@ class ClientGuardService : Service() {
                         }
                     }
                 }
+
+                override fun onLost(network: Network) {
+                    isSupervisorReachable = false
+                    _isSupervisorReachableFlow.value = false
+                }
             }
             wifiCallback = cb
             cm.registerNetworkCallback(req, cb)
@@ -243,33 +338,37 @@ class ClientGuardService : Service() {
     }
 
     private fun startPersistentHeartbeatAndVpnWatchdog() {
-        // Zero-CPU reactive collector (no 3s polling!): fires immediately the millisecond VPN stops
         serviceScope.launch {
             WifiGuardVpnService.isRunning.collect { vpnNow ->
                 runCatching {
                     val role = prefs.roleFlow.first()
                     if (role == AppRole.CLIENT && wasVpnRunning && !vpnNow) {
                         val host = prefs.getSupervisorHost()
-                        val port = prefs.getSupervisorPort()
-                        val id = prefs.getOrCreateDeviceId()
-                        val name = prefs.getDeviceName()
-                        LocalLanClient.sendTamperAlert(
-                            host,
-                            port,
-                            id,
-                            name,
-                            "تحايل: قام جهاز $name بإيقاف الحماية (VPN) دون حذف التطبيق!"
-                        )
-                        syncWithSupervisorOnce()
+                        if (host.isNotBlank()) {
+                            val port = prefs.getSupervisorPort()
+                            val id = prefs.getOrCreateDeviceId()
+                            val name = prefs.getDeviceName()
+                            val token = prefs.getClientAuthToken()
+                            LocalLanClient.sendTamperAlert(
+                                host,
+                                port,
+                                id,
+                                name,
+                                "تحايل: قام جهاز $name بإيقاف الحماية (VPN) دون حذف التطبيق!",
+                                authToken = token
+                            )
+                            syncWithSupervisorOnce()
+                        }
                     }
                     wasVpnRunning = vpnNow
                 }
             }
         }
 
-        // Battery-saving adaptive heartbeat: 60s when screen ON, 180s when screen OFF
         serviceScope.launch {
-            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            // Brief startup grace so WifiGuardVpnService finishes establishing tunnel before first heartbeat
+            delay(5_000L)
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
             var failures = 0
             while (isActive) {
                 runCatching {
@@ -278,73 +377,107 @@ class ClientGuardService : Service() {
                         val ok = syncWithSupervisorOnce()
                         if (ok) {
                             failures = 0
-                        } else {
+                        } else if (!_isUnpairedFlow.value) {
                             failures++
                             if (failures >= 2) {
                                 failures = 0
-                                val found = withTimeoutOrNull(3500L) {
+                                val candidates = withTimeoutOrNull(8_000L) {
                                     LocalLanClient.discoverSupervisors(applicationContext).first { it.isNotEmpty() }
-                                }?.firstOrNull()
-                                if (found != null) {
-                                    prefs.setSupervisorConnection(found.host, found.port, "")
-                                    syncWithSupervisorOnce()
+                                } ?: emptyList()
+                                for (cand in candidates) {
+                                    if (syncWithSupervisorOnce(overrideHost = cand.host, overridePort = cand.port)) {
+                                        prefs.setSupervisorConnection(cand.host, cand.port, pairingCode = null)
+                                        break
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                delay(if (pm.isInteractive) 60_000L else 180_000L)
+                val interactive = pm?.isInteractive ?: true
+                delay(if (interactive) 60_000L else 180_000L)
             }
         }
     }
 
-    private suspend fun syncWithSupervisorOnce(): Boolean {
-        val host = prefs.getSupervisorHost()
-        val port = prefs.getSupervisorPort()
+    private suspend fun syncWithSupervisorOnce(
+        overrideHost: String? = null,
+        overridePort: Int? = null
+    ): Boolean {
+        val host = overrideHost ?: prefs.getSupervisorHost()
+        val port = overridePort ?: prefs.getSupervisorPort()
         if (host.isBlank()) return false
         val id = prefs.getOrCreateDeviceId()
         val name = prefs.getDeviceName()
+        val token = prefs.getClientAuthToken()
         val usedMb = prefs.getUsedMbActivePeriod()
+        val usedMbToday = prefs.getUsedMbToday()
         val savedMb = prefs.getSavedMbToday()
         val vpnUp = WifiGuardVpnService.isRunning.value
         val adminActive = WifiGuardDeviceAdminReceiver.isActive(applicationContext)
-        val updated = LocalLanClient.sendHeartbeat(
+        val nowMs = System.currentTimeMillis()
+        val shouldSendApps = lastAppsSentMs == 0L || (nowMs - lastAppsSentMs >= 30 * 60_000L)
+        when (val outcome = LocalLanClient.sendHeartbeatOutcome(
             host = host,
             port = port,
             deviceId = id,
             deviceName = name,
             usedMb = usedMb,
+            usedMbToday = usedMbToday,
             savedMbToday = savedMb,
             actualSpeedMbps = WifiGuardVpnService.liveSpeedMbps.value,
             appUsageMb = prefs.getAppUsedMbMap(prefs.limitPeriodFlow.first()),
             protectionActive = vpnUp,
             uninstallProtectionActive = adminActive,
             connectionState = if (vpnUp) WifiGuardVpnService.connectionState.value else ConnectionState.PROTECTION_OFF,
-            installedApps = if (!sentAppsOnce) getInstalledLaunchableApps(applicationContext) else emptyList()
-        )
-        if (updated != null) {
-            isSupervisorReachable = true
-            sentAppsOnce = true
-            prefs.updateLocalLimits(
-                limitMb = updated.dailyLimitMb,
-                limitPeriod = updated.limitPeriod,
-                speedPolicy = updated.speedPolicy,
-                whitelist = updated.whitelistedPackages,
-                globalSpeedCapMbps = updated.globalSpeedCapMbps,
-                forceQuotaSaver = updated.forceQuotaSaver,
-                targetNetworkOnly = updated.targetNetworkOnly,
-                targetNetworkSig = updated.targetNetworkSig,
-                isPaused = updated.isPaused
-            )
-            return true
+            installedApps = if (shouldSendApps) getInstalledLaunchableApps(applicationContext) else emptyList(),
+            authToken = token
+        )) {
+            is HeartbeatOutcome.Synced -> {
+                val updated = outcome.config
+                isSupervisorReachable = true
+                _isSupervisorReachableFlow.value = true
+                _isUnpairedFlow.value = false
+                _lastSyncMillisFlow.value = nowMs
+                if (shouldSendApps) lastAppsSentMs = nowMs
+                if (updated.authToken.isNotBlank() && token.isBlank()) {
+                    prefs.setClientAuthToken(updated.authToken)
+                }
+                prefs.updateLocalLimits(
+                    limitMb = updated.dailyLimitMb,
+                    limitPeriod = updated.limitPeriod,
+                    speedPolicy = updated.speedPolicy,
+                    whitelist = updated.whitelistedPackages,
+                    globalSpeedCapMbps = updated.globalSpeedCapMbps,
+                    forceQuotaSaver = updated.forceQuotaSaver,
+                    targetNetworkOnly = updated.targetNetworkOnly,
+                    targetNetworkSig = updated.targetNetworkSig,
+                    isPaused = updated.isPaused
+                )
+                WifiGuardVpnService.notifyConfigChanged()
+                return true
+            }
+            HeartbeatOutcome.Unpaired -> {
+                if (overrideHost == null) {
+                    isSupervisorReachable = false
+                    _isSupervisorReachableFlow.value = false
+                    _isUnpairedFlow.value = true
+                }
+                return false
+            }
+            HeartbeatOutcome.NetworkError -> {
+                if (overrideHost == null) {
+                    isSupervisorReachable = false
+                    _isSupervisorReachableFlow.value = false
+                }
+                return false
+            }
         }
-        isSupervisorReachable = false
-        return false
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = getSystemService(NotificationManager::class.java)
+            val nm = getSystemService(NotificationManager::class.java) ?: return
             nm.createNotificationChannel(
                 NotificationChannel(CHANNEL_ID, "مراقبة الاتصال بالمشرف", NotificationManager.IMPORTANCE_MIN)
             )
@@ -354,7 +487,7 @@ class ClientGuardService : Service() {
     private fun buildNotification(): Notification {
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("حارس الواي فاي")
+            .setContentTitle("No Quota")
             .setContentText("متصل بجهاز المشرف")
             .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
             .setContentIntent(pi)
