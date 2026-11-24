@@ -3,6 +3,7 @@ package com.wifiguard.limiter.data
 import android.app.AppOpsManager
 import android.app.usage.NetworkStats
 import android.app.usage.NetworkStatsManager
+import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.net.ConnectivityManager
 import android.os.Build
@@ -36,7 +37,6 @@ object AppUsageStatsHelper {
         when (period) {
             LimitPeriod.DAILY -> {}
             LimitPeriod.WEEKLY -> {
-                // Always move backward to the start of the current locale week (avoids forward jump on Saturday-start locales)
                 val diff = (cal.get(Calendar.DAY_OF_WEEK) - cal.firstDayOfWeek + 7) % 7
                 cal.add(Calendar.DAY_OF_YEAR, -diff)
             }
@@ -47,7 +47,7 @@ object AppUsageStatsHelper {
 
     /**
      * Queries exact Wi-Fi usage in MB for each requested package using a single
-     * NetworkStatsManager.querySummary() Binder IPC (avoiding N+1 IPCs and shared-UID double counting).
+     * NetworkStatsManager.querySummary() Binder IPC.
      */
     fun getWifiUsageMbByPackage(
         context: Context,
@@ -63,7 +63,6 @@ object AppUsageStatsHelper {
         val endMs = System.currentTimeMillis()
         if (endMs <= startMs) return emptyMap()
 
-        // Map each unique UID to its primary requested package (prevents double-counting sharedUserId packages)
         val uidToPkg = LinkedHashMap<Int, String>()
         for (pkg in packages) {
             runCatching {
@@ -104,5 +103,63 @@ object AppUsageStatsHelper {
             if (mb > 0L) result[pkg] = mb
         }
         return result
+    }
+
+    /**
+     * Returns total device Wi-Fi bytes in [startMs, endMs] from Android's kernel NetworkStatsManager.
+     */
+    fun getTotalWifiBytesInRange(context: Context, startMs: Long, endMs: Long): Long {
+        if (endMs <= startMs || !hasUsageStatsPermission(context)) return -1L
+        val nsm = context.applicationContext.getSystemService(Context.NETWORK_STATS_SERVICE) as? NetworkStatsManager
+            ?: return -1L
+        return runCatching {
+            @Suppress("DEPRECATION")
+            val bucket = nsm.querySummaryForDevice(ConnectivityManager.TYPE_WIFI, null, startMs, endMs)
+            (bucket.rxBytes + bucket.txBytes).coerceAtLeast(0L)
+        }.getOrDefault(-1L)
+    }
+
+    /**
+     * Returns total foreground app screen-on time in hours within [startMs, endMs] using UsageStatsManager.
+     */
+    fun getActiveForegroundHoursInRange(context: Context, startMs: Long, endMs: Long): Double {
+        if (endMs <= startMs || !hasUsageStatsPermission(context)) return 0.0
+        val usm = context.applicationContext.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+            ?: return 0.0
+        return runCatching {
+            val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startMs, endMs) ?: return 0.0
+            var totalMs = 0L
+            for (s in stats) {
+                val fg = s.totalTimeInForeground
+                if (fg > 0L) totalMs += fg
+            }
+            (totalMs.toDouble() / 3_600_000.0).coerceAtLeast(0.0)
+        }.getOrDefault(0.0)
+    }
+
+    /**
+     * Computes a real kernel-backed historical baseline (MB per active foreground hour)
+     * over the 7-day window immediately preceding [beforeMillis] (e.g., before Saver was enabled).
+     * Returns -1.0 if insufficient history (< 1.0 active hour or permission missing).
+     */
+    fun computeBaselineMbPerActiveHour(context: Context, beforeMillis: Long, lookbackDays: Int = 7): Double {
+        if (!hasUsageStatsPermission(context)) return -1.0
+        val endMs = beforeMillis
+        val startMs = endMs - (lookbackDays.coerceIn(1, 30) * 24L * 3_600_000L)
+        val totalBytes = getTotalWifiBytesInRange(context, startMs, endMs)
+        if (totalBytes <= 0L) return -1.0
+        val activeHours = getActiveForegroundHoursInRange(context, startMs, endMs)
+        if (activeHours < 1.0) return -1.0
+        val totalMb = totalBytes.toDouble() / (1024.0 * 1024.0)
+        return (totalMb / activeHours).coerceIn(10.0, 2048.0)
+    }
+
+    /**
+     * Returns today's active foreground hours since local midnight.
+     */
+    fun getTodayActiveForegroundHours(context: Context): Double {
+        val startMs = periodStartMillis(LimitPeriod.DAILY)
+        val endMs = System.currentTimeMillis()
+        return getActiveForegroundHoursInRange(context, startMs, endMs)
     }
 }

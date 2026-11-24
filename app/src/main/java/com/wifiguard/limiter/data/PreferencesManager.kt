@@ -77,6 +77,7 @@ class PreferencesManager(context: Context) {
         // Period usage tracking
         val USED_BYTES_DAY = longPreferencesKey("used_bytes_today")
         val SAVED_BYTES_DAY = longPreferencesKey("saved_bytes_today")
+        val BASELINE_MB_PER_ACTIVE_HOUR = doublePreferencesKey("baseline_mb_per_active_hour")
         val DAILY_USAGE_HISTORY_JSON = stringPreferencesKey("daily_usage_history_json")
         val DAILY_SAVED_HISTORY_JSON = stringPreferencesKey("daily_saved_history_json")
         val APP_USAGE_BYTES_JSON = stringPreferencesKey("app_usage_bytes_json")
@@ -501,6 +502,28 @@ class PreferencesManager(context: Context) {
             hist[d] = newDayBytes / (1024L * 1024L)
             pruneHistoryMap(hist)
             prefs[Keys.DAILY_USAGE_HISTORY_JSON] = JSONObject(hist as Map<*, *>).toString()
+        }
+    }
+
+    suspend fun getBaselineMbPerActiveHour(): Double =
+        (appContext.dataStore.data.first()[Keys.BASELINE_MB_PER_ACTIVE_HOUR] ?: -1.0)
+
+    suspend fun setBaselineMbPerActiveHour(mbPerHour: Double) {
+        if (!mbPerHour.isFinite() || mbPerHour <= 0.0) return
+        appContext.dataStore.edit { it[Keys.BASELINE_MB_PER_ACTIVE_HOUR] = mbPerHour.coerceIn(10.0, 2048.0) }
+    }
+
+    suspend fun setSavedBytesToday(totalSavedBytes: Long) {
+        val safe = totalSavedBytes.coerceAtLeast(0L)
+        appContext.dataStore.edit { prefs ->
+            val today = localDateNow()
+            val d = dayStr(today)
+            ensureDayRolledOver(prefs, d)
+            prefs[Keys.SAVED_BYTES_DAY] = safe
+            val hist = parseLongMap(prefs[Keys.DAILY_SAVED_HISTORY_JSON] ?: "{}").toMutableMap()
+            hist[d] = safe / (1024L * 1024L)
+            pruneHistoryMap(hist)
+            prefs[Keys.DAILY_SAVED_HISTORY_JSON] = JSONObject(hist as Map<*, *>).toString()
         }
     }
 

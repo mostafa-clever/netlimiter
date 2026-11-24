@@ -40,6 +40,7 @@ import com.wifiguard.limiter.model.getInstalledLaunchableApps
 import com.wifiguard.limiter.network.ClientGuardService
 import com.wifiguard.limiter.network.LocalLanClient
 import com.wifiguard.limiter.network.NetworkScanner
+import com.wifiguard.limiter.receiver.DevicePowerState
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -79,6 +80,9 @@ class WifiGuardVpnService : VpnService() {
     private var packetLoopJob: Job? = null
     private var screenReceiver: BroadcastReceiver? = null
     private val forceRebuild = AtomicBoolean(false)
+    private val isStoppingIntentional = AtomicBoolean(false)
+    private var cachedBaselineMbPerHour: Double = -1.0
+    private var lastBaselineEvalMs: Long = 0L
 
     // Exact screen-off timestamp so unlocking wakes internet in < 100ms with zero VPN rebuild
     private val screenOffStartElapsedMs = AtomicLong(0L)
@@ -256,17 +260,22 @@ class WifiGuardVpnService : VpnService() {
                     when (intent?.action) {
                         Intent.ACTION_SCREEN_ON -> {
                             screenOffStartElapsedMs.set(0L)
-                            // Immediately unfreeze background flag without waiting for coroutine wake
                             tunForwarder?.let { fwd ->
                                 if (fwd.flags.screenOffFreezeActive) {
                                     fwd.flags = fwd.flags.copy(screenOffFreezeActive = false)
                                 }
+                            }
+                            if (tunInterface == null || packetLoopJob?.isActive != true) {
+                                forceRebuild.set(true)
                             }
                             wakeSignal.trySend(Unit)
                         }
                         Intent.ACTION_SCREEN_OFF -> {
                             screenOffStartElapsedMs.compareAndSet(0L, SystemClock.elapsedRealtime())
                             wakeSignal.trySend(Unit)
+                        }
+                        Intent.ACTION_SHUTDOWN -> {
+                            DevicePowerState.isShuttingDown.set(true)
                         }
                     }
                 }
@@ -275,6 +284,7 @@ class WifiGuardVpnService : VpnService() {
             val filter = IntentFilter().apply {
                 addAction(Intent.ACTION_SCREEN_ON)
                 addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SHUTDOWN)
             }
             ContextCompat.registerReceiver(this, rx, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         }
@@ -282,15 +292,18 @@ class WifiGuardVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            isStoppingIntentional.set(true)
             _isRunning.value = false
             stopSelf()
             return START_NOT_STICKY
         }
+        isStoppingIntentional.set(false)
+        DevicePowerState.isShuttingDown.set(false)
         startForegroundSafe(
             lastNotifTitle.ifBlank { "التوفير الذكي نشط" },
             lastNotifText.ifBlank { "جاري تشغيل حماية الاتصال..." }
         )
-        if (intent?.action == ACTION_RESTART) {
+        if (intent?.action == ACTION_RESTART || tunInterface == null || packetLoopJob?.isActive != true) {
             forceRebuild.set(true)
             configDirty.set(true)
             wifiStateDirty.set(true)
@@ -301,9 +314,19 @@ class WifiGuardVpnService : VpnService() {
 
     override fun onRevoke() {
         super.onRevoke()
+        isStoppingIntentional.set(true)
         _isRunning.value = false
         _connectionState.value = ConnectionState.PROTECTION_OFF
         _statusLabel.value = "الحماية متوقفة حالياً"
+        if (DevicePowerState.isShuttingDown.get()) {
+            stopSelf()
+            return
+        }
+        val trulyRevoked = runCatching { VpnService.prepare(applicationContext) != null }.getOrDefault(false)
+        if (!trulyRevoked) {
+            stopSelf()
+            return
+        }
         serviceScope.launch {
             try {
                 withTimeoutOrNull(3_000L) {
@@ -336,6 +359,7 @@ class WifiGuardVpnService : VpnService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        isStoppingIntentional.set(true)
         _isRunning.value = false
         runCatching { screenReceiver?.let { unregisterReceiver(it) } }
         screenReceiver = null
@@ -603,14 +627,38 @@ class WifiGuardVpnService : VpnService() {
                         val deltaMediaBytes = (curMediaBytes - lastMediaThrottledBytes).coerceAtLeast(0L)
                         lastMediaThrottledBytes = curMediaBytes
 
-                        var savedDelta = (deltaAds * 45L * 1024L) +
-                            (deltaUpdates * 2L * 1024L * 1024L) +
-                            (deltaBgBlocks * 180L * 1024L)
-                        if (deltaMediaBytes > 0L && cfg.speedPolicy.mediaCdnSpeedMbps <= 1.2) {
-                            // 480p/360p (~0.75 Mbps) uses ~45-55% fewer bytes than 1080p (~3-5 Mbps)
-                            savedDelta += deltaMediaBytes
+                        // Primary Ground Truth: kernel NetworkStatsManager + UsageStatsManager MB/active-foreground-hour baseline
+                        val evalNowMs = System.currentTimeMillis()
+                        if (cachedBaselineMbPerHour <= 0.0) {
+                            cachedBaselineMbPerHour = prefs.getBaselineMbPerActiveHour()
+                            if (cachedBaselineMbPerHour <= 0.0 && AppUsageStatsHelper.hasUsageStatsPermission(applicationContext)) {
+                                val computed = AppUsageStatsHelper.computeBaselineMbPerActiveHour(applicationContext, evalNowMs, lookbackDays = 7)
+                                if (computed > 0.0) {
+                                    cachedBaselineMbPerHour = computed
+                                    prefs.setBaselineMbPerActiveHour(computed)
+                                }
+                            }
                         }
-                        if (savedDelta > 0L) pendingSavedBytes.addAndGet(savedDelta)
+                        if (cachedBaselineMbPerHour > 0.0 && isInteractive && (evalNowMs - lastBaselineEvalMs >= 300_000L || lastBaselineEvalMs == 0L)) {
+                            lastBaselineEvalMs = evalNowMs
+                            val activeHrs = AppUsageStatsHelper.getTodayActiveForegroundHours(applicationContext)
+                            if (activeHrs >= 0.15) {
+                                val expectedMb = (cachedBaselineMbPerHour * activeHrs).toLong()
+                                val actualUsedTodayMb = prefs.getUsedMbToday() + pendingMb
+                                val realSavedMb = (expectedMb - actualUsedTodayMb).coerceAtLeast(0L)
+                                prefs.setSavedBytesToday(realSavedMb * 1024L * 1024L)
+                            }
+                        } else if (cachedBaselineMbPerHour <= 0.0) {
+                            // Fallback when PACKAGE_USAGE_STATS is not granted: backpressure-gated media bytes + conservative blocks
+                            var savedDelta = (deltaAds * 45L * 1024L) +
+                                (deltaUpdates * 2L * 1024L * 1024L) +
+                                (deltaBgBlocks * 180L * 1024L)
+                            if (deltaMediaBytes > 0L && cfg.speedPolicy.mediaCdnSpeedMbps <= 1.2) {
+                                val ratio = ((2.5 - cfg.speedPolicy.mediaCdnSpeedMbps) / cfg.speedPolicy.mediaCdnSpeedMbps.coerceAtLeast(0.3)).coerceIn(0.25, 2.0)
+                                savedDelta += (deltaMediaBytes * ratio).toLong()
+                            }
+                            if (savedDelta > 0L) pendingSavedBytes.addAndGet(savedDelta)
+                        }
 
                         // Coalesced DataStore flush: every 5 MB or 120 seconds (8x fewer flash fsyncs!)
                         val nowMs = System.currentTimeMillis()
@@ -721,7 +769,8 @@ class WifiGuardVpnService : VpnService() {
                             useLocalDnsNow != currentUseLocalDns ||
                             meteredNow != currentMeteredMode ||
                             cfg.whitelist != currentWhitelist ||
-                            tunInterface == null
+                            tunInterface == null ||
+                            packetLoopJob?.isActive != true
                         ) {
                             establishTunnel(
                                 blockAll = hardBlockedNow,
@@ -818,12 +867,24 @@ class WifiGuardVpnService : VpnService() {
             if (!lockdownOn) { whitelist.forEach { pkg -> runCatching { builder.addDisallowedApplication(pkg) } } }
         }
 
-        val pfd = runCatching { builder.establish() }.getOrNull()
+        var pfd: ParcelFileDescriptor? = null
+        for (attempt in 0 until 3) {
+            pfd = runCatching { builder.establish() }.getOrNull()
+            if (pfd != null) break
+            if (VpnService.prepare(applicationContext) != null) break
+            runCatching { Thread.sleep(600L * (attempt + 1)) }
+        }
         tunInterface = pfd
         if (pfd == null) {
-            _isRunning.value = false
-            _connectionState.value = ConnectionState.PROTECTION_OFF
-            _statusLabel.value = "الحماية متوقفة — يرجى إعادة التفعيل"
+            val revoked = runCatching { VpnService.prepare(applicationContext) != null }.getOrDefault(false)
+            if (revoked) {
+                _isRunning.value = false
+                _connectionState.value = ConnectionState.PROTECTION_OFF
+                _statusLabel.value = "الحماية متوقفة — يرجى إعادة التفعيل"
+            } else {
+                // Transient Android VPN hiccup: keep trying automatically instead of cutting protection permanently
+                forceRebuild.set(true)
+            }
             return
         }
         // Let Android propagate underlying network connectivity cleanly
@@ -834,7 +895,14 @@ class WifiGuardVpnService : VpnService() {
         val output = FileOutputStream(pfd.fileDescriptor)
 
         if (fullTunnel) {
-            val fwd = runCatching { Tun2NetForwarder(this, dnsHandler, tokenBucket, output) }.getOrNull()
+            val fwd = runCatching {
+                Tun2NetForwarder(this, dnsHandler, tokenBucket, output) {
+                    if (!isStoppingIntentional.get() && !DevicePowerState.isShuttingDown.get()) {
+                        forceRebuild.set(true)
+                        wakeSignal.trySend(Unit)
+                    }
+                }
+            }.getOrNull()
             tunForwarder = fwd
             if (fwd != null) {
                 val policy = cachedPolicy
@@ -865,6 +933,11 @@ class WifiGuardVpnService : VpnService() {
                     } finally {
                         runCatching { input.close() }
                         runCatching { output.close() }
+                        // Auto-heal if the TUN descriptor closed unexpectedly after hours of uptime
+                        if (isActive && !isStoppingIntentional.get() && !DevicePowerState.isShuttingDown.get() && tunInterface == pfd) {
+                            forceRebuild.set(true)
+                            wakeSignal.trySend(Unit)
+                        }
                     }
                 }
             } else {

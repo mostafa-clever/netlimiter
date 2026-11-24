@@ -30,6 +30,8 @@ import com.wifiguard.limiter.model.SpeedPolicyConfig
 import com.wifiguard.limiter.model.getInstalledLaunchableApps
 import com.wifiguard.limiter.model.optCleanString
 import com.wifiguard.limiter.model.sanitizeFinite
+import android.net.VpnService
+import com.wifiguard.limiter.receiver.DevicePowerState
 import com.wifiguard.limiter.vpn.WifiGuardVpnService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -119,6 +121,10 @@ class ClientGuardService : Service() {
         runCatching {
             val rx = object : android.content.BroadcastReceiver() {
                 override fun onReceive(context: Context?, intent: Intent?) {
+                    if (intent?.action == Intent.ACTION_SHUTDOWN) {
+                        DevicePowerState.isShuttingDown.set(true)
+                        return
+                    }
                     val now = System.currentTimeMillis()
                     if (now - lastScreenOnSyncMs >= 60_000L) {
                         lastScreenOnSyncMs = now
@@ -127,10 +133,14 @@ class ClientGuardService : Service() {
                 }
             }
             screenOnReceiver = rx
+            val f = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SHUTDOWN)
+            }
             ContextCompat.registerReceiver(
                 this,
                 rx,
-                IntentFilter(Intent.ACTION_SCREEN_ON),
+                f,
                 ContextCompat.RECEIVER_NOT_EXPORTED
             )
         }
@@ -351,8 +361,24 @@ class ClientGuardService : Service() {
                 runCatching {
                     val role = prefs.roleFlow.first()
                     if (role == AppRole.CLIENT && wasVpnRunning && !vpnNow) {
+                        // 15-second grace period: prevents false fraud alarms on power-off, reboot, or OEM service restart
+                        delay(15_000L)
+                        if (DevicePowerState.isShuttingDown.get() || WifiGuardVpnService.isRunning.value) {
+                            wasVpnRunning = WifiGuardVpnService.isRunning.value
+                            return@collect
+                        }
+                        // If Android VPN consent is STILL granted, it was an OS/OEM kill — auto-heal instead of firing fake fraud!
+                        val consentStillGranted = runCatching { VpnService.prepare(applicationContext) == null }.getOrDefault(false)
+                        if (consentStillGranted) {
+                            WifiGuardVpnService.start(applicationContext)
+                            delay(5_000L)
+                            if (WifiGuardVpnService.isRunning.value || DevicePowerState.isShuttingDown.get()) {
+                                wasVpnRunning = WifiGuardVpnService.isRunning.value
+                                return@collect
+                            }
+                        }
                         val host = prefs.getSupervisorHost()
-                        if (host.isNotBlank()) {
+                        if (host.isNotBlank() && !DevicePowerState.isShuttingDown.get()) {
                             val port = prefs.getSupervisorPort()
                             val id = prefs.getOrCreateDeviceId()
                             val name = prefs.getDeviceName()

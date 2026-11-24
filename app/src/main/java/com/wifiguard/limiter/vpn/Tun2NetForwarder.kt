@@ -22,7 +22,8 @@ class Tun2NetForwarder(
     private val vpnService: VpnService,
     private val dnsHandler: DnsPacketHandler,
     private val tokenBucket: TokenBucket,
-    private val tunOutput: FileOutputStream
+    private val tunOutput: FileOutputStream,
+    private val onFatalExit: (() -> Unit)? = null
 ) {
 
     data class PacketPolicyFlags(
@@ -257,6 +258,7 @@ class Tun2NetForwarder(
         var state: TcpState = TcpState.SYN_SENT,
         var flowClass: FlowClass = FlowClass.NORMAL,
         var sniInspected: Boolean = false,
+        var hitMediaBackpressure: Boolean = false,
         var lastActivityMs: Long = System.currentTimeMillis(),
         val writeQueue: ConcurrentLinkedQueue<ByteBuffer> = ConcurrentLinkedQueue()
     )
@@ -676,6 +678,7 @@ class Tun2NetForwarder(
                                 }
                             } else {
                                 anyThrottled = true
+                                if (mediaLimited && mAvail < 1360) session.hitMediaBackpressure = true
                                 val waitG = if (gAvail < 1360) tokenBucket.millisUntilBytes(4096) else 0L
                                 val waitM = if (mediaLimited && mAvail < 1360) mediaTokenBucket.millisUntilBytes(4096) else 0L
                                 val waitB = if (burstLimited && bAvail < 1360) burstBucket.millisUntilBytes(4096) else 0L
@@ -750,7 +753,11 @@ class Tun2NetForwarder(
             }
         } catch (_: Throwable) {
         } finally {
+            val unexpectedExit = running
             runCatching { selector.close() }
+            if (unexpectedExit) {
+                runCatching { onFatalExit?.invoke() }
+            }
         }
     }
 
@@ -829,7 +836,9 @@ class Tun2NetForwarder(
                 tokenBucket.consume(bytesRead)
                 if (mediaLimited) {
                     mediaTokenBucket.consume(bytesRead)
-                    mediaThrottledBytes.addAndGet(bytesRead.toLong())
+                    if (session.hitMediaBackpressure) {
+                        mediaThrottledBytes.addAndGet(bytesRead.toLong())
+                    }
                 }
                 if (uidThrottled) burstBucket.consume(bytesRead)
                 recordUidBytesAndCheckBurst(session.ownerUid, bytesRead)

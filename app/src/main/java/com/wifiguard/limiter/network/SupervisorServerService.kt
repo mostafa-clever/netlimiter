@@ -66,6 +66,7 @@ class SupervisorServerService : Service() {
     private val alertedOfflineDevices = ConcurrentHashMap.newKeySet<String>()
     private val alertedMacCheatDevices = ConcurrentHashMap.newKeySet<String>()
     private val portClosedStrikes = ConcurrentHashMap<String, Int>()
+    private val vpnOffFirstSeenMs = ConcurrentHashMap<String, Long>()
     private val recentTamperByCategory = ConcurrentHashMap<String, Long>()
 
     companion object {
@@ -419,12 +420,20 @@ class SupervisorServerService : Service() {
         val parsedApps = parseInstalledApps(body)
 
         var tamperMsg: String? = null
-        if (existingCheck.protectionActive && !protectionActive) {
-            tamperMsg = "تم إيقاف حماية الاتصال على جهاز $deviceName"
-            recordAndNotifyTamper(deviceId, deviceName, tamperMsg, category = if (!protectionActive) "VPN_OFF" else "ADMIN_OFF")
-        } else if (existingCheck.uninstallProtectionActive && !uninstallProtectionActive) {
+        val nowHbMs = System.currentTimeMillis()
+        if (protectionActive) {
+            vpnOffFirstSeenMs.remove(deviceId)
+        } else if (existingCheck.protectionActive || vpnOffFirstSeenMs.containsKey(deviceId)) {
+            val firstOff = vpnOffFirstSeenMs.putIfAbsent(deviceId, nowHbMs) ?: nowHbMs
+            // Require >= 30s sustained VPN-off state to eliminate boot / service-restart race fake fires
+            if (nowHbMs - firstOff >= 30_000L) {
+                tamperMsg = "تم إيقاف حماية الاتصال على جهاز $deviceName"
+                recordAndNotifyTamper(deviceId, deviceName, tamperMsg, category = "VPN_OFF")
+            }
+        }
+        if (tamperMsg == null && existingCheck.uninstallProtectionActive && !uninstallProtectionActive) {
             tamperMsg = "تم إلغاء حماية الحذف على جهاز $deviceName"
-            recordAndNotifyTamper(deviceId, deviceName, tamperMsg, category = if (!protectionActive) "VPN_OFF" else "ADMIN_OFF")
+            recordAndNotifyTamper(deviceId, deviceName, tamperMsg, category = "ADMIN_OFF")
         }
 
         val todayKey = LocalDate.now().format(DAY_FMT)
@@ -627,10 +636,17 @@ class SupervisorServerService : Service() {
                                     }
                                 }
                                 ClientProbeResult.PortClosedOnLan -> {
-                                    // Require 2 consecutive strikes (~60s) so normal app updates/reboots don't false-alarm
-                                    val strikes = (portClosedStrikes[d.deviceId] ?: 0) + 1
-                                    portClosedStrikes[d.deviceId] = strikes
-                                    if (strikes >= 2) portClosedCheat = true
+                                    // Verify ARP MAC matches before counting a strike (prevents fake fraud if DHCP gave powered-off phone's IP to another device!)
+                                    val arpNow = NetworkScanner.readArpAndNeighTable().firstOrNull { it.ip == d.lastKnownIp }?.mac.orEmpty()
+                                    val ipReassigned = d.macAddress.isNotBlank() && arpNow.isNotBlank() && !arpNow.equals(d.macAddress, ignoreCase = true)
+                                    if (ipReassigned) {
+                                        portClosedStrikes.remove(d.deviceId)
+                                    } else {
+                                        // Require 4 consecutive strikes (~2+ min) so power-off, reboots, and app updates never false-alarm
+                                        val strikes = (portClosedStrikes[d.deviceId] ?: 0) + 1
+                                        portClosedStrikes[d.deviceId] = strikes
+                                        if (strikes >= 4) portClosedCheat = true
+                                    }
                                     heartbeatTimedOut = true
                                 }
                                 ClientProbeResult.UnreachableOrSleeping -> {
